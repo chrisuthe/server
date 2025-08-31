@@ -39,12 +39,14 @@ from music_assistant_models.media_items import (
 from music_assistant_models.streamdetails import StreamDetails
 
 from music_assistant.constants import CACHE_CATEGORY_MEDIA_INFO, MASS_LOGO, VARIOUS_ARTISTS_FANART
+from music_assistant.controllers.media.tracks import TracksController
 from music_assistant.helpers.tags import AudioTags, async_parse_tags
 from music_assistant.helpers.uri import parse_uri
 from music_assistant.models.music_provider import MusicProvider
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ConfigValueType, ProviderConfig
+    from music_assistant_models.media_items.media_item import ItemMapping
     from music_assistant_models.provider import ProviderManifest
 
     from music_assistant.mass import MusicAssistant
@@ -400,6 +402,8 @@ class BuiltinProvider(MusicProvider):
                 media_type, provider_instance_id_or_domain, item_id = await parse_uri(uri)
                 media_controller = self.mass.music.get_controller(media_type)
                 # prefer item already in the db
+                assert isinstance(media_controller, TracksController)  # for type checking
+                track: Track | ItemMapping | None
                 track = await media_controller.get_library_item_by_prov_id(
                     item_id, provider_instance_id_or_domain
                 )
