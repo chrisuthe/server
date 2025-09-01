@@ -1509,7 +1509,7 @@ class PlayerController(CoreController):
         exclude_self: bool = True,
     ) -> Iterator[Player]:
         """Get (child) players attached to a group player or syncgroup."""
-        group_members = group_player.group_members
+        group_members = group_player.group_members.copy()
         if not exclude_self and group_player.player_id not in group_members:
             # Always include the group player itself if not excluded
             group_members.append(group_player.player_id)

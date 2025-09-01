@@ -997,11 +997,10 @@ class Player(ABC):
         # signal the state update to the PlayerController
         self.mass.players.signal_player_state_update(self, changed_values)
 
-        if group_members := changed_values.get("group_members"):
+        if group_members_value := changed_values.get("group_members"):
             # Removed group members also need to be updated since they are no longer part
             # of this group and are available again for playback
-            prev_group_members = group_members[0]
-            new_group_members = group_members[1]
+            prev_group_members, new_group_members = group_members_value
 
             removed_members = set(prev_group_members) - set(new_group_members)
             for member in removed_members:
