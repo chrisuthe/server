@@ -1007,6 +1007,9 @@ class Player(ABC):
             for member in removed_members:
                 if player := self.mass.players.get(member):
                     player.update_state()
+        if changed_values.get("volume_level") and self.synced_to:
+            if player := self.mass.players.get(self.synced_to):
+                player.update_state()
 
     @final
     def set_current_media(  # noqa: PLR0913
