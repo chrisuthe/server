@@ -997,6 +997,17 @@ class Player(ABC):
         # signal the state update to the PlayerController
         self.mass.players.signal_player_state_update(self, changed_values)
 
+        if group_members := changed_values.get("group_members"):
+            # Removed group members also need to be updated since they are no longer part
+            # of this group and are available again for playback
+            prev_group_members = group_members[0]
+            new_group_members = group_members[1]
+
+            removed_members = set(prev_group_members) - set(new_group_members)
+            for member in removed_members:
+                if player := self.mass.players.get(member):
+                    player.update_state()
+
     @final
     def set_current_media(  # noqa: PLR0913
         self,
