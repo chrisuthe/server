@@ -1509,7 +1509,11 @@ class PlayerController(CoreController):
         exclude_self: bool = True,
     ) -> Iterator[Player]:
         """Get (child) players attached to a group player or syncgroup."""
-        for child_id in list(group_player.group_members):
+        group_members = group_player.group_members
+        if not exclude_self and group_player.player_id not in group_members:
+            # Always include the group player itself if not excluded
+            group_members.append(group_player.player_id)
+        for child_id in group_members:
             if child_player := self.get(child_id, False):
                 if not child_player.available or not child_player.enabled:
                     continue
