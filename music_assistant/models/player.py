@@ -1008,6 +1008,7 @@ class Player(ABC):
                     player.update_state()
         if changed_values.get("volume_level") and self.synced_to:
             if player := self.mass.players.get(self.synced_to):
+                # We need to update group_volume
                 player.update_state()
 
     @final
