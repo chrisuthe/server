@@ -285,12 +285,72 @@ class PlayerQueuesController(CoreController):
         return self._queues.get(queue_id)
 
     @api_command("player_queues/items")
-    def items(self, queue_id: str, limit: int = 500, offset: int = 0) -> list[QueueItem]:
-        """Return all QueueItems for given PlayerQueue."""
+    async def items(self, queue_id: str, limit: int = 500, offset: int = 0) -> list[QueueItem]:
+        """Return all QueueItems for given PlayerQueue.
+
+        :param queue_id: The ID of the queue to get items from.
+        :param limit: Maximum number of items to return.
+        :param offset: Offset to start returning items from.
+        """
         if queue_id not in self._queue_items:
             return []
 
-        return self._queue_items[queue_id][offset : offset + limit]
+        queue_items = self._queue_items[queue_id][offset : offset + limit]
+
+        # Resolve ItemMapping artists to full Artist objects with images
+        for queue_item in queue_items:
+            if not queue_item.media_item:
+                continue
+
+            # Resolve track/album artist ItemMappings to full Artist objects
+            if hasattr(queue_item.media_item, "artists"):
+                resolved_artists = []
+                for artist in queue_item.media_item.artists:
+                    if not isinstance(artist, ItemMapping):
+                        resolved_artists.append(artist)
+                        continue
+                    try:
+                        full_artist = await self.mass.music.artists.get(
+                            artist.item_id,
+                            artist.provider,
+                        )
+                        resolved_artists.append(full_artist)
+                    except MusicAssistantError as err:
+                        # If we can't fetch the full artist, keep the ItemMapping
+                        self.logger.debug(
+                            "Unable to fetch artist details for %s - %s", artist.uri, str(err)
+                        )
+                        resolved_artists.append(artist)
+
+                queue_item.media_item.artists = resolved_artists
+
+            # Also resolve album artists if present
+            if hasattr(queue_item.media_item, "album") and queue_item.media_item.album:
+                album = queue_item.media_item.album
+                if hasattr(album, "artists"):
+                    resolved_album_artists = []
+                    for artist in album.artists:
+                        if not isinstance(artist, ItemMapping):
+                            resolved_album_artists.append(artist)
+                            continue
+                        try:
+                            full_artist = await self.mass.music.artists.get(
+                                artist.item_id,
+                                artist.provider,
+                            )
+                            resolved_album_artists.append(full_artist)
+                        except MusicAssistantError as err:
+                            # If we can't fetch the full artist, keep the ItemMapping
+                            self.logger.debug(
+                                "Unable to fetch album artist details for %s - %s",
+                                artist.uri,
+                                str(err),
+                            )
+                            resolved_album_artists.append(artist)
+
+                    album.artists = resolved_album_artists
+
+        return queue_items
 
     @api_command("player_queues/get_active_queue")
     def get_active_queue(self, player_id: str) -> PlayerQueue | None:
