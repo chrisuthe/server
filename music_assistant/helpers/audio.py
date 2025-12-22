@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Final, cast
 from urllib.parse import urlparse
 
 import aiofiles
+import aiohttp
 import shortuuid
 from aiohttp import ClientTimeout
 from music_assistant_models.dsp import DSPConfig, DSPDetails, DSPState
@@ -764,7 +765,7 @@ async def _detect_icy_stream(url: str) -> bool:
 
         return False
 
-    except Exception as err:
+    except (TimeoutError, OSError, UnicodeDecodeError) as err:
         LOGGER.debug("ICY detection failed for %s: %s", url, err)
         return False
 
@@ -820,15 +821,20 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
             except IsHLSPlaylist:
                 stream_type = StreamType.HLS
 
-    except Exception as err:
-        LOGGER.debug("Error while parsing radio URL %s: %s", url, str(err))
-        # Fallback: Try to detect ICY/Shoutcast streams that aiohttp can't parse
+    except TimeoutError as err:
+        LOGGER.warning("Timeout while resolving radio URL %s: %s", url, err)
+        # Try ICY detection as fallback
         if await _detect_icy_stream(url):
             stream_type = StreamType.ICY
-            LOGGER.debug("Detected ICY stream via fallback method: %s", url)
-        else:
-            LOGGER.warning("Error while parsing radio URL %s: %s", url, str(err))
         return (url, stream_type)
+    except aiohttp.ClientError as err:
+        LOGGER.warning("HTTP error while resolving radio URL %s: %s", url, err)
+        # Try ICY detection as fallback
+        if await _detect_icy_stream(url):
+            stream_type = StreamType.ICY
+        return (url, stream_type)
+    except InvalidDataError:
+        raise
 
     result = (resolved_url, stream_type)
     cache_expiration = 3600 * 3
@@ -891,16 +897,19 @@ async def get_icy_radio_stream(
                         cleaned_stream_title,
                     )
                     streamdetails.stream_title = cleaned_stream_title
-    except Exception as err:
+    except (aiohttp.ClientError, KeyError, ValueError) as err:
         # Fallback for old Shoutcast servers that return "ICY 200 OK"
-        LOGGER.debug("aiohttp failed for ICY stream %s (%s), using raw socket fallback", url, err)
+        LOGGER.debug("Using raw socket fallback for ICY stream %s: %s", url, err)
 
         parsed = urlparse(url)
         host = parsed.hostname
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         path = parsed.path or "/"
 
-        reader, writer = await asyncio.open_connection(host, port)
+        try:
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=30)
+        except (TimeoutError, OSError) as err:
+            raise AudioError(f"Failed to connect to ICY stream: {err}") from err
 
         try:
             # Send ICY metadata request
