@@ -47,7 +47,7 @@ from music_assistant.controllers.cache import use_cache
 from music_assistant.helpers.app_vars import app_var  # type: ignore[attr-defined]
 from music_assistant.helpers.auth import AuthenticationHelper
 from music_assistant.helpers.datetime import utc_timestamp
-from music_assistant.helpers.util import infer_album_type
+from music_assistant.helpers.util import infer_album_type, parse_title_and_version
 from music_assistant.models import ProviderInstanceType
 from music_assistant.models.music_provider import MusicProvider
 
@@ -425,7 +425,7 @@ class DeezerProvider(MusicProvider):
         return [
             RecommendationFolder(
                 item_id="recommended_tracks",
-                provider=self.lookup_key,
+                provider=self.instance_id,
                 name="Recommended tracks",
                 translation_key="recommended_tracks",
                 items=UniqueList(
@@ -476,7 +476,7 @@ class DeezerProvider(MusicProvider):
         url = url_details["sources"][0]["url"]
         return StreamDetails(
             item_id=item_id,
-            provider=self.lookup_key,
+            provider=self.instance_id,
             audio_format=AudioFormat(
                 content_type=ContentType.try_parse(url_details["format"].split("_")[0])
             ),
@@ -557,7 +557,7 @@ class DeezerProvider(MusicProvider):
                 MediaItemImage(
                     type=ImageType.THUMB,
                     path=track.album.cover_big,
-                    provider=self.lookup_key,
+                    provider=self.instance_id,
                     remotely_accessible=True,
                 )
             )
@@ -572,7 +572,7 @@ class DeezerProvider(MusicProvider):
                     MediaItemImage(
                         type=ImageType.THUMB,
                         path=album.cover_big,
-                        provider=self.lookup_key,
+                        provider=self.instance_id,
                         remotely_accessible=True,
                     )
                 ]
@@ -587,7 +587,7 @@ class DeezerProvider(MusicProvider):
                     MediaItemImage(
                         type=ImageType.THUMB,
                         path=artist.picture_big,
-                        provider=self.lookup_key,
+                        provider=self.instance_id,
                         remotely_accessible=True,
                     )
                 ]
@@ -599,7 +599,7 @@ class DeezerProvider(MusicProvider):
         """Parse the deezer-python artist to a Music Assistant artist."""
         return Artist(
             item_id=str(artist.id),
-            provider=self.lookup_key,
+            provider=self.instance_id,
             name=artist.name,
             media_type=MediaType.ARTIST,
             provider_mappings={
@@ -615,17 +615,19 @@ class DeezerProvider(MusicProvider):
 
     def parse_album(self, album: deezer.Album) -> Album:
         """Parse the deezer-python album to a Music Assistant album."""
+        name, version = parse_title_and_version(album.title)
         return Album(
             album_type=self.get_album_type(album),
             item_id=str(album.id),
-            provider=self.lookup_key,
-            name=album.title,
+            provider=self.instance_id,
+            name=name,
+            version=version,
             artists=UniqueList(
                 [
                     ItemMapping(
                         media_type=MediaType.ARTIST,
                         item_id=str(album.artist.id),
-                        provider=self.lookup_key,
+                        provider=self.instance_id,
                         name=album.artist.name,
                     )
                 ]
@@ -648,7 +650,7 @@ class DeezerProvider(MusicProvider):
         is_editable = creator.id == self.user.id
         return Playlist(
             item_id=str(playlist.id),
-            provider=self.instance_id if is_editable else self.lookup_key,
+            provider=self.instance_id,
             name=playlist.title,
             media_type=MediaType.PLAYLIST,
             provider_mappings={
@@ -657,6 +659,7 @@ class DeezerProvider(MusicProvider):
                     provider_domain=self.domain,
                     provider_instance=self.instance_id,
                     url=getattr(playlist, "link", None),
+                    is_unique=is_editable,  # user-owned playlists are unique
                 )
             },
             metadata=MediaItemMetadata(
@@ -665,7 +668,7 @@ class DeezerProvider(MusicProvider):
                         MediaItemImage(
                             type=ImageType.THUMB,
                             path=playlist.picture_big,
-                            provider=self.lookup_key,
+                            provider=self.instance_id,
                             remotely_accessible=True,
                         )
                     ]
@@ -687,7 +690,7 @@ class DeezerProvider(MusicProvider):
             artist = ItemMapping(
                 media_type=MediaType.ARTIST,
                 item_id=str(getattr(track.artist, "id", f"deezer-{track.artist.name}")),
-                provider=self.lookup_key,
+                provider=self.instance_id,
                 name=track.artist.name,
             )
         else:
@@ -696,16 +699,18 @@ class DeezerProvider(MusicProvider):
             album = ItemMapping(
                 media_type=MediaType.ALBUM,
                 item_id=str(track.album.id),
-                provider=self.lookup_key,
+                provider=self.instance_id,
                 name=track.album.title,
             )
         else:
             album = None
 
+        name, version = parse_title_and_version(track.title)
         item = Track(
             item_id=str(track.id),
-            provider=self.lookup_key,
-            name=track.title,
+            provider=self.instance_id,
+            name=name,
+            version=version,
             sort_name=self.get_short_title(track),
             duration=track.duration,
             artists=UniqueList([artist]) if artist else UniqueList(),

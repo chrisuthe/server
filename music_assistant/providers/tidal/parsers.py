@@ -24,7 +24,7 @@ from music_assistant_models.media_items import (
     UniqueList,
 )
 
-from music_assistant.helpers.util import infer_album_type
+from music_assistant.helpers.util import infer_album_type, parse_title_and_version
 
 from .constants import BROWSE_URL, RESOURCES_URL
 
@@ -37,7 +37,7 @@ def parse_artist(provider: TidalProvider, artist_obj: dict[str, Any]) -> Artist:
     artist_id = str(artist_obj["id"])
     artist = Artist(
         item_id=artist_id,
-        provider=provider.lookup_key,
+        provider=provider.instance_id,
         name=artist_obj["name"],
         provider_mappings={
             ProviderMapping(
@@ -59,7 +59,7 @@ def parse_artist(provider: TidalProvider, artist_obj: dict[str, Any]) -> Artist:
                 MediaItemImage(
                     type=ImageType.THUMB,
                     path=image_url,
-                    provider=provider.lookup_key,
+                    provider=provider.instance_id,
                     remotely_accessible=True,
                 )
             ]
@@ -70,13 +70,15 @@ def parse_artist(provider: TidalProvider, artist_obj: dict[str, Any]) -> Artist:
 
 def parse_album(provider: TidalProvider, album_obj: dict[str, Any]) -> Album:
     """Parse tidal album object to generic layout."""
-    name = album_obj.get("title", "Unknown Album")
-    version = album_obj.get("version", "") or ""
+    name, version = parse_title_and_version(
+        album_obj.get("title", "Unknown Album"),
+        album_obj.get("version") or None,
+    )
     album_id = str(album_obj.get("id", ""))
 
     album = Album(
         item_id=album_id,
-        provider=provider.lookup_key,
+        provider=provider.instance_id,
         name=name,
         version=version,
         provider_mappings={
@@ -147,7 +149,7 @@ def parse_album(provider: TidalProvider, album_obj: dict[str, Any]) -> Album:
                 MediaItemImage(
                     type=ImageType.THUMB,
                     path=image_url,
-                    provider=provider.lookup_key,
+                    provider=provider.instance_id,
                     remotely_accessible=True,
                 )
             ]
@@ -162,15 +164,18 @@ def parse_track(
     lyrics: dict[str, str] | None = None,
 ) -> Track:
     """Parse tidal track object to generic layout."""
-    version = track_obj.get("version", "") or ""
+    name, version = parse_title_and_version(
+        track_obj.get("title", "Unknown"),
+        track_obj.get("version") or None,
+    )
     track_id = str(track_obj.get("id", 0))
     media_metadata = track_obj.get("mediaMetadata") or {}
     tags = media_metadata.get("tags", [])
     hi_res_lossless = any(tag in tags for tag in ["HIRES_LOSSLESS", "HI_RES_LOSSLESS"])
     track = Track(
         item_id=track_id,
-        provider=provider.lookup_key,
-        name=track_obj.get("title", "Unknown"),
+        provider=provider.instance_id,
+        name=name,
         version=version,
         duration=track_obj.get("duration", 0),
         provider_mappings={
@@ -220,7 +225,7 @@ def parse_track(
                     MediaItemImage(
                         type=ImageType.THUMB,
                         path=image_url,
-                        provider=provider.lookup_key,
+                        provider=provider.instance_id,
                         remotely_accessible=True,
                     )
                 ]
@@ -263,7 +268,7 @@ def parse_playlist(
 
     playlist = Playlist(
         item_id=playlist_id,
-        provider=provider.instance_id if is_editable else provider.lookup_key,
+        provider=provider.instance_id,
         name=playlist_obj.get("title", "Unknown"),
         owner=owner_name,
         provider_mappings={
@@ -272,6 +277,7 @@ def parse_playlist(
                 provider_domain=provider.domain,
                 provider_instance=provider.instance_id,
                 url=f"{BROWSE_URL}/{url_path}/{raw_id}",
+                is_unique=is_editable,  # user-owned playlists are unique
             )
         },
         is_editable=is_editable,
@@ -295,7 +301,7 @@ def parse_playlist(
                         MediaItemImage(
                             type=ImageType.THUMB,
                             path=image_url,
-                            provider=provider.lookup_key,
+                            provider=provider.instance_id,
                             remotely_accessible=True,
                         )
                     ]
@@ -308,7 +314,7 @@ def parse_playlist(
                 MediaItemImage(
                     type=ImageType.THUMB,
                     path=image_url,
-                    provider=provider.lookup_key,
+                    provider=provider.instance_id,
                     remotely_accessible=True,
                 )
             ]

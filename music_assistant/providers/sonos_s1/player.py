@@ -85,7 +85,7 @@ class SonosPlayer(Player):
         self._attr_needs_poll = True
         self._attr_poll_interval = 5
         self._attr_available = True
-        self._attr_can_group_with = {provider.lookup_key}
+        self._attr_can_group_with = {provider.instance_id}
 
         # Subscriptions and events
         self._subscriptions: list[SubscriptionBase] = []
@@ -280,7 +280,9 @@ class SonosPlayer(Player):
             self._attr_volume_level = self.soco.volume
             self._attr_volume_muted = self.soco.mute
 
-        await asyncio.to_thread(_poll)
+        await self._check_availability()
+        if self._attr_available:
+            await asyncio.to_thread(_poll)
 
     @soco_error()
     def poll_media(self) -> None:
@@ -316,6 +318,20 @@ class SonosPlayer(Player):
             ip_address=ip_address,
         )
         self.update_player()
+
+    async def _check_availability(self) -> None:
+        """Check if the player is still available."""
+        try:
+            await asyncio.to_thread(self.ping)
+            self._speaker_activity("ping")
+        except SonosUpdateError:
+            if not self._attr_available:
+                return
+            self.logger.warning(
+                "No recent activity and cannot reach %s, marking unavailable",
+                self.display_name,
+            )
+            await self.offline()
 
     @soco_error()
     def ping(self) -> None:
@@ -708,7 +724,7 @@ class SonosPlayer(Player):
         except TimeoutError:
             self.logger.warning("Timeout waiting for target groups %s", groups)
 
-        if players := self.mass.players.all(provider_filter=_provider.lookup_key):
+        if players := self.mass.players.all(provider_filter=_provider.instance_id):
             any_speaker = cast("SonosPlayer", players[0])
             any_speaker.soco.zone_group_state.clear_cache()
 

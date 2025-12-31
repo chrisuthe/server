@@ -159,4 +159,6 @@ class AirPlay2Stream(AirPlayProtocol):
             await asyncio.sleep(0)  # Yield to event loop
 
         # ensure we're cleaned up afterwards (this also logs the returncode)
-        await self.stop()
+        if not self._stopped:
+            self._stopped = True
+            self.player.set_state_from_stream(state=PlaybackState.IDLE, elapsed_time=0)

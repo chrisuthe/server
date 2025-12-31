@@ -169,7 +169,7 @@ class AirPlayProvider(PlayerProvider):
         # Get volume from cache
         if not (
             volume := await self.mass.cache.get(
-                key=player_id, provider=self.lookup_key, category=CACHE_CATEGORY_PREV_VOLUME
+                key=player_id, provider=self.instance_id, category=CACHE_CATEGORY_PREV_VOLUME
             )
         ):
             volume = FALLBACK_VOLUME
@@ -294,7 +294,7 @@ class AirPlayProvider(PlayerProvider):
                 queue = self.mass.player_queues.get(player_id)
                 if not queue:
                     return
-                self.mass.player_queues.set_shuffle(
+                await self.mass.player_queues.set_shuffle(
                     active_queue.queue_id, not queue.shuffle_enabled
                 )
             elif path in ("/ctrl-int/1/pause", "/ctrl-int/1/discrete-pause"):

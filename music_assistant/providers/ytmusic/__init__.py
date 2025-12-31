@@ -54,7 +54,7 @@ from ytmusicapi.helpers import get_authorization, sapisid_from_cookie
 
 from music_assistant.constants import CONF_USERNAME, VERBOSE_LOG_LEVEL
 from music_assistant.controllers.cache import use_cache
-from music_assistant.helpers.util import infer_album_type, install_package
+from music_assistant.helpers.util import infer_album_type, install_package, parse_title_and_version
 from music_assistant.models.music_provider import MusicProvider
 
 from .helpers import (
@@ -621,7 +621,7 @@ class YoutubeMusicProvider(MusicProvider):
         stream_format = await self._get_stream_format(item_id=item_id)
         self.logger.debug("Found stream_format: %s for song %s", stream_format["format"], item_id)
         stream_details = StreamDetails(
-            provider=self.lookup_key,
+            provider=self.instance_id,
             item_id=item_id,
             audio_format=AudioFormat(
                 content_type=ContentType.try_parse(stream_format["audio_ext"]),
@@ -649,7 +649,7 @@ class YoutubeMusicProvider(MusicProvider):
             folder = RecommendationFolder(
                 name=section["title"],
                 item_id=f"{self.instance_id}_{section['title']}",
-                provider=self.lookup_key,
+                provider=self.instance_id,
                 icon=determine_recommendation_icon(section["title"]),
             )
             for recommended_item in section.get("contents", []):
@@ -740,13 +740,16 @@ class YoutubeMusicProvider(MusicProvider):
             raise InvalidDataError("Album ID is required but not found")
 
         if "title" in album_obj:
-            name = album_obj["title"]
+            name, version = parse_title_and_version(album_obj["title"])
         elif "name" in album_obj:
-            name = album_obj["name"]
+            name, version = parse_title_and_version(album_obj["name"])
+        else:
+            name, version = "", ""
         album = Album(
             item_id=album_id,
             name=name,
-            provider=self.lookup_key,
+            version=version,
+            provider=self.instance_id,
             provider_mappings={
                 ProviderMapping(
                     item_id=str(album_id),
@@ -787,7 +790,7 @@ class YoutubeMusicProvider(MusicProvider):
             album.album_type = album_type
 
         # Try inference - override if it finds something more specific
-        inferred_type = infer_album_type(name, "")  # YouTube doesn't seem to have version field
+        inferred_type = infer_album_type(name, version)
         if inferred_type in (AlbumType.SOUNDTRACK, AlbumType.LIVE):
             album.album_type = inferred_type
 
@@ -808,7 +811,7 @@ class YoutubeMusicProvider(MusicProvider):
         artist = Artist(
             item_id=artist_id,
             name=artist_obj["name"],
-            provider=self.lookup_key,
+            provider=self.instance_id,
             provider_mappings={
                 ProviderMapping(
                     item_id=str(artist_id),
@@ -837,7 +840,7 @@ class YoutubeMusicProvider(MusicProvider):
             playlist_name = f"{playlist_name} ({self.name})"
         playlist = Playlist(
             item_id=playlist_id,
-            provider=self.instance_id if is_editable else self.lookup_key,
+            provider=self.instance_id,
             name=playlist_name,
             provider_mappings={
                 ProviderMapping(
@@ -845,6 +848,7 @@ class YoutubeMusicProvider(MusicProvider):
                     provider_domain=self.domain,
                     provider_instance=self.instance_id,
                     url=f"{YTM_DOMAIN}/playlist?list={playlist_id}",
+                    is_unique=is_editable,  # user-owned playlists are unique
                 )
             },
             is_editable=is_editable,
@@ -872,10 +876,12 @@ class YoutubeMusicProvider(MusicProvider):
             msg = "Track is missing videoId"
             raise InvalidDataError(msg)
         track_id = str(track_obj["videoId"])
+        name, version = parse_title_and_version(track_obj["title"])
         track = Track(
             item_id=track_id,
-            provider=self.lookup_key,
-            name=track_obj["title"],
+            provider=self.instance_id,
+            name=name,
+            version=version,
             provider_mappings={
                 ProviderMapping(
                     item_id=track_id,
@@ -930,7 +936,7 @@ class YoutubeMusicProvider(MusicProvider):
         podcast = Podcast(
             item_id=podcast_obj["podcastId"],
             name=podcast_obj["title"],
-            provider=self.lookup_key,
+            provider=self.instance_id,
             provider_mappings={
                 ProviderMapping(
                     item_id=podcast_obj["podcastId"],
@@ -956,7 +962,7 @@ class YoutubeMusicProvider(MusicProvider):
         item_id = f"{podcast.item_id}{PODCAST_EPISODE_SPLITTER}{episode_id}"
         episode = PodcastEpisode(
             item_id=item_id,
-            provider=self.lookup_key,
+            provider=self.instance_id,
             name=episode_obj.get("title"),
             podcast=podcast,
             provider_mappings={
@@ -1024,7 +1030,7 @@ class YoutubeMusicProvider(MusicProvider):
         return ItemMapping(
             media_type=media_type,
             item_id=key,
-            provider=self.lookup_key,
+            provider=self.instance_id,
             name=name,
         )
 
@@ -1079,7 +1085,7 @@ class YoutubeMusicProvider(MusicProvider):
                 MediaItemImage(
                     type=image_type,
                     path=url,
-                    provider=self.lookup_key,
+                    provider=self.instance_id,
                     remotely_accessible=True,
                 )
             )

@@ -193,6 +193,8 @@ class LocalFileSystemProvider(MusicProvider):
         if self.media_content_type == "podcasts":
             return {ProviderFeature.LIBRARY_PODCASTS, *base_features}
         music_features = {
+            ProviderFeature.LIBRARY_ALBUMS,
+            ProviderFeature.LIBRARY_ARTISTS,
             ProviderFeature.LIBRARY_TRACKS,
             ProviderFeature.LIBRARY_PLAYLISTS,
             *base_features,
@@ -320,6 +322,9 @@ class LocalFileSystemProvider(MusicProvider):
 
     async def sync_library(self, media_type: MediaType) -> None:
         """Run library sync for this provider."""
+        if media_type in (MediaType.ARTIST, MediaType.ALBUM):
+            # artists and albums are synced as part of track sync
+            return
         assert self.mass.music.database
         start_time = time.time()
         if self.sync_running:
@@ -1039,7 +1044,9 @@ class LocalFileSystemProvider(MusicProvider):
                 artist_path = foldermatch
             else:
                 # check if we have an existing item to retrieve the artist path
-                async for item in self.mass.music.artists.iter_library_items(search=name):
+                async for item in self.mass.music.artists.iter_library_items(
+                    search=name, provider=self.instance_id
+                ):
                     if not compare_strings(name, item.name):
                         continue
                     for prov_mapping in item.provider_mappings:

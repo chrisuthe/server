@@ -18,7 +18,6 @@ import time
 from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any
 
-from aiohttp.client_exceptions import ClientError
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueType, ProviderConfig
 from music_assistant_models.enums import (
     ConfigEntryType,
@@ -354,7 +353,7 @@ class GPodder(MusicProvider):
                     feed_url=feed_url,
                     max_episodes=self.max_episodes,
                 )
-            except ClientError:
+            except MediaNotFoundError:
                 self.logger.warning(f"Was unable to obtain podcast with feed {feed_url}")
                 continue
             await self._cache_set_podcast(feed_url, parsed_podcast)
@@ -402,9 +401,8 @@ class GPodder(MusicProvider):
             yield parse_podcast(
                 feed_url=feed_url,
                 parsed_feed=parsed_podcast,
-                lookup_key=self.lookup_key,
-                domain=self.domain,
                 instance_id=self.instance_id,
+                domain=self.domain,
             )
 
         self.timestamp_subscriptions = subscriptions.timestamp
@@ -420,9 +418,8 @@ class GPodder(MusicProvider):
         return parse_podcast(
             feed_url=prov_podcast_id,
             parsed_feed=parsed_podcast,
-            lookup_key=self.lookup_key,
-            domain=self.domain,
             instance_id=self.instance_id,
+            domain=self.domain,
         )
 
     async def get_podcast_episodes(
@@ -449,7 +446,6 @@ class GPodder(MusicProvider):
                 episode_cnt=cnt,
                 podcast_cover=podcast_cover,
                 domain=self.domain,
-                lookup_key=self.lookup_key,
                 instance_id=self.instance_id,
             )
             if mass_episode is None:
@@ -578,7 +574,7 @@ class GPodder(MusicProvider):
         if stream_url is None:
             raise MediaNotFoundError
         return StreamDetails(
-            provider=self.lookup_key,
+            provider=self.instance_id,
             item_id=item_id,
             audio_format=AudioFormat(
                 content_type=ContentType.try_parse(stream_url),
@@ -615,6 +611,7 @@ class GPodder(MusicProvider):
             default=None,
         )
         if parsed_podcast is None:
+            # raises MediaNotFoundError
             parsed_podcast = await get_podcastparser_dict(
                 session=self.mass.http_session,
                 feed_url=prov_podcast_id,

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.enums import MediaType, ProviderFeature
-from music_assistant_models.media_items import Audiobook, UniqueList
+from music_assistant_models.media_items import Audiobook, ProviderMapping, UniqueList
 
 from music_assistant.constants import DB_TABLE_AUDIOBOOKS, DB_TABLE_PLAYLOG
 from music_assistant.controllers.media.base import MediaControllerBase
@@ -40,15 +40,16 @@ class AudiobooksController(MediaControllerBase[Audiobook]):
             audiobooks.*,
             (SELECT JSON_GROUP_ARRAY(
                 json_object(
-                'item_id', provider_mappings.provider_item_id,
-                    'provider_domain', provider_mappings.provider_domain,
-                        'provider_instance', provider_mappings.provider_instance,
-                        'available', provider_mappings.available,
-                        'audio_format', json(provider_mappings.audio_format),
-                        'url', provider_mappings.url,
-                        'details', provider_mappings.details,
-                        'in_library', provider_mappings.in_library
-                )) FROM provider_mappings WHERE provider_mappings.item_id = audiobooks.item_id AND media_type = 'audiobook') AS provider_mappings,
+                'item_id', audiobook_pm.provider_item_id,
+                    'provider_domain', audiobook_pm.provider_domain,
+                        'provider_instance', audiobook_pm.provider_instance,
+                        'available', audiobook_pm.available,
+                        'audio_format', json(audiobook_pm.audio_format),
+                        'url', audiobook_pm.url,
+                        'details', audiobook_pm.details,
+                        'in_library', audiobook_pm.in_library,
+                        'is_unique', audiobook_pm.is_unique
+                )) FROM provider_mappings audiobook_pm WHERE audiobook_pm.item_id = audiobooks.item_id AND audiobook_pm.media_type = 'audiobook') AS provider_mappings,
             playlog.fully_played AS fully_played,
             playlog.seconds_played AS seconds_played,
             playlog.seconds_played * 1000 as resume_position_ms
@@ -77,7 +78,7 @@ class AudiobooksController(MediaControllerBase[Audiobook]):
         :param limit: Maximum number of items to return.
         :param offset: Number of items to skip.
         :param order_by: Order by field (e.g. 'sort_name', 'timestamp_added').
-        :param provider: Filter by provider instance ID or domain (single string or list).
+        :param provider: Filter by provider instance ID (single string or list).
         :param extra_query: Additional SQL query string.
         :param extra_query_params: Additional query parameters.
         """
@@ -204,13 +205,56 @@ class AudiobooksController(MediaControllerBase[Audiobook]):
 
     async def radio_mode_base_tracks(
         self,
-        item_id: str,
-        provider_instance_id_or_domain: str,
-        limit: int = 25,
+        item: Audiobook,
+        preferred_provider_instances: list[str] | None = None,
     ) -> list[Track]:
-        """Get the list of base tracks from the controller used to calculate the dynamic radio."""
-        msg = "Dynamic tracks not supported for Radio MediaItem"
+        """
+        Get the list of base tracks from the controller used to calculate the dynamic radio.
+
+        :param item: The Audiobook to get base tracks for.
+        :param preferred_provider_instances: List of preferred provider instance IDs to use.
+        """
+        msg = "Dynamic tracks not supported for Audiobook MediaItem"
         raise NotImplementedError(msg)
+
+    async def match_provider(
+        self, db_audiobook: Audiobook, provider: MusicProvider, strict: bool = True
+    ) -> list[ProviderMapping]:
+        """
+        Try to find match on (streaming) provider for the provided (database) audiobook.
+
+        This is used to link objects of different providers/qualities together.
+        """
+        self.logger.debug(
+            "Trying to match audiobook %s on provider %s",
+            db_audiobook.name,
+            provider.name,
+        )
+        matches: list[ProviderMapping] = []
+        author_name = db_audiobook.authors[0] if db_audiobook.authors else ""
+        search_str = f"{author_name} - {db_audiobook.name}" if author_name else db_audiobook.name
+        search_result = await self.search(search_str, provider.instance_id)
+        for search_result_item in search_result:
+            if not search_result_item.available:
+                continue
+            if not compare_media_item(db_audiobook, search_result_item, strict=strict):
+                continue
+            # we must fetch the full audiobook version, search results can be simplified objects
+            prov_audiobook = await self.get_provider_item(
+                search_result_item.item_id,
+                search_result_item.provider,
+                fallback=search_result_item,
+            )
+            if compare_audiobook(db_audiobook, prov_audiobook, strict=strict):
+                # 100% match
+                matches.extend(prov_audiobook.provider_mappings)
+        if not matches:
+            self.logger.debug(
+                "Could not find match for Audiobook %s on provider %s",
+                db_audiobook.name,
+                provider.name,
+            )
+        return matches
 
     async def match_providers(self, db_audiobook: Audiobook) -> None:
         """Try to find match on all (streaming) providers for the provided (database) audiobook.
@@ -219,37 +263,6 @@ class AudiobooksController(MediaControllerBase[Audiobook]):
         """
         if db_audiobook.provider != "library":
             return  # Matching only supported for database items
-        if not db_audiobook.authors:
-            return  # guard
-        author_name = db_audiobook.authors[0]
-
-        async def find_prov_match(provider: MusicProvider) -> bool:
-            self.logger.debug(
-                "Trying to match audiobook %s on provider %s",
-                db_audiobook.name,
-                provider.name,
-            )
-            match_found = False
-            search_str = f"{author_name} - {db_audiobook.name}"
-            search_result = await self.search(search_str, provider.instance_id)
-            for search_result_item in search_result:
-                if not search_result_item.available:
-                    continue
-                if not compare_media_item(db_audiobook, search_result_item):
-                    continue
-                # we must fetch the full audiobook version, search results can be simplified objects
-                prov_audiobook = await self.get_provider_item(
-                    search_result_item.item_id,
-                    search_result_item.provider,
-                    fallback=search_result_item,
-                )
-                if compare_audiobook(db_audiobook, prov_audiobook):
-                    # 100% match, we update the db with the additional provider mapping(s)
-                    match_found = True
-                    for provider_mapping in search_result_item.provider_mappings:
-                        await self.add_provider_mapping(db_audiobook.item_id, provider_mapping)
-                        db_audiobook.provider_mappings.add(provider_mapping)
-            return match_found
 
         # try to find match on all providers
         cur_provider_domains = {x.provider_domain for x in db_audiobook.provider_mappings}
@@ -263,28 +276,22 @@ class AudiobooksController(MediaControllerBase[Audiobook]):
             if not provider.is_streaming_provider:
                 # matching on unique providers is pointless as they push (all) their content to MA
                 continue
-            if await find_prov_match(provider):
+            if match := await self.match_provider(db_audiobook, provider):
+                # 100% match, we update the db with the additional provider mapping(s)
+                await self.add_provider_mappings(db_audiobook.item_id, match)
                 cur_provider_domains.add(provider.domain)
-            else:
-                self.logger.debug(
-                    "Could not find match for Audiobook %s on provider %s",
-                    db_audiobook.name,
-                    provider.name,
-                )
 
     async def _set_playlog(self, db_id: int, media_item: Audiobook) -> None:
         """Update/set the playlog table for the given audiobook db item_id."""
         # cleanup provider specific entries for this item
         # we always prefer the library playlog entry
         for prov_mapping in media_item.provider_mappings:
-            if not (provider := self.mass.get_provider(prov_mapping.provider_instance)):
-                continue
             await self.mass.music.database.delete(
                 DB_TABLE_PLAYLOG,
                 {
                     "media_type": self.media_type.value,
                     "item_id": prov_mapping.item_id,
-                    "provider": provider.lookup_key,
+                    "provider": prov_mapping.provider_instance,
                 },
             )
         if media_item.fully_played is None and media_item.resume_position_ms is None:

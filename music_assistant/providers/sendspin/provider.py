@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import TYPE_CHECKING, cast
 
@@ -16,12 +17,15 @@ if TYPE_CHECKING:
     from music_assistant_models.config_entries import ProviderConfig
     from music_assistant_models.provider import ProviderManifest
 
+    from music_assistant.providers.hass import HomeAssistantProvider
+
 
 class SendspinProvider(PlayerProvider):
     """Player Provider for Sendspin."""
 
     server_api: SendspinServer
     unregister_cbs: list[Callable[[], None]]
+    _pending_unregisters: dict[str, asyncio.Event]
 
     def __init__(
         self, mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
@@ -31,12 +35,9 @@ class SendspinProvider(PlayerProvider):
         self.server_api = SendspinServer(
             self.mass.loop, mass.server_id, "Music Assistant", self.mass.http_session
         )
+        self._pending_unregisters = {}
         self.unregister_cbs = [
             self.server_api.add_event_listener(self.event_cb),
-            # For the web player
-            self.mass.webserver.register_dynamic_route(
-                "/sendspin", self.server_api.on_client_connect
-            ),
         ]
 
     async def event_cb(self, server: SendspinServer, event: SendspinEvent) -> None:
@@ -44,12 +45,35 @@ class SendspinProvider(PlayerProvider):
         self.logger.debug("Received SendspinEvent: %s", event)
         match event:
             case ClientAddedEvent(client_id):
+                # Wait for any pending unregister to complete before registering
+                # This prevents a race condition where a slow unregister removes
+                # a newly registered player after a quick reconnect
+                if pending_event := self._pending_unregisters.get(client_id):
+                    self.logger.debug(
+                        "Waiting for pending unregister of %s before registering", client_id
+                    )
+                    await pending_event.wait()
                 player = SendspinPlayer(self, client_id)
                 self.logger.debug("Client %s connected", client_id)
+                if player.device_info.manufacturer == "ESPHome" and (
+                    hass := self.mass.get_provider("hass")
+                ):
+                    # Try to get device name from Home Assistant for ESPHome devices
+                    hass = cast("HomeAssistantProvider", hass)
+                    if hass_device := await hass.get_device_by_connection(client_id):
+                        player._attr_name = (
+                            hass_device["name_by_user"] or hass_device["name"] or player.name
+                        )
                 await self.mass.players.register(player)
             case ClientRemovedEvent(client_id):
                 self.logger.debug("Client %s disconnected", client_id)
-                await self.mass.players.unregister(client_id)
+                unregister_event = asyncio.Event()
+                self._pending_unregisters[client_id] = unregister_event
+                try:
+                    await self.mass.players.unregister(client_id)
+                finally:
+                    self._pending_unregisters.pop(client_id, None)
+                    unregister_event.set()
             case _:
                 self.logger.error("Unknown sendspin event: %s", event)
 
@@ -76,7 +100,8 @@ class SendspinProvider(PlayerProvider):
         Handle unload/close of the provider.
 
         Called when provider is deregistered (e.g. MA exiting or config reloading).
-        is_removed will be set to True when the provider is removed from the configuration.
+
+        :param is_removed: True when the provider is removed from the configuration.
         """
         # Stop the Sendspin server
         await self.server_api.close()

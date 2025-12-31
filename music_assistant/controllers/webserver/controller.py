@@ -10,15 +10,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
-import json
 import os
-import ssl
-import tempfile
 import urllib.parse
 from collections.abc import Awaitable, Callable
 from concurrent import futures
 from functools import partial
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast
 from urllib.parse import quote
 
@@ -27,7 +23,7 @@ from aiohttp import ClientTimeout, web
 from mashumaro.exceptions import MissingField
 from music_assistant_frontend import where as locate_frontend
 from music_assistant_models.api import CommandMessage
-from music_assistant_models.auth import AuthProviderType, User, UserRole
+from music_assistant_models.auth import UserRole
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import ConfigEntryType
 
@@ -35,10 +31,13 @@ from music_assistant.constants import (
     CONF_AUTH_ALLOW_SELF_REGISTRATION,
     CONF_BIND_IP,
     CONF_BIND_PORT,
-    CONF_ONBOARD_DONE,
-    DB_TABLE_PLAYLOG,
     RESOURCES_DIR,
     VERBOSE_LOG_LEVEL,
+)
+from music_assistant.controllers.webserver.helpers.ssl import (
+    create_server_ssl_context,
+    format_certificate_info,
+    verify_ssl_certificate,
 )
 from music_assistant.helpers.api import parse_arguments
 from music_assistant.helpers.audio import get_preview_stream
@@ -55,8 +54,9 @@ from .helpers.auth_middleware import (
     is_request_from_ingress,
     set_current_user,
 )
-from .helpers.auth_providers import BuiltinLoginProvider
+from .helpers.auth_providers import BuiltinLoginProvider, get_ha_user_role
 from .remote_access import RemoteAccessManager
+from .sendspin_proxy import SendspinProxyHandler
 from .websocket_client import WebsocketClientHandler
 
 if TYPE_CHECKING:
@@ -70,6 +70,7 @@ CONF_BASE_URL = "base_url"
 CONF_ENABLE_SSL = "enable_ssl"
 CONF_SSL_CERTIFICATE = "ssl_certificate"
 CONF_SSL_PRIVATE_KEY = "ssl_private_key"
+CONF_ACTION_VERIFY_SSL = "verify_ssl"
 MAX_PENDING_MSG = 512
 CANCELLATION_ERRORS: Final = (asyncio.CancelledError, futures.CancelledError)
 
@@ -93,6 +94,7 @@ class WebserverController(CoreController):
         self.manifest.icon = "web-box"
         self.auth = AuthenticationManager(self)
         self.remote_access = RemoteAccessManager(self)
+        self._sendspin_proxy = SendspinProxyHandler(self)
 
     @property
     def base_url(self) -> str:
@@ -108,6 +110,15 @@ class WebserverController(CoreController):
         ip_addresses = await get_ip_addresses()
         default_publish_ip = ip_addresses[0]
 
+        # Handle verify SSL action
+        ssl_verify_result = ""
+        if action == CONF_ACTION_VERIFY_SSL and values:
+            cert_info = await verify_ssl_certificate(
+                str(values.get(CONF_SSL_CERTIFICATE, "")),
+                str(values.get(CONF_SSL_PRIVATE_KEY, "")),
+            )
+            ssl_verify_result = format_certificate_info(cert_info)
+
         # Determine if SSL is enabled from values
         ssl_enabled = values.get(CONF_ENABLE_SSL, False) if values else False
         protocol = "https" if ssl_enabled else "http"
@@ -118,8 +129,7 @@ class WebserverController(CoreController):
                 type=ConfigEntryType.BOOLEAN,
                 default_value=True,
                 label="Allow User Self-Registration",
-                description="Allow users to create accounts via Home Assistant OAuth. \n"
-                "New users will have USER role by default.",
+                description="Allow users to create accounts via Home Assistant OAuth.",
                 hidden=not any(provider.domain == "hass" for provider in self.mass.providers),
             ),
             ConfigEntry(
@@ -141,15 +151,16 @@ class WebserverController(CoreController):
             ConfigEntry(
                 key="webserver_warn",
                 type=ConfigEntryType.ALERT,
-                label="Please note that the webserver is unencrypted. "
+                label="Please note that the webserver is by default unencrypted. "
                 "Never ever expose the webserver directly to the internet! \n\n"
-                "Use a reverse proxy or VPN to secure access, or enable SSL below. \n\n"
+                "Enable SSL below or use a reverse proxy or VPN to secure access. \n\n"
                 "As an alternative, consider using the Remote Access feature which "
                 "secures access to your Music Assistant instance without the need to "
                 "expose your webserver directly.",
                 required=False,
                 depends_on=CONF_ENABLE_SSL,
                 depends_on_value=False,
+                hidden=bool(values.get(CONF_ENABLE_SSL, False)) if values else False,
             ),
             ConfigEntry(
                 key=CONF_ENABLE_SSL,
@@ -163,8 +174,11 @@ class WebserverController(CoreController):
                 key=CONF_SSL_CERTIFICATE,
                 type=ConfigEntryType.STRING,
                 label="SSL Certificate",
-                description="Paste the contents of your SSL certificate file (PEM format). \n"
-                "This should include the full certificate chain if applicable.",
+                description="Provide your SSL certificate in PEM format. You can either:\n"
+                "- Paste the full contents of your certificate file, or\n"
+                "- Enter an absolute file path (e.g., /ssl/fullchain.pem)\n\n"
+                "This should include the full certificate chain if applicable.\n"
+                "Both RSA and ECDSA certificates are supported.",
                 required=False,
                 depends_on=CONF_ENABLE_SSL,
             ),
@@ -172,10 +186,32 @@ class WebserverController(CoreController):
                 key=CONF_SSL_PRIVATE_KEY,
                 type=ConfigEntryType.SECURE_STRING,
                 label="SSL Private Key",
-                description="Paste the contents of your SSL private key file (PEM format). \n"
+                description="Provide your SSL private key in PEM format. You can either:\n"
+                "- Paste the full contents of your private key file, or\n"
+                "- Enter an absolute file path (e.g., /ssl/privkey.pem)\n\n"
+                "Both RSA and ECDSA keys are supported. The key must be unencrypted.\n"
                 "This is securely encrypted and stored.",
                 required=False,
                 depends_on=CONF_ENABLE_SSL,
+            ),
+            ConfigEntry(
+                key=CONF_ACTION_VERIFY_SSL,
+                type=ConfigEntryType.ACTION,
+                label="Verify SSL Certificate",
+                description="Test your certificate and private key to verify they are valid "
+                "and match each other.",
+                action=CONF_ACTION_VERIFY_SSL,
+                action_label="Verify",
+                depends_on=CONF_ENABLE_SSL,
+                required=False,
+            ),
+            ConfigEntry(
+                key="ssl_verify_result",
+                type=ConfigEntryType.LABEL,
+                label=ssl_verify_result,
+                hidden=not ssl_verify_result,
+                depends_on=CONF_ENABLE_SSL,
+                required=False,
             ),
             ConfigEntry(
                 key=CONF_BIND_IP,
@@ -221,9 +257,6 @@ class WebserverController(CoreController):
         # add info
         routes.append(("GET", "/info", self._handle_server_info))
         routes.append(("OPTIONS", "/info", self._handle_cors_preflight))
-        # add logging
-        routes.append(("GET", "/music-assistant.log", self._handle_application_log))
-        routes.append(("OPTIONS", "/music-assistant.log", self._handle_cors_preflight))
         # add websocket api
         routes.append(("GET", "/ws", self._handle_ws_client))
         # also host the image proxy on the webserver
@@ -257,6 +290,8 @@ class WebserverController(CoreController):
         # add first-time setup routes
         routes.append(("GET", "/setup", self._handle_setup_page))
         routes.append(("POST", "/setup", self._handle_setup))
+        # add sendspin proxy route (authenticated WebSocket proxy to internal sendspin server)
+        routes.append(("GET", "/sendspin", self._sendspin_proxy.handle_sendspin_proxy))
         await self.auth.setup()
         # start the webserver
         all_ip_addresses = await get_ip_addresses()
@@ -278,7 +313,7 @@ class WebserverController(CoreController):
         bind_ip = cast("str | None", config.get_value(CONF_BIND_IP))
         # print a big fat message in the log where the webserver is running
         # because this is a common source of issues for people with more complex setups
-        if not self.mass.config.onboard_done:
+        if not self.auth.has_users:
             self.logger.warning(
                 "\n\n################################################################################\n"
                 "###                           SETUP REQUIRED                                 ###\n"
@@ -289,21 +324,20 @@ class WebserverController(CoreController):
                 "\n"
                 "    %s/setup\n"
                 "\n"
-                "Webserver running on: %s:%s\n"
+                "################################################################################\n",
+                base_url,
+            )
+        else:
+            self.logger.info(
+                "\n"
+                "################################################################################\n"
+                "\n"
+                "Webserver available on: %s\n"
                 "\n"
                 "If this address is incorrect, see the documentation on how to configure\n"
                 "the Webserver in Settings --> Core modules --> Webserver\n"
                 "\n"
                 "################################################################################\n",
-                base_url,
-                bind_ip,
-                self.publish_port,
-            )
-        else:
-            self.logger.info(
-                "Starting webserver on  %s:%s - base url: %s\n#\n",
-                bind_ip,
-                self.publish_port,
                 base_url,
             )
 
@@ -311,52 +345,11 @@ class WebserverController(CoreController):
         ssl_context = None
         ssl_enabled = config.get_value(CONF_ENABLE_SSL, False)
         if ssl_enabled:
-            ssl_certificate = config.get_value(CONF_SSL_CERTIFICATE)
-            ssl_private_key = config.get_value(CONF_SSL_PRIVATE_KEY)
-
-            if not ssl_certificate or not ssl_private_key:
-                self.logger.error(
-                    "SSL is enabled but certificate or private key is missing. "
-                    "Webserver will start without SSL."
-                )
-            else:
-                try:
-                    # Create SSL context
-                    ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-
-                    # Write certificate and key to temporary files
-                    # This is necessary because ssl.SSLContext.load_cert_chain requires file paths
-                    with tempfile.NamedTemporaryFile(
-                        mode="w", suffix=".pem", delete=False
-                    ) as cert_file:
-                        cert_file.write(str(ssl_certificate))
-                        cert_path = cert_file.name
-
-                    with tempfile.NamedTemporaryFile(
-                        mode="w", suffix=".pem", delete=False
-                    ) as key_file:
-                        key_file.write(str(ssl_private_key))
-                        key_path = key_file.name
-
-                    try:
-                        # Load certificate and private key
-                        ssl_context.load_cert_chain(cert_path, key_path)
-                        self.logger.info("SSL/TLS enabled for webserver")
-                    finally:
-                        # Clean up temporary files
-                        try:
-                            Path(cert_path).unlink()
-                            Path(key_path).unlink()
-                        except Exception as cleanup_err:
-                            self.logger.debug(
-                                "Failed to cleanup temporary SSL files: %s", cleanup_err
-                            )
-
-                except Exception as e:
-                    self.logger.exception(
-                        "Failed to create SSL context: %s. Webserver will start without SSL.", e
-                    )
-                    ssl_context = None
+            ssl_context = await create_server_ssl_context(
+                str(config.get_value(CONF_SSL_CERTIFICATE) or ""),
+                str(config.get_value(CONF_SSL_PRIVATE_KEY) or ""),
+                logger=self.logger,
+            )
 
         await self._server.setup(
             bind_ip=bind_ip,
@@ -371,7 +364,7 @@ class WebserverController(CoreController):
             ssl_context=ssl_context,
         )
         if self.mass.running_as_hass_addon:
-            # announce to HA supervisor
+            # (re)announce to HA supervisor to make sure that HA picks it up
             await self._announce_to_homeassistant()
 
         # Setup remote access after webserver is running
@@ -468,10 +461,9 @@ class WebserverController(CoreController):
 
     async def _handle_jsonrpc_api_command(self, request: web.Request) -> web.Response:
         """Handle incoming JSON RPC API command."""
-        # Block until onboarding is complete
-        if not self.mass.config.onboard_done:
+        # Fail early if we don't have any users yet
+        if not self.auth.has_users:
             return web.Response(status=503, text="Setup required")
-
         if not request.can_read_body:
             return web.Response(status=400, text="Body required")
         cmd_data = await request.read()
@@ -502,33 +494,22 @@ class WebserverController(CoreController):
 
         # Check authentication if required
         if handler.authenticated or handler.required_role:
-            if is_request_from_ingress(request):
-                # Ingress authentication (Home Assistant)
-                user = await self._get_ingress_user(request)
-                if not user:
-                    # This should not happen - ingress requests should have user headers
-                    return web.Response(
-                        status=401,
-                        text="Ingress authentication failed - missing user information",
-                    )
-            else:
-                # Regular authentication (non-ingress)
-                try:
-                    user = await get_authenticated_user(request)
-                except Exception as e:
-                    self.logger.exception("Authentication error: %s", e)
-                    return web.Response(
-                        status=401,
-                        text="Authentication failed",
-                        headers={"WWW-Authenticate": 'Bearer realm="Music Assistant"'},
-                    )
+            try:
+                user = await get_authenticated_user(request)
+            except Exception as e:
+                self.logger.exception("Authentication error: %s", e)
+                return web.Response(
+                    status=401,
+                    text="Authentication failed",
+                    headers={"WWW-Authenticate": 'Bearer realm="Music Assistant"'},
+                )
 
-                if not user:
-                    return web.Response(
-                        status=401,
-                        text="Authentication required",
-                        headers={"WWW-Authenticate": 'Bearer realm="Music Assistant"'},
-                    )
+            if not user:
+                return web.Response(
+                    status=401,
+                    text="Authentication required",
+                    headers={"WWW-Authenticate": 'Bearer realm="Music Assistant"'},
+                )
 
             # Set user in context and check role
             set_current_user(user)
@@ -554,19 +535,6 @@ class WebserverController(CoreController):
             error = f"{error_type}: {error_msg}"
             self.logger.exception("Error executing command %s: %s", command_msg.command, error)
             return web.Response(status=500, text="Internal server error")
-
-    async def _handle_application_log(self, request: web.Request) -> web.Response:
-        """Handle request to get the application log."""
-        log_data = await self.mass.get_application_log()
-        return web.Response(
-            text=log_data,
-            content_type="text/text",
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type, Authorization",
-            },
-        )
 
     async def _handle_api_intro(self, request: web.Request) -> web.Response:
         """Handle request for API introduction/documentation page."""
@@ -614,27 +582,48 @@ class WebserverController(CoreController):
         swagger_html_path = str(RESOURCES_DIR.joinpath("swagger_ui.html"))
         return await self._server.serve_static(swagger_html_path, request)
 
+    async def _render_error_page(self, error_message: str, status: int = 403) -> web.Response:
+        """Render a user-friendly error page with the given message.
+
+        :param error_message: The error message to display to the user.
+        :param status: HTTP status code for the response.
+        """
+        error_html_path = str(RESOURCES_DIR.joinpath("error.html"))
+        async with aiofiles.open(error_html_path) as f:
+            html_content = await f.read()
+        # Replace placeholder with the actual error message (escape to prevent XSS)
+        html_content = html_content.replace("{{ERROR_MESSAGE}}", html.escape(error_message))
+        return web.Response(text=html_content, content_type="text/html", status=status)
+
     async def _handle_index(self, request: web.Request) -> web.StreamResponse:
-        """Handle request for index page with onboarding check."""
-        # If not yet onboarded, redirect to setup
-        if not self.mass.config.onboard_done or not await self.auth.has_users():
-            # Preserve return_url parameter if present (will be passed back after setup)
-            return_url = request.query.get("return_url")
-            if return_url:
-                quoted_return = urllib.parse.quote(return_url, safe="")
-                setup_url = f"setup?return_url={quoted_return}"
-            else:
-                # No return URL - just redirect to setup without the parameter
-                setup_url = "setup"
-            return web.Response(status=302, headers={"Location": setup_url})
+        """Handle request for index page (Vue frontend)."""
+        is_ingress_request = is_request_from_ingress(request)
+
+        if (not self.auth.has_users or not self.mass.config.onboard_done) and is_ingress_request:
+            # a non-admin user tries to access the index via HA ingress
+            # while we're not yet onboarded, prevent that as it leads to a bad UX
+            ingress_user_id = request.headers.get("X-Remote-User-ID", "")
+            role = await get_ha_user_role(self.mass, ingress_user_id)
+            if role != UserRole.ADMIN:
+                return await self._render_error_page(
+                    "Administrator permissions are required to complete the initial setup. "
+                    "Please ask a Home Assistant administrator to complete the setup first."
+                )
+            # NOTE: For ingress admin user,
+            # we allow access to index, user will be auto created and then forwarded to the
+            # frontend (which will take care of onboarding)
+
+        if not self.auth.has_users and not is_ingress_request:
+            # non ingress request and no users yet, redirect to setup
+            return web.Response(status=302, headers={"Location": "setup"})
 
         # Serve the Vue frontend index.html
         return await self._server.serve_static(self._index_path, request)
 
     async def _handle_login_page(self, request: web.Request) -> web.Response:
         """Handle request for login page (external client OAuth callback scenario)."""
-        # If not yet onboarded, redirect to setup
-        if not self.mass.config.onboard_done or not await self.auth.has_users():
+        if not self.auth.has_users:
+            # not yet onboarded (no first admin user exists), redirect to setup
             return_url = request.query.get("return_url", "")
             device_name = request.query.get("device_name", "")
             setup_url = (
@@ -643,7 +632,6 @@ class WebserverController(CoreController):
                 else "/setup"
             )
             return web.Response(status=302, headers={"Location": setup_url})
-
         # Serve login page for external clients
         login_html_path = str(RESOURCES_DIR.joinpath("login.html"))
         async with aiofiles.open(login_html_path) as f:
@@ -653,7 +641,7 @@ class WebserverController(CoreController):
     async def _handle_auth_login(self, request: web.Request) -> web.Response:
         """Handle login request."""
         # Block until onboarding is complete
-        if not self.mass.config.onboard_done:
+        if not self.auth.has_users:
             return web.json_response(
                 {"success": False, "error": "Setup required"},
                 status=403,
@@ -837,7 +825,7 @@ class WebserverController(CoreController):
             self.logger.exception("Error during OAuth authorization")
             return web.json_response({"error": "Authorization failed"}, status=500)
 
-    async def _handle_auth_callback(self, request: web.Request) -> web.Response:  # noqa: PLR0915
+    async def _handle_auth_callback(self, request: web.Request) -> web.Response:
         """Handle OAuth callback."""
         try:
             code = request.query.get("code")
@@ -868,22 +856,6 @@ class WebserverController(CoreController):
             # Create token
             device_name = f"OAuth ({provider_id})"
             token = await self.auth.create_token(auth_result.user, device_name)
-
-            if auth_result.return_url and auth_result.return_url.startswith(
-                "urn:ietf:wg:oauth:2.0:oob:auto:"
-            ):
-                session_id = auth_result.return_url.split(":")[-1]
-                if session_id in self.auth._pending_oauth_sessions:
-                    self.auth._pending_oauth_sessions[session_id] = token
-                    oauth_callback_html_path = str(RESOURCES_DIR.joinpath("oauth_callback.html"))
-                    async with aiofiles.open(oauth_callback_html_path) as f:
-                        success_html = await f.read()
-
-                    success_html = success_html.replace("{TOKEN}", token)
-                    success_html = success_html.replace("{REDIRECT_URL}", "about:blank")
-                    success_html = success_html.replace("{REQUIRES_CONSENT}", "false")
-
-                    return web.Response(text=success_html, content_type="text/html")
 
             # Determine redirect URL (use return_url from OAuth flow or default to root)
             final_redirect_url = auth_result.return_url or "/"
@@ -949,45 +921,28 @@ class WebserverController(CoreController):
 
     async def _handle_setup_page(self, request: web.Request) -> web.Response:
         """Handle request for first-time setup page."""
-        # Check if setup is needed
-        # Allow setup if either:
-        # 1. No users exist yet (fresh install)
-        # 2. Users exist but onboarding not done (e.g., Ingress auto-created user)
-        if await self.auth.has_users() and self.mass.config.get(CONF_ONBOARD_DONE):
-            # Setup already completed, redirect to login
-            return web.Response(status=302, headers={"Location": "/login"})
-
         # Validate return_url if provided
         return_url = request.query.get("return_url")
         if return_url:
             is_valid, _ = is_allowed_redirect_url(return_url, request, self.base_url)
             if not is_valid:
                 return web.Response(status=400, text="Invalid return_url")
+        else:
+            return_url = "/"
 
-        # Serve setup page
+        if self.auth.has_users:
+            # this should not happen, but guard anyways
+            return await self._render_error_page("Setup has already been completed.")
+
         setup_html_path = str(RESOURCES_DIR.joinpath("setup.html"))
         async with aiofiles.open(setup_html_path) as f:
             html_content = await f.read()
 
-        # Check if this is from Ingress - if so, pre-fill user info
-        if is_request_from_ingress(request):
-            ingress_username = request.headers.get("X-Remote-User-Name", "")
-            ingress_display_name = request.headers.get("X-Remote-User-Display-Name", "")
-
-            # Inject ingress user info into the page (use json.dumps to escape properly)
-            html_content = html_content.replace(
-                "const deviceName = urlParams.get('device_name');",
-                f"const deviceName = urlParams.get('device_name');\n"
-                f"        const ingressUsername = {json.dumps(ingress_username)};\n"
-                f"        const ingressDisplayName = {json.dumps(ingress_display_name)};",
-            )
-
         return web.Response(text=html_content, content_type="text/html")
 
     async def _handle_setup(self, request: web.Request) -> web.Response:
-        """Handle first-time setup request to create admin user."""
-        # Check if setup is still needed (allow if onboard_done is false)
-        if await self.auth.has_users() and self.mass.config.get(CONF_ONBOARD_DONE):
+        """Handle first-time setup request to create admin user (non-ingress only)."""
+        if self.auth.has_users:
             return web.json_response(
                 {"success": False, "error": "Setup already completed"}, status=400
             )
@@ -998,8 +953,6 @@ class WebserverController(CoreController):
         body = await request.json()
         username = body.get("username", "").strip()
         password = body.get("password", "")
-        from_ingress = body.get("from_ingress", False)
-        display_name = body.get("display_name")
 
         # Validation
         if not username or len(username) < 2:
@@ -1013,64 +966,23 @@ class WebserverController(CoreController):
             )
 
         try:
-            # Get built-in provider
             builtin_provider = self.auth.login_providers.get("builtin")
             if not builtin_provider:
                 return web.json_response(
-                    {"success": False, "error": "Built-in auth provider not available"}, status=500
+                    {"success": False, "error": "Built-in auth provider not available"},
+                    status=500,
                 )
 
             if not isinstance(builtin_provider, BuiltinLoginProvider):
                 return web.json_response(
-                    {"success": False, "error": "Built-in provider configuration error"}, status=500
+                    {"success": False, "error": "Built-in provider configuration error"},
+                    status=500,
                 )
 
-            # Check if this is an Ingress setup where user already exists
-            user = None
-            if from_ingress and is_request_from_ingress(request):
-                ha_user_id = request.headers.get("X-Remote-User-ID")
-                if ha_user_id:
-                    # Try to find existing auto-created Ingress user
-                    user = await self.auth.get_user_by_provider_link(
-                        AuthProviderType.HOME_ASSISTANT, ha_user_id
-                    )
-            if user:
-                # User already exists (auto-created from Ingress), update and add password
-                updates = {}
-                if display_name and not user.display_name:
-                    updates["display_name"] = display_name
-                    user.display_name = display_name
-
-                # Make user admin if not already
-                if user.role != UserRole.ADMIN:
-                    updates["role"] = UserRole.ADMIN.value
-                    user.role = UserRole.ADMIN
-
-                # Apply updates if any
-                if updates:
-                    await self.auth.database.update(
-                        "users",
-                        {"user_id": user.user_id},
-                        updates,
-                    )
-
-                # Add password authentication to existing user
-                password_hash = builtin_provider._hash_password(password, user.user_id)
-                await self.auth.link_user_to_provider(user, AuthProviderType.BUILTIN, password_hash)
-            else:
-                # Create new admin user with password
-                user = await builtin_provider.create_user_with_password(
-                    username, password, role=UserRole.ADMIN, display_name=display_name
-                )
-
-                # If from Ingress, also link to HA provider
-                if from_ingress and is_request_from_ingress(request):
-                    ha_user_id = request.headers.get("X-Remote-User-ID")
-                    if ha_user_id:
-                        # Link user to Home Assistant provider
-                        await self.auth.link_user_to_provider(
-                            user, AuthProviderType.HOME_ASSISTANT, ha_user_id
-                        )
+            # Create admin user with password
+            user = await builtin_provider.create_user_with_password(
+                username, password, role=UserRole.ADMIN
+            )
 
             # Create token for the new admin
             device_name = body.get(
@@ -1078,19 +990,9 @@ class WebserverController(CoreController):
             )
             token = await self.auth.create_token(user, device_name)
 
-            # Migrate existing playlog entries to this first user
-            await self._migrate_playlog_to_first_user(user.user_id)
-
-            # Mark onboarding as complete
-            self.mass.config.set(CONF_ONBOARD_DONE, True)
-            self.mass.config.save(immediate=True)
-
             self.logger.info("First admin user created: %s", username)
 
-            # Announce to Home Assistant now that onboarding is complete
-            if self.mass.running_as_hass_addon:
-                await self._announce_to_homeassistant()
-
+            # Return token - frontend will complete onboarding via config/onboard_complete
             return web.json_response(
                 {
                     "success": True,
@@ -1105,85 +1007,12 @@ class WebserverController(CoreController):
                 {"success": False, "error": f"Setup failed: {e!s}"}, status=500
             )
 
-    async def _migrate_playlog_to_first_user(self, user_id: str) -> None:
-        """
-        Migrate all existing playlog entries to the first user.
-
-        This is called during onboarding when the first admin user is created.
-        All existing playlog entries (which have NULL userid) will be updated
-        to belong to this first user.
-
-        :param user_id: The user ID of the first admin user.
-        """
-        try:
-            # Update all playlog entries with NULL userid to this user
-            await self.mass.music.database.execute(
-                f"UPDATE {DB_TABLE_PLAYLOG} SET userid = :userid WHERE userid IS NULL",
-                {"userid": user_id},
-            )
-            await self.mass.music.database.commit()
-            self.logger.info("Migrated existing playlog entries to first user: %s", user_id)
-        except Exception as err:
-            self.logger.warning("Failed to migrate playlog entries: %s", err)
-
-    async def _get_ingress_user(self, request: web.Request) -> User | None:
-        """
-        Get or create user for ingress (Home Assistant) requests.
-
-        Extracts user information from Home Assistant ingress headers and either
-        finds the existing linked user or creates a new one.
-
-        :param request: The web request with HA ingress headers.
-        :return: User object or None if headers are missing.
-        """
-        ingress_user_id = request.headers.get("X-Remote-User-ID")
-        ingress_username = request.headers.get("X-Remote-User-Name")
-        ingress_display_name = request.headers.get("X-Remote-User-Display-Name")
-
-        if not ingress_user_id or not ingress_username:
-            # No user headers available
-            return None
-
-        # Try to find existing user linked to this HA user ID
-        user = await self.auth.get_user_by_provider_link(
-            AuthProviderType.HOME_ASSISTANT, ingress_user_id
-        )
-
-        if not user:
-            # Security: Ensure at least one user exists (setup should have been completed)
-            if not await self.auth.has_users():
-                self.logger.warning("Ingress request attempted before setup completed")
-                return None
-
-            # Auto-create user for Ingress (they're already authenticated by HA)
-            # Always create with USER role (admin is created during setup)
-            user = await self.auth.create_user(
-                username=ingress_username,
-                role=UserRole.USER,
-                display_name=ingress_display_name,
-            )
-            # Link to Home Assistant provider
-            await self.auth.link_user_to_provider(
-                user, AuthProviderType.HOME_ASSISTANT, ingress_user_id
-            )
-            self.logger.info("Auto-created ingress user: %s", ingress_username)
-
-        return user
-
     async def _announce_to_homeassistant(self) -> None:
         """Announce Music Assistant Ingress server to Home Assistant via Supervisor API."""
-        # Only announce if server is onboarded to prevent race condition
-        # where HA integration ignores servers that are not yet onboarded
-        if not self.mass.config.onboard_done:
-            self.logger.debug("Skipping HA announcement - server not yet onboarded")
-            return
-
         supervisor_token = os.environ["SUPERVISOR_TOKEN"]
         addon_hostname = os.environ["HOSTNAME"]
-
         # Get or create auth token for the HA system user
         ha_integration_token = await self.auth.get_homeassistant_system_user_token()
-
         discovery_payload = {
             "service": "music_assistant",
             "config": {
@@ -1192,7 +1021,6 @@ class WebserverController(CoreController):
                 "auth_token": ha_integration_token,
             },
         }
-
         try:
             async with self.mass.http_session_no_ssl.post(
                 "http://supervisor/discovery",

@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any
 
 import aiofiles
 import orjson
-from aiohttp.client_exceptions import ClientError
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import (
     ConfigEntryType,
@@ -188,7 +187,7 @@ class ITunesPodcastsProvider(MusicProvider):
                 name=result.track_name,
                 item_id=result.feed_url,
                 publisher=result.artist_name,
-                provider=self.lookup_key,
+                provider=self.instance_id,
                 provider_mappings={
                     ProviderMapping(
                         item_id=result.feed_url,
@@ -207,7 +206,7 @@ class ITunesPodcastsProvider(MusicProvider):
                 if artwork_url is not None:
                     image_list.append(
                         MediaItemImage(
-                            type=ImageType.THUMB, path=artwork_url, provider=self.lookup_key
+                            type=ImageType.THUMB, path=artwork_url, provider=self.instance_id
                         )
                     )
             podcast.metadata.images = UniqueList(image_list)
@@ -221,9 +220,8 @@ class ITunesPodcastsProvider(MusicProvider):
         return parse_podcast(
             feed_url=prov_podcast_id,
             parsed_feed=parsed,
-            lookup_key=self.lookup_key,
-            domain=self.domain,
             instance_id=self.instance_id,
+            domain=self.domain,
         )
 
     async def get_podcast_episodes(
@@ -240,7 +238,6 @@ class ITunesPodcastsProvider(MusicProvider):
                 episode_cnt=cnt,
                 podcast_cover=podcast_cover,
                 domain=self.domain,
-                lookup_key=self.lookup_key,
                 instance_id=self.instance_id,
             ):
                 yield mass_episode
@@ -269,7 +266,7 @@ class ITunesPodcastsProvider(MusicProvider):
                 icon="mdi-trending-up",
                 # translation_key=shelf.id_,
                 items=UniqueList(podcast_list),
-                provider=self.lookup_key,
+                provider=self.instance_id,
             )
         ]
 
@@ -297,7 +294,7 @@ class ITunesPodcastsProvider(MusicProvider):
         if stream_url is None:
             raise MediaNotFoundError
         return StreamDetails(
-            provider=self.lookup_key,
+            provider=self.instance_id,
             item_id=item_id,
             audio_format=AudioFormat(
                 content_type=ContentType.try_parse(stream_url),
@@ -336,14 +333,12 @@ class ITunesPodcastsProvider(MusicProvider):
             default=None,
         )
         if parsed_podcast is None:
-            try:
-                parsed_podcast = await get_podcastparser_dict(
-                    session=self.mass.http_session,
-                    feed_url=prov_podcast_id,
-                    max_episodes=self.max_episodes,
-                )
-            except ClientError as exc:
-                raise MediaNotFoundError from exc
+            # get_podcastparser_dict raises MediaNotFoundError if data is invalid
+            parsed_podcast = await get_podcastparser_dict(
+                session=self.mass.http_session,
+                feed_url=prov_podcast_id,
+                max_episodes=self.max_episodes,
+            )
             await self._cache_set_podcast(feed_url=prov_podcast_id, parsed_podcast=parsed_podcast)
 
         # this is a dictionary from podcastparser

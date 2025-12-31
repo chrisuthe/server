@@ -154,7 +154,7 @@ class SonosPlayer(Player):
         )
         self._attr_device_info.model = self.discovery_info["device"]["modelDisplayName"]
         self._attr_device_info.manufacturer = self._provider.manifest.name
-        self._attr_can_group_with = {self._provider.lookup_key}
+        self._attr_can_group_with = {self._provider.instance_id}
 
         if SonosCapability.LINE_IN in self.discovery_info["device"]["capabilities"]:
             self._attr_source_list.append(PLAYER_SOURCE_MAP[SOURCE_LINE_IN])
@@ -384,7 +384,9 @@ class SonosPlayer(Player):
         if media.source_id:
             await self._set_sonos_queue_from_mass_queue(media.source_id)
 
-        if (media.source_id and media.queue_item_id) or media.media_type == MediaType.PLUGIN_SOURCE:
+        if (
+            not self.flow_mode and media.source_id and media.queue_item_id
+        ) or media.media_type == MediaType.PLUGIN_SOURCE:
             # Regular Queue item playback
             # create a sonos cloud queue and load it
             cloud_queue_url = f"{self.mass.streams.base_url}/sonos_queue/v2.3/"
@@ -572,7 +574,7 @@ class SonosPlayer(Player):
                     if x.player_id != airplay_player.player_id
                 )
             else:
-                self._attr_can_group_with = {self._provider.lookup_key}
+                self._attr_can_group_with = {self._provider.instance_id}
         else:
             # player is group child (synced to another player)
             group_parent: SonosPlayer = self.mass.players.get(
@@ -716,6 +718,8 @@ class SonosPlayer(Player):
 
     async def _connect(self, retry_on_fail: int = 0) -> None:
         """Connect to the Sonos player."""
+        if self.mass.closing:
+            return
         if self._listen_task and not self._listen_task.done():
             self.logger.debug("Already connected to Sonos player: %s", self.player_id)
             return
@@ -741,7 +745,7 @@ class SonosPlayer(Player):
                     self.logger.exception("Error in Sonos player listener: %s", err)
             finally:
                 self.logger.info("Disconnected from player API")
-                if self.connected:
+                if self.connected and not self.mass.closing:
                     # we didn't explicitly disconnect, try to reconnect
                     # this should simply try to reconnect once and if that fails
                     # we rely on mdns to pick it up again later
@@ -755,6 +759,8 @@ class SonosPlayer(Player):
 
     def reconnect(self, delay: float = 1) -> None:
         """Reconnect the player."""
+        if self.mass.closing:
+            return
         # use a task_id to prevent multiple reconnects
         task_id = f"sonos_reconnect_{self.player_id}"
         self.mass.call_later(delay, self._connect, delay, task_id=task_id)
@@ -880,19 +886,41 @@ class SonosPlayer(Player):
 
     async def _set_sonos_queue_from_mass_queue(self, queue_id: str) -> None:
         """Set the SonosQueue items from the given MA PlayerQueue."""
-        items = []
+        items: list[PlayerMedia] = []
         queue = self.mass.player_queues.get(queue_id)
         if not queue:
             self.sonos_queue.items.clear()
             return
         current_index = queue.current_index or 0
+
+        # Add a few items before the current index for context
         offset = max(0, current_index - 4)
-        queue_items = self.mass.player_queues.items(queue_id=queue_id, offset=offset, limit=10)
-        for item in queue_items:
-            if not item.available:
-                continue
-            media = await self.mass.player_queues.player_media_from_queue_item(item, False)
+        for idx in range(offset, current_index):
+            if queue_item := self.mass.player_queues.get_item(queue_id, idx):
+                if queue_item.available:
+                    media = await self.mass.player_queues.player_media_from_queue_item(
+                        queue_item, False
+                    )
+                    items.append(media)
+
+        # Add the current item
+        if current_item := self.mass.player_queues.get_item(queue_id, current_index):
+            if current_item.available:
+                media = await self.mass.player_queues.player_media_from_queue_item(
+                    current_item, False
+                )
+                items.append(media)
+
+        # Use get_next_item to fetch next items, which accounts for repeat mode
+        last_index: int | str = current_index
+        for _ in range(5):
+            next_item = self.mass.player_queues.get_next_item(queue_id, last_index)
+            if next_item is None:
+                break
+            media = await self.mass.player_queues.player_media_from_queue_item(next_item, False)
             items.append(media)
+            last_index = next_item.queue_item_id
+
         self.sonos_queue.items = items
         self.logger.debug(
             "Set Sonos queue items from MA queue %s: %s",

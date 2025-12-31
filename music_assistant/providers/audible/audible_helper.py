@@ -11,14 +11,17 @@ import os
 import re
 from collections.abc import AsyncGenerator
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from os import PathLike
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlparse
 
 import audible
 import audible.register
 from audible import AsyncClient
+
+if TYPE_CHECKING:
+    from aiohttp import ClientSession
 from music_assistant_models.enums import ContentType, ImageType, MediaType, StreamType
 from music_assistant_models.errors import LoginFailed, MediaNotFoundError
 from music_assistant_models.media_items import (
@@ -41,14 +44,77 @@ CACHE_CATEGORY_CHAPTERS = 2
 _AUTH_CACHE: dict[str, audible.Authenticator] = {}
 
 
+async def refresh_access_token_compat(
+    refresh_token: str, domain: str, http_session: ClientSession, with_username: bool = False
+) -> dict[str, Any]:
+    """Refresh tokens with compatibility for new Audible API format.
+
+    The Audible API changed from returning 'access_token' to 'actor_access_token'.
+    This function handles both formats for backward compatibility.
+
+    :param refresh_token: The refresh token obtained after device registration.
+    :param domain: The top level domain (e.g., com, de).
+    :param http_session: The HTTP client session to use for requests.
+    :param with_username: If True, use audible domain instead of amazon.
+    :return: Dict with access_token and expires timestamp.
+    """
+    logger = logging.getLogger("audible_helper")
+
+    body = {
+        "app_name": "Audible",
+        "app_version": "3.56.2",
+        "source_token": refresh_token,
+        "requested_token_type": "access_token",
+        "source_token_type": "refresh_token",
+    }
+
+    target_domain = "audible" if with_username else "amazon"
+    url = f"https://api.{target_domain}.{domain}/auth/token"
+
+    async with http_session.post(url, data=body) as resp:
+        resp.raise_for_status()
+        resp_dict = await resp.json()
+
+    expires_in_sec = int(resp_dict.get("expires_in", 3600))
+    expires = (datetime.now(UTC) + timedelta(seconds=expires_in_sec)).timestamp()
+
+    # Handle new format (actor_access_token) or fall back to legacy (access_token)
+    access_token = resp_dict.get("actor_access_token") or resp_dict.get("access_token")
+
+    if not access_token:
+        logger.error("Token refresh response missing both actor_access_token and access_token")
+        raise LoginFailed("Token refresh failed: no access token in response")
+
+    logger.debug(
+        "Token refreshed successfully using %s format",
+        "new (actor)" if "actor_access_token" in resp_dict else "legacy",
+    )
+
+    return {"access_token": access_token, "expires": expires}
+
+
 async def cached_authenticator_from_file(path: str) -> audible.Authenticator:
-    """Get an authenticator from file with caching to avoid repeated file reads."""
+    """Get an authenticator from file with caching and signing auth validation.
+
+    :param path: Path to the authenticator JSON file.
+    :return: The cached or loaded Authenticator instance.
+    """
     logger = logging.getLogger("audible_helper")
     if path in _AUTH_CACHE:
         return _AUTH_CACHE[path]
 
     logger.debug("Loading authenticator from file %s and caching it", path)
     auth = await asyncio.to_thread(audible.Authenticator.from_file, path)
+
+    # Verify signing auth is available (not affected by API changes)
+    if auth.adp_token and auth.device_private_key:
+        logger.debug("Signing auth available - using stable RSA-signed requests")
+    else:
+        logger.warning(
+            "Signing auth not available - only bearer auth will work. "
+            "Consider re-authenticating for more stable auth."
+        )
+
     _AUTH_CACHE[path] = auth
     return auth
 
@@ -97,9 +163,9 @@ class AudibleHelper:
 
         try:
             if cached_book is not None:
-                album = await self._parse_audiobook(cached_book)
+                album = self._parse_audiobook(cached_book)
             else:
-                album = await self._parse_audiobook(audiobook_data)
+                album = self._parse_audiobook(audiobook_data)
             return album, total_processed + 1
         except MediaNotFoundError as exc:
             self.logger.warning(f"Skipping invalid audiobook: {exc}")
@@ -198,7 +264,11 @@ class AudibleHelper:
             )
 
     async def get_audiobook(self, asin: str, use_cache: bool = True) -> Audiobook:
-        """Fetch the audiobook by asin."""
+        """Fetch the full audiobook by asin with all details including chapters.
+
+        This method fetches complete audiobook details including chapters and resume position.
+        Use this when the user requests full details for a specific audiobook.
+        """
         if use_cache:
             cached_book = await self.mass.cache.get(
                 key=asin,
@@ -207,7 +277,10 @@ class AudibleHelper:
                 default=None,
             )
             if cached_book is not None:
-                return await self._parse_audiobook(cached_book)
+                book = self._parse_audiobook(cached_book)
+                # Enrich with chapters and resume position
+                await self._enrich_audiobook(book, asin)
+                return book
         response = await self._call_api(
             f"library/{asin}",
             response_groups="""
@@ -229,7 +302,34 @@ class AudibleHelper:
             category=CACHE_CATEGORY_AUDIOBOOK,
             data=item_data,
         )
-        return await self._parse_audiobook(item_data)
+        book = self._parse_audiobook(item_data)
+        # Enrich with chapters and resume position
+        await self._enrich_audiobook(book, asin)
+        return book
+
+    async def _enrich_audiobook(self, book: Audiobook, asin: str) -> None:
+        """Enrich audiobook with chapters and resume position.
+
+        This makes additional API calls and should only be used for full audiobook details,
+        not during library sync.
+        """
+        # Fetch chapters
+        chapters_data = await self._fetch_chapters(asin=asin)
+        if chapters_data:
+            chapters: list[MediaItemChapter] = [
+                self._parse_chapter_data(chapter, idx) for idx, chapter in enumerate(chapters_data)
+            ]
+            book.metadata.chapters = chapters
+            # Update duration from chapters if available (more accurate)
+            try:
+                duration = sum(chapter.get("length_ms", 0) for chapter in chapters_data) / 1000
+                if duration > 0:
+                    book.duration = duration
+            except Exception as exc:
+                self.logger.warning(f"Error calculating duration from chapters for {asin}: {exc}")
+
+        # Fetch resume position
+        book.resume_position_ms = await self.get_last_postion(asin=asin)
 
     async def get_stream(self, asin: str) -> StreamDetails:
         """Get stream details for a track (audiobook chapter)."""
@@ -492,8 +592,12 @@ class AudibleHelper:
 
         return MediaItemChapter(position=index, name=chapter_title, start=start, end=start + length)
 
-    async def _parse_audiobook(self, audiobook_data: dict[str, Any] | None) -> Audiobook:
-        """Parse audiobook data from API response."""
+    def _parse_audiobook(self, audiobook_data: dict[str, Any] | None) -> Audiobook:
+        """Parse audiobook data from API response.
+
+        NOTE: This is a pure parser - no API calls allowed here.
+        Chapters and resume position are fetched lazily when needed.
+        """
         if audiobook_data is None:
             self.logger.error("Received None audiobook_data in _parse_audiobook")
             raise MediaNotFoundError("Audiobook data not found")
@@ -505,13 +609,10 @@ class AudibleHelper:
         narrators = self._parse_contributors(audiobook_data.get("narrators"), "Unknown Narrator")
         authors = self._parse_contributors(audiobook_data.get("authors"), "Unknown Author")
 
-        # Get chapters and calculate duration
-        chapters_data = await self._fetch_chapters(asin=asin)
-        try:
-            duration = sum(chapter.get("length_ms", 0) for chapter in chapters_data) / 1000
-        except Exception as exc:
-            self.logger.warning(f"Error calculating duration for audiobook {asin}: {exc}")
-            duration = 0
+        # Get duration from runtime_length_min (provided by 'media' response group)
+        # Chapters are fetched lazily when streaming, not during library sync
+        runtime_minutes = audiobook_data.get("runtime_length_min", 0)
+        duration = runtime_minutes * 60 if runtime_minutes else 0
 
         # Create audiobook object
         book = Audiobook(
@@ -555,14 +656,9 @@ class AudibleHelper:
         image_path = audiobook_data.get("product_images", {}).get("500")
         book.metadata.images = UniqueList(self._create_images(image_path))
 
-        # Parse chapters
-        chapters: list[MediaItemChapter] = [
-            self._parse_chapter_data(chapter, idx) for idx, chapter in enumerate(chapters_data)
-        ]
-        book.metadata.chapters = chapters
+        # Chapters are not fetched during parsing - they are fetched lazily when streaming
+        # This avoids N+1 API calls during library sync
 
-        # Get resume position
-        book.resume_position_ms = await self.get_last_postion(asin=asin)
         return book
 
     async def deregister(self) -> None:
@@ -607,30 +703,38 @@ async def audible_get_auth_info(locale: str) -> tuple[str, str, str]:
 async def audible_custom_login(
     code_verifier: str, response_url: str, serial: str, locale: str
 ) -> audible.Authenticator:
-    """
-    Complete the authentication using the code_verifier, response_url, and serial asynchronously.
+    """Complete the authentication using the code_verifier, response_url, and serial.
 
-    Args:
-        code_verifier: The code verifier string used in OAuth flow
-        response_url: The response URL containing the authorization code
-        serial: The device serial number
-        locale: The locale string
-    Returns:
-        Audible Authenticator object
-    Raises:
-        LoginFailed: If authorization code is not found in the URL
+    :param code_verifier: The code verifier string used in OAuth flow.
+    :param response_url: The response URL containing the authorization code.
+    :param serial: The device serial number.
+    :param locale: The locale string.
+    :return: Audible Authenticator object.
+    :raises LoginFailed: If authorization code is not found in the URL.
     """
+    logger = logging.getLogger("audible_helper")
     auth = audible.Authenticator()
     auth.locale = audible.localization.Locale(locale)
 
     response_url_parsed = urlparse(response_url)
     parsed_qs = parse_qs(response_url_parsed.query)
 
-    authorization_codes = parsed_qs.get("openid.oa2.authorization_code")
-    if not authorization_codes:
-        raise LoginFailed("Authorization code not found in the provided URL.")
+    # Try multiple parameter names for authorization code
+    # Audible may use different parameter names depending on the flow
+    authorization_code = None
+    for param_name in ["openid.oa2.authorization_code", "authorization_code", "code"]:
+        if codes := parsed_qs.get(param_name):
+            authorization_code = codes[0]
+            logger.debug("Found authorization code in parameter: %s", param_name)
+            break
 
-    authorization_code = authorization_codes[0]
+    if not authorization_code:
+        available_params = list(parsed_qs.keys())
+        raise LoginFailed(
+            f"Authorization code not found in URL. "
+            f"Expected 'openid.oa2.authorization_code' but found parameters: {available_params}"
+        )
+
     registration_data = await asyncio.to_thread(
         audible.register.register,
         authorization_code=authorization_code,
@@ -639,6 +743,13 @@ async def audible_custom_login(
         serial=serial,
     )
     auth._update_attrs(**registration_data)
+
+    # Log what auth methods are available after registration
+    if auth.adp_token and auth.device_private_key:
+        logger.info("Registration successful with signing auth (stable)")
+    else:
+        logger.warning("Registration successful but signing auth not available")
+
     return auth
 
 

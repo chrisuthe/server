@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import logging
@@ -73,8 +74,6 @@ from music_assistant.models import ProviderModuleType
 from music_assistant.models.music_provider import MusicProvider
 
 if TYPE_CHECKING:
-    import asyncio
-
     from music_assistant import MusicAssistant
     from music_assistant.models.core_controller import CoreController
 
@@ -117,12 +116,34 @@ class ConfigController:
         self._fernet = Fernet(fernet_key)
         config_entries.ENCRYPT_CALLBACK = self.encrypt_string
         config_entries.DECRYPT_CALLBACK = self.decrypt_string
+        if not self.onboard_done:
+            self.mass.register_api_command(
+                "config/onboard_complete",
+                self.set_onboard_complete,
+                authenticated=True,
+                alias=True,  # hide from public API docs
+            )
         LOGGER.debug("Started.")
 
     @property
     def onboard_done(self) -> bool:
         """Return True if onboarding is done."""
         return bool(self.get(CONF_ONBOARD_DONE, False))
+
+    async def set_onboard_complete(self) -> None:
+        """
+        Mark onboarding as complete.
+
+        This is called by the frontend after the user has completed the onboarding wizard.
+        Only available when onboarding is not yet complete.
+        """
+        if self.onboard_done:
+            msg = "Onboarding already completed"
+            raise InvalidDataError(msg)
+
+        self.set(CONF_ONBOARD_DONE, True)
+        self.save(immediate=True)
+        LOGGER.info("Onboarding completed")
 
     async def close(self) -> None:
         """Handle logic on server stop."""
@@ -193,7 +214,7 @@ class ConfigController:
 
         self.save()
 
-    @api_command("config/providers", required_role="admin")
+    @api_command("config/providers")
     async def get_provider_configs(
         self,
         provider_type: ProviderType | None = None,
@@ -214,7 +235,7 @@ class ConfigController:
             and prov_conf["domain"] in prov_entries
         ]
 
-    @api_command("config/providers/get", required_role="admin")
+    @api_command("config/providers/get")
     async def get_provider_config(self, instance_id: str) -> ProviderConfig:
         """Return configuration for a single provider."""
         if raw_conf := self.get(f"{CONF_PROVIDERS}/{instance_id}", {}):
@@ -400,13 +421,18 @@ class ConfigController:
             ):
                 extra_entries.append(CONF_ENTRY_LIBRARY_SYNC_BACK)
 
-        return [
+        all_entries = [
             *DEFAULT_PROVIDER_CONFIG_ENTRIES,
             *extra_entries,
             *await prov_mod.get_config_entries(
                 self.mass, instance_id=instance_id, action=action, values=values
             ),
         ]
+        # set current value from stored values
+        for entry in all_entries:
+            if entry.value is None:
+                entry.value = values.get(entry.key, None)
+        return all_entries
 
     @api_command("config/providers/save", required_role="admin")
     async def save_provider_config(
@@ -496,7 +522,7 @@ class ConfigController:
         if raw_conf := self.get(f"{CONF_PLAYERS}/{player_id}"):
             if player := self.mass.players.get(player_id, False):
                 raw_conf["default_name"] = player.display_name
-                raw_conf["provider"] = player.provider.lookup_key
+                raw_conf["provider"] = player.provider.instance_id
                 # pass action and values to get_config_entries
                 if values is None:
                     values = raw_conf.get("values", {})
@@ -532,7 +558,12 @@ class ConfigController:
         if values is None:
             values = self.get(f"{CONF_PLAYERS}/{player_id}/values", {})
 
-        return await player.get_config_entries(action=action, values=values)
+        all_entries = await player.get_config_entries(action=action, values=values)
+        # set current value from stored values
+        for entry in all_entries:
+            if entry.value is None:
+                entry.value = values.get(entry.key, None)
+        return all_entries
 
     @overload
     async def get_player_config_value(
@@ -910,9 +941,9 @@ class ConfigController:
         )
         default_config.validate()
         conf_key = f"{CONF_PROVIDERS}/{default_config.instance_id}"
-        self.set(conf_key, default_config.to_raw())
+        self.set_default(conf_key, default_config.to_raw())
 
-    @api_command("config/core", required_role="admin")
+    @api_command("config/core")
     async def get_core_configs(self, include_values: bool = False) -> list[CoreConfig]:
         """Return all core controllers config options."""
         return [
@@ -1014,10 +1045,15 @@ class ConfigController:
         if values is None:
             values = self.get(f"{CONF_CORE}/{domain}/values", {})
         controller: CoreController = getattr(self.mass, domain)
-        return list(
+        all_entries = list(
             await controller.get_config_entries(action=action, values=values)
             + DEFAULT_CORE_CONFIG_ENTRIES
         )
+        # set current value from stored values
+        for entry in all_entries:
+            if entry.value is None:
+                entry.value = values.get(entry.key, None)
+        return all_entries
 
     @api_command("config/core/save", required_role="admin")
     async def save_core_config(
@@ -1027,20 +1063,31 @@ class ConfigController:
     ) -> CoreConfig:
         """Save CoreController Config values."""
         config = await self.get_core_config(domain)
+        prev_config = config.to_raw()
         changed_keys = config.update(values)
         # validate the new config
         config.validate()
         if not changed_keys:
             # no changes
             return config
-        # try to load the provider first to catch errors before we save it.
-        controller: CoreController = getattr(self.mass, domain)
-        await controller.reload(config)
-        # reload succeeded, save new config
-        config.last_error = None
+        # save the config first before reloading to avoid issues on reload
+        # for example when reloading the webserver we might be cancelled here
         conf_key = f"{CONF_CORE}/{domain}"
         self.set(conf_key, config.to_raw())
-        # return full config, just in case
+        self.save(immediate=True)
+        try:
+            controller: CoreController = getattr(self.mass, domain)
+            await controller.reload(config)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            # revert to previous config on error
+            self.set(conf_key, prev_config)
+            self.save(immediate=True)
+            raise
+        # reload succeeded; clear last_error and persist the final state
+        config.last_error = None
+        # return full config
         return await self.get_core_config(domain)
 
     if TYPE_CHECKING:
@@ -1311,21 +1358,32 @@ class ConfigController:
                 values[CONF_SMART_FADES_MODE] = "smart_crossfade"
                 changed = True
 
-        # migrate player configs: always use lookup key for provider
-        prov_configs = self._data.get(CONF_PROVIDERS, {})
+        # Remove obsolete builtin_player configurations (provider was deleted in 2.7)
+        for player_id, player_config in list(self._data.get(CONF_PLAYERS, {}).items()):
+            if player_config.get("provider") != "builtin_player":
+                continue
+            self._data[CONF_PLAYERS].pop(player_id, None)
+            # Also remove any DSP config for this player
+            if CONF_PLAYER_DSP in self._data:
+                self._data[CONF_PLAYER_DSP].pop(player_id, None)
+            LOGGER.warning("Removed obsolete builtin_player configuration: %s", player_id)
+            changed = True
+
+        # migrate player configs: always use instance_id for provider
         for player_config in self._data.get(CONF_PLAYERS, {}).values():
             if "provider" not in player_config:
                 continue
             player_provider = player_config["provider"]
-            if prov_conf := prov_configs.get(player_provider):
-                if not (prov_manifest := self.mass.get_provider_manifest(prov_conf["domain"])):
+            try:
+                if not (prov := self.mass.get_provider(player_provider)):
                     continue
-                if prov_manifest.multi_instance:
-                    # multi instance providers use instance_id as lookup key
-                    continue
-                # single instance providers use domain as lookup key
-                player_config["provider"] = prov_conf["domain"]
-                changed = True
+            except KeyError:
+                # removed provider
+                continue
+            if player_config["provider"] == prov.instance_id:
+                continue
+            player_config["provider"] = prov.instance_id
+            changed = True
 
         if changed:
             await self._async_save()
@@ -1453,4 +1511,10 @@ class ConfigController:
             # loading failed, remove config
             self.remove(conf_key)
             raise
+        if not self.onboard_done:
+            # mark onboard as complete as soon as the first provider is added
+            await self.set_onboard_complete()
+        if manifest.type == ProviderType.MUSIC:
+            # correct any multi-instance provider mappings
+            self.mass.create_task(self.mass.music.correct_multi_instance_provider_mappings())
         return config

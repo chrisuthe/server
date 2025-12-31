@@ -67,7 +67,7 @@ from music_assistant.helpers.auth import AuthenticationHelper
 from music_assistant.helpers.json import json_loads
 from music_assistant.helpers.playlists import fetch_playlist
 from music_assistant.helpers.throttle_retry import ThrottlerManager, throttle_with_retries
-from music_assistant.helpers.util import infer_album_type
+from music_assistant.helpers.util import infer_album_type, parse_title_and_version
 from music_assistant.models.music_provider import MusicProvider
 
 if TYPE_CHECKING:
@@ -641,7 +641,7 @@ class AppleMusicProvider(MusicProvider):
                 ) from exc
             return StreamDetails(
                 item_id=item_id,
-                provider=self.lookup_key,
+                provider=self.instance_id,
                 path=stream_url,
                 stream_type=StreamType.HTTP,
                 audio_format=AudioFormat(content_type=ContentType.UNKNOWN),
@@ -656,7 +656,7 @@ class AppleMusicProvider(MusicProvider):
         key_id = base64.b64decode(uri.split(",")[1])
         return StreamDetails(
             item_id=item_id,
-            provider=self.lookup_key,
+            provider=self.instance_id,
             audio_format=AudioFormat(content_type=ContentType.MP4, codec_type=ContentType.AAC),
             stream_type=StreamType.ENCRYPTED_HTTP,
             decryption_key=await self._get_decryption_key(license_url, key_id, uri, item_id),
@@ -698,7 +698,7 @@ class AppleMusicProvider(MusicProvider):
             # No more details available other than the id, return an ItemMapping
             return ItemMapping(
                 media_type=MediaType.ARTIST,
-                provider=self.lookup_key,
+                provider=self.instance_id,
                 item_id=artist_id,
                 name=artist_id,
             )
@@ -718,7 +718,7 @@ class AppleMusicProvider(MusicProvider):
         if artwork := attributes.get("artwork"):
             artist.metadata.add_image(
                 MediaItemImage(
-                    provider=self.lookup_key,
+                    provider=self.instance_id,
                     type=ImageType.THUMB,
                     path=artwork["url"].format(w=artwork["width"], h=artwork["height"]),
                     remotely_accessible=True,
@@ -751,7 +751,7 @@ class AppleMusicProvider(MusicProvider):
             # No more details available other than the id, return an ItemMapping
             return ItemMapping(
                 media_type=MediaType.ALBUM,
-                provider=self.lookup_key,
+                provider=self.instance_id,
                 item_id=album_id,
                 name=album_id,
             )
@@ -762,10 +762,12 @@ class AppleMusicProvider(MusicProvider):
                 attributes.get("name"),
             )
             return None
+        name, version = parse_title_and_version(attributes["name"])
         album = Album(
             item_id=album_id,
             provider=self.domain,
-            name=attributes.get("name"),
+            name=name,
+            version=version,
             provider_mappings={
                 ProviderMapping(
                     item_id=album_id,
@@ -783,7 +785,7 @@ class AppleMusicProvider(MusicProvider):
                 [
                     ItemMapping(
                         media_type=MediaType.ARTIST,
-                        provider=self.lookup_key,
+                        provider=self.instance_id,
                         item_id=artist_name,
                         name=artist_name,
                     )
@@ -796,7 +798,7 @@ class AppleMusicProvider(MusicProvider):
         if artwork := attributes.get("artwork"):
             album.metadata.add_image(
                 MediaItemImage(
-                    provider=self.lookup_key,
+                    provider=self.instance_id,
                     type=ImageType.THUMB,
                     path=artwork["url"].format(w=artwork["width"], h=artwork["height"]),
                     remotely_accessible=True,
@@ -848,10 +850,12 @@ class AppleMusicProvider(MusicProvider):
         else:
             track_id = track_obj["id"]
             attributes = {}
+        name, version = parse_title_and_version(attributes.get("name", ""))
         track = Track(
             item_id=track_id,
             provider=self.domain,
-            name=attributes.get("name"),
+            name=name,
+            version=version,
             duration=attributes.get("durationInMillis", 0) / 1000,
             provider_mappings={
                 ProviderMapping(
@@ -879,7 +883,7 @@ class AppleMusicProvider(MusicProvider):
                 ItemMapping(
                     media_type=MediaType.ARTIST,
                     item_id=artist_name,
-                    provider=self.lookup_key,
+                    provider=self.instance_id,
                     name=artist_name,
                 )
             ]
@@ -889,7 +893,7 @@ class AppleMusicProvider(MusicProvider):
         if artwork := attributes.get("artwork"):
             track.metadata.add_image(
                 MediaItemImage(
-                    provider=self.lookup_key,
+                    provider=self.instance_id,
                     type=ImageType.THUMB,
                     path=artwork["url"].format(w=artwork["width"], h=artwork["height"]),
                     remotely_accessible=True,
@@ -913,7 +917,7 @@ class AppleMusicProvider(MusicProvider):
         is_editable = attributes.get("canEdit", False)
         playlist = Playlist(
             item_id=playlist_id,
-            provider=self.instance_id if is_editable else self.lookup_key,
+            provider=self.instance_id,
             name=attributes.get("name", UNKNOWN_PLAYLIST_NAME),
             owner=attributes.get("curatorName", "me"),
             provider_mappings={
@@ -922,6 +926,7 @@ class AppleMusicProvider(MusicProvider):
                     provider_domain=self.domain,
                     provider_instance=self.instance_id,
                     url=attributes.get("url"),
+                    is_unique=is_editable,  # user-owned playlists are unique
                 )
             },
             is_editable=is_editable,
@@ -932,7 +937,7 @@ class AppleMusicProvider(MusicProvider):
                 url = url.format(w=artwork["width"], h=artwork["height"])
             playlist.metadata.add_image(
                 MediaItemImage(
-                    provider=self.lookup_key,
+                    provider=self.instance_id,
                     type=ImageType.THUMB,
                     path=url,
                     remotely_accessible=True,
