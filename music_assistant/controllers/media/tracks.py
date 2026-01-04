@@ -58,16 +58,16 @@ class TracksController(MediaControllerBase[Track]):
             tracks.*,
             (SELECT JSON_GROUP_ARRAY(
                 json_object(
-                'item_id', provider_mappings.provider_item_id,
-                    'provider_domain', provider_mappings.provider_domain,
-                        'provider_instance', provider_mappings.provider_instance,
-                        'available', provider_mappings.available,
-                        'audio_format', json(provider_mappings.audio_format),
-                        'url', provider_mappings.url,
-                        'details', provider_mappings.details,
-                        'in_library', provider_mappings.in_library,
-                        'is_unique', provider_mappings.is_unique
-                )) FROM provider_mappings WHERE provider_mappings.item_id = tracks.item_id AND media_type = 'track') AS provider_mappings,
+                'item_id', track_pm.provider_item_id,
+                    'provider_domain', track_pm.provider_domain,
+                        'provider_instance', track_pm.provider_instance,
+                        'available', track_pm.available,
+                        'audio_format', json(track_pm.audio_format),
+                        'url', track_pm.url,
+                        'details', track_pm.details,
+                        'in_library', track_pm.in_library,
+                        'is_unique', track_pm.is_unique
+                )) FROM provider_mappings track_pm WHERE track_pm.item_id = tracks.item_id AND track_pm.media_type = 'track') AS provider_mappings,
 
             (SELECT JSON_GROUP_ARRAY(
                 json_object(
@@ -166,10 +166,6 @@ class TracksController(MediaControllerBase[Track]):
         offset: int = 0,
         order_by: str = "sort_name",
         provider: str | list[str] | None = None,
-        extra_query: str | None = None,
-        extra_query_params: dict[str, Any] | None = None,
-        library_items_only: bool = True,
-        **kwargs: Any,
     ) -> list[Track]:
         """Get in-database tracks.
 
@@ -179,13 +175,9 @@ class TracksController(MediaControllerBase[Track]):
         :param offset: Number of items to skip.
         :param order_by: Order by field (e.g. 'sort_name', 'timestamp_added').
         :param provider: Filter by provider instance ID (single string or list).
-        :param extra_query: Additional SQL query string.
-        :param extra_query_params: Additional query parameters.
-        :param library_items_only: If True, only return items that are
-            marked as 'in_library' on any provider mapping.
         """
-        extra_query_params = extra_query_params or {}
-        extra_query_parts: list[str] = [extra_query] if extra_query else []
+        extra_query_params: dict[str, Any] = {}
+        extra_query_parts: list[str] = []
         extra_join_parts: list[str] = []
         if search and " - " in search:
             # handle combined artist + title search
@@ -202,7 +194,7 @@ class TracksController(MediaControllerBase[Track]):
                 "AND artists.search_name LIKE :search_artist"
             )
             extra_query_params["search_artist"] = f"%{artist_str}%"
-        result = await self._get_library_items_by_query(
+        result = await self.get_library_items_by_query(
             favorite=favorite,
             search=search,
             limit=limit,
@@ -212,7 +204,6 @@ class TracksController(MediaControllerBase[Track]):
             extra_query_parts=extra_query_parts,
             extra_query_params=extra_query_params,
             extra_join_parts=extra_join_parts,
-            in_library_only=library_items_only,
         )
         if search and len(result) < 25 and not offset:
             # append artist items to result
@@ -224,7 +215,7 @@ class TracksController(MediaControllerBase[Track]):
             )
             extra_query_params["search_artist"] = f"%{artist_search_str}%"
             existing_uris = {item.uri for item in result}
-            for _track in await self._get_library_items_by_query(
+            for _track in await self.get_library_items_by_query(
                 favorite=favorite,
                 search=None,
                 limit=limit,
@@ -233,7 +224,6 @@ class TracksController(MediaControllerBase[Track]):
                 extra_query_parts=extra_query_parts,
                 extra_query_params=extra_query_params,
                 extra_join_parts=extra_join_parts,
-                in_library_only=library_items_only,
             ):
                 # prevent duplicates (when artist is also in the title)
                 if _track.uri not in existing_uris:
@@ -416,13 +406,15 @@ class TracksController(MediaControllerBase[Track]):
         item_id: str | int,
     ) -> list[Album]:
         """Return all in-library albums for a track."""
+        db_id = int(item_id)  # ensure integer
         subquery = (
             f"SELECT album_id FROM {DB_TABLE_ALBUM_TRACKS} "
-            f"WHERE {DB_TABLE_ALBUM_TRACKS}.track_id = {item_id}"
+            f"WHERE {DB_TABLE_ALBUM_TRACKS}.track_id = :track_id"
         )
         query = f"{DB_TABLE_ALBUMS}.item_id in ({subquery})"
-        return await self.mass.music.albums._get_library_items_by_query(
-            extra_query_parts=[query], in_library_only=True
+        return await self.mass.music.albums.get_library_items_by_query(
+            extra_query_parts=[query],
+            extra_query_params={"track_id": db_id},
         )
 
     async def match_provider(

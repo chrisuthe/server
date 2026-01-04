@@ -40,16 +40,16 @@ class AudiobooksController(MediaControllerBase[Audiobook]):
             audiobooks.*,
             (SELECT JSON_GROUP_ARRAY(
                 json_object(
-                'item_id', provider_mappings.provider_item_id,
-                    'provider_domain', provider_mappings.provider_domain,
-                        'provider_instance', provider_mappings.provider_instance,
-                        'available', provider_mappings.available,
-                        'audio_format', json(provider_mappings.audio_format),
-                        'url', provider_mappings.url,
-                        'details', provider_mappings.details,
-                        'in_library', provider_mappings.in_library,
-                        'is_unique', provider_mappings.is_unique
-                )) FROM provider_mappings WHERE provider_mappings.item_id = audiobooks.item_id AND media_type = 'audiobook') AS provider_mappings,
+                'item_id', audiobook_pm.provider_item_id,
+                    'provider_domain', audiobook_pm.provider_domain,
+                        'provider_instance', audiobook_pm.provider_instance,
+                        'available', audiobook_pm.available,
+                        'audio_format', json(audiobook_pm.audio_format),
+                        'url', audiobook_pm.url,
+                        'details', audiobook_pm.details,
+                        'in_library', audiobook_pm.in_library,
+                        'is_unique', audiobook_pm.is_unique
+                )) FROM provider_mappings audiobook_pm WHERE audiobook_pm.item_id = audiobooks.item_id AND audiobook_pm.media_type = 'audiobook') AS provider_mappings,
             playlog.fully_played AS fully_played,
             playlog.seconds_played AS seconds_played,
             playlog.seconds_played * 1000 as resume_position_ms
@@ -68,10 +68,6 @@ class AudiobooksController(MediaControllerBase[Audiobook]):
         offset: int = 0,
         order_by: str = "sort_name",
         provider: str | list[str] | None = None,
-        extra_query: str | None = None,
-        extra_query_params: dict[str, Any] | None = None,
-        library_items_only: bool = True,
-        **kwargs: Any,
     ) -> list[Audiobook]:
         """Get in-database audiobooks.
 
@@ -81,14 +77,10 @@ class AudiobooksController(MediaControllerBase[Audiobook]):
         :param offset: Number of items to skip.
         :param order_by: Order by field (e.g. 'sort_name', 'timestamp_added').
         :param provider: Filter by provider instance ID (single string or list).
-        :param extra_query: Additional SQL query string.
-        :param extra_query_params: Additional query parameters.
-        :param library_items_only: If True, only return items that are
-            marked as 'in_library' on any provider mapping.
         """
-        extra_query_params = extra_query_params or {}
-        extra_query_parts: list[str] = [extra_query] if extra_query else []
-        result = await self._get_library_items_by_query(
+        extra_query_params: dict[str, Any] = {}
+        extra_query_parts: list[str] = []
+        result = await self.get_library_items_by_query(
             favorite=favorite,
             search=search,
             limit=limit,
@@ -97,7 +89,6 @@ class AudiobooksController(MediaControllerBase[Audiobook]):
             provider_filter=self._ensure_provider_filter(provider),
             extra_query_parts=extra_query_parts,
             extra_query_params=extra_query_params,
-            in_library_only=library_items_only,
         )
         if search and len(result) < 25 and not offset:
             # append author items to result
@@ -105,7 +96,7 @@ class AudiobooksController(MediaControllerBase[Audiobook]):
                 "WHERE audiobooks.authors LIKE :search or audiobooks.narrators LIKE :search",
             ]
             extra_query_params["search"] = f"%{search}%"
-            return result + await self._get_library_items_by_query(
+            return result + await self.get_library_items_by_query(
                 favorite=favorite,
                 search=None,
                 limit=limit,
@@ -113,7 +104,6 @@ class AudiobooksController(MediaControllerBase[Audiobook]):
                 provider_filter=self._ensure_provider_filter(provider),
                 extra_query_parts=extra_query_parts,
                 extra_query_params=extra_query_params,
-                in_library_only=library_items_only,
             )
         return result
 

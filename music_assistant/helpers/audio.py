@@ -319,8 +319,8 @@ async def get_stream_details(
         if (
             streamdetails.stream_type in (StreamType.ICY, StreamType.HLS, StreamType.HTTP)
             and streamdetails.media_type == MediaType.RADIO
+            and isinstance(streamdetails.path, str)
         ):
-            assert isinstance(streamdetails.path, str)  # for type checking
             resolved_url, stream_type = await resolve_radio_stream(mass, streamdetails.path)
             streamdetails.path = resolved_url
             streamdetails.stream_type = stream_type
@@ -765,7 +765,7 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
         return (cache[0], StreamType(cache[1]))
     stream_type = StreamType.HTTP
     resolved_url = url
-    timeout = ClientTimeout(total=0, connect=10, sock_read=5)
+    timeout = ClientTimeout(total=None, connect=10, sock_read=5)
     try:
         async with mass.http_session_no_ssl.get(
             url, headers=HTTP_HEADERS_ICY, allow_redirects=True, timeout=timeout
@@ -922,7 +922,7 @@ async def get_hls_substream(
     url: str,
 ) -> PlaylistItem:
     """Select the (highest quality) HLS substream for given HLS playlist/URL."""
-    timeout = ClientTimeout(total=0, connect=30, sock_read=5 * 60)
+    timeout = ClientTimeout(total=None, connect=30, sock_read=5 * 60)
     # fetch master playlist and select (best) child playlist
     # https://datatracker.ietf.org/doc/html/draft-pantos-http-live-streaming-19#section-10
     async with mass.http_session_no_ssl.get(
@@ -982,7 +982,7 @@ async def get_http_stream(
             seek_supported = resp.headers.get("Accept-Ranges") == "bytes"
     # headers
     headers = {**HTTP_HEADERS}
-    timeout = ClientTimeout(total=0, connect=30, sock_read=5 * 60)
+    timeout = ClientTimeout(total=None, connect=30, sock_read=5 * 60)
     skip_bytes = 0
     if seek_position and streamdetails.size:
         assert streamdetails.duration is not None  # for type checking

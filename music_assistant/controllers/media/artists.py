@@ -71,11 +71,7 @@ class ArtistsController(MediaControllerBase[Artist]):
         offset: int = 0,
         order_by: str = "sort_name",
         provider: str | list[str] | None = None,
-        extra_query: str | None = None,
-        extra_query_params: dict[str, Any] | None = None,
-        library_items_only: bool = True,
         album_artists_only: bool = False,
-        **kwargs: Any,
     ) -> list[Artist]:
         """Get in-database (album) artists.
 
@@ -85,20 +81,16 @@ class ArtistsController(MediaControllerBase[Artist]):
         :param offset: Number of items to skip.
         :param order_by: Order by field (e.g. 'sort_name', 'timestamp_added').
         :param provider: Filter by provider instance ID (single string or list).
-        :param extra_query: Additional SQL query string.
-        :param extra_query_params: Additional query parameters.
         :param album_artists_only: Only return artists that have albums.
-        :param library_items_only: If True, only return items that are
-            marked as 'in_library' on any provider mapping.
         """
-        extra_query_params = extra_query_params or {}
-        extra_query_parts: list[str] = [extra_query] if extra_query else []
+        extra_query_params: dict[str, Any] = {}
+        extra_query_parts: list[str] = []
         if album_artists_only:
             extra_query_parts.append(
                 f"artists.item_id in (select {DB_TABLE_ALBUM_ARTISTS}.artist_id "
                 f"from {DB_TABLE_ALBUM_ARTISTS})"
             )
-        return await self._get_library_items_by_query(
+        return await self.get_library_items_by_query(
             favorite=favorite,
             search=search,
             limit=limit,
@@ -107,7 +99,6 @@ class ArtistsController(MediaControllerBase[Artist]):
             provider_filter=self._ensure_provider_filter(provider),
             extra_query_parts=extra_query_parts,
             extra_query_params=extra_query_params,
-            in_library_only=library_items_only,
         )
 
     async def tracks(
@@ -207,7 +198,8 @@ class ArtistsController(MediaControllerBase[Artist]):
 
         # recursively also remove artist albums
         for db_row in await self.mass.music.database.get_rows_from_query(
-            f"SELECT album_id FROM {DB_TABLE_ALBUM_ARTISTS} WHERE artist_id = {db_id}",
+            f"SELECT album_id FROM {DB_TABLE_ALBUM_ARTISTS} WHERE artist_id = :artist_id",
+            {"artist_id": db_id},
             limit=5000,
         ):
             if not recursive:
@@ -216,7 +208,8 @@ class ArtistsController(MediaControllerBase[Artist]):
                 await self.mass.music.albums.remove_item_from_library(db_row["album_id"])
         # recursively also remove artist tracks
         for db_row in await self.mass.music.database.get_rows_from_query(
-            f"SELECT track_id FROM {DB_TABLE_TRACK_ARTISTS} WHERE artist_id = {db_id}",
+            f"SELECT track_id FROM {DB_TABLE_TRACK_ARTISTS} WHERE artist_id = :artist_id",
+            {"artist_id": db_id},
             limit=5000,
         ):
             if not recursive:
@@ -245,13 +238,13 @@ class ArtistsController(MediaControllerBase[Artist]):
             item_id,
             provider_instance_id_or_domain,
         ):
-            artist_id = db_artist.item_id
-            subquery = (
-                f"SELECT track_id FROM {DB_TABLE_TRACK_ARTISTS} WHERE artist_id = {artist_id}"
-            )
+            db_artist_id = int(db_artist.item_id)  # ensure integer
+            subquery = f"SELECT track_id FROM {DB_TABLE_TRACK_ARTISTS} WHERE artist_id = :artist_id"
             query = f"tracks.item_id in ({subquery})"
-            return await self.mass.music.tracks._get_library_items_by_query(
-                extra_query_parts=[query], provider_filter=[provider_instance_id_or_domain]
+            return await self.mass.music.tracks.get_library_items_by_query(
+                extra_query_parts=[query],
+                extra_query_params={"artist_id": db_artist_id},
+                provider_filter=[provider_instance_id_or_domain],
             )
         return []
 
@@ -260,9 +253,13 @@ class ArtistsController(MediaControllerBase[Artist]):
         item_id: str | int,
     ) -> list[Track]:
         """Return all tracks for an artist in the library/db."""
-        subquery = f"SELECT track_id FROM {DB_TABLE_TRACK_ARTISTS} WHERE artist_id = {item_id}"
+        db_id = int(item_id)  # ensure integer
+        subquery = f"SELECT track_id FROM {DB_TABLE_TRACK_ARTISTS} WHERE artist_id = :artist_id"
         query = f"tracks.item_id in ({subquery})"
-        return await self.mass.music.tracks.library_items(extra_query=query)
+        return await self.mass.music.tracks.get_library_items_by_query(
+            extra_query_parts=[query],
+            extra_query_params={"artist_id": db_id},
+        )
 
     async def get_provider_artist_albums(
         self,
@@ -281,13 +278,13 @@ class ArtistsController(MediaControllerBase[Artist]):
             item_id,
             provider_instance_id_or_domain,
         ):
-            artist_id = db_artist.item_id
-            subquery = (
-                f"SELECT album_id FROM {DB_TABLE_ALBUM_ARTISTS} WHERE artist_id = {artist_id}"
-            )
+            db_artist_id = int(db_artist.item_id)  # ensure integer
+            subquery = f"SELECT album_id FROM {DB_TABLE_ALBUM_ARTISTS} WHERE artist_id = :artist_id"
             query = f"albums.item_id in ({subquery})"
-            return await self.mass.music.albums._get_library_items_by_query(
-                extra_query_parts=[query], provider_filter=[provider_instance_id_or_domain]
+            return await self.mass.music.albums.get_library_items_by_query(
+                extra_query_parts=[query],
+                extra_query_params={"artist_id": db_artist_id},
+                provider_filter=[provider_instance_id_or_domain],
             )
         return []
 
@@ -296,9 +293,13 @@ class ArtistsController(MediaControllerBase[Artist]):
         item_id: str | int,
     ) -> list[Album]:
         """Return all in-library albums for an artist."""
-        subquery = f"SELECT album_id FROM {DB_TABLE_ALBUM_ARTISTS} WHERE artist_id = {item_id}"
+        db_id = int(item_id)  # ensure integer
+        subquery = f"SELECT album_id FROM {DB_TABLE_ALBUM_ARTISTS} WHERE artist_id = :artist_id"
         query = f"albums.item_id in ({subquery})"
-        return await self.mass.music.albums.library_items(extra_query=query)
+        return await self.mass.music.albums.get_library_items_by_query(
+            extra_query_parts=[query],
+            extra_query_params={"artist_id": db_id},
+        )
 
     async def _add_library_item(
         self, item: Artist | ItemMapping, overwrite_existing: bool = False
