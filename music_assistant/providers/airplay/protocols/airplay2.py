@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import TYPE_CHECKING
 
+import pyatv
 from music_assistant_models.enums import PlaybackState
 from music_assistant_models.errors import PlayerCommandFailed
+from pyatv.const import Protocol
 
 from music_assistant.constants import CONF_SYNC_ADJUST, VERBOSE_LOG_LEVEL
 from music_assistant.helpers.process import AsyncProcess
@@ -16,6 +19,9 @@ from music_assistant.providers.airplay.constants import (
 from music_assistant.providers.airplay.helpers import get_cli_binary
 
 from ._protocol import AirPlayProtocol
+
+if TYPE_CHECKING:
+    from pyatv.interface import PairingHandler
 
 
 class AirPlay2Stream(AirPlayProtocol):
@@ -27,6 +33,9 @@ class AirPlay2Stream(AirPlayProtocol):
     the actual timestamped playback. It reads pcm audio from a named pipe
     and we can send some interactive commands using another named pipe.
     """
+
+    supports_pairing = True
+    pairing: PairingHandler | None = None
 
     @property
     def _cli_loglevel(self) -> int:
@@ -116,6 +125,52 @@ class AirPlay2Stream(AirPlayProtocol):
                 raise PlayerCommandFailed("Cannot connect to AirPlay device")
         # start reading the stderr of the cliap2 process from another task
         self._cli_proc.attach_stderr_reader(self.mass.create_task(self._stderr_reader()))
+
+    async def start_pairing(self) -> None:
+        """Start pairing process for this protocol (if supported)."""
+        assert self.player.airplay_discovery_info is not None  # for type checker
+
+        event_loop = asyncio.get_event_loop()
+        ap_devices = await pyatv.scan(
+            event_loop,
+            timeout=5,
+            protocol=Protocol.AirPlay,
+            identifier=self.player.airplay_discovery_info.name,
+        )
+        if not ap_devices:
+            raise PlayerCommandFailed("Pairing failed. AirPlay2 device not found.")
+        if len(ap_devices) != 1:
+            raise PlayerCommandFailed(
+                f"Pairing failed. Found {len(ap_devices)} AirPlay2 devices with identifier "
+                f"{self.player.airplay_discovery_info.name}"
+            )
+        self.pairing = await pyatv.pair(ap_devices[0], Protocol.AirPlay, event_loop)
+        await self.pairing.begin()
+        if self.pairing.device_provides_pin:
+            self.is_pairing = True
+            return
+        await self.pairing.finish()
+        self.player.logger.debug(
+            f"AirPlay device {self.player.name} paired: {self.pairing.has_paired}"
+        )
+        await self.pairing.close()
+
+    async def finish_pairing(self, pin: str) -> str:
+        """Finish pairing process with given PIN (if supported)."""
+        if not self.is_pairing:
+            await self.start_pairing()
+        if self.pairing is None:
+            raise PlayerCommandFailed("Pairing failed. No pyatv PairingHandler.")
+        self.is_pairing = False
+        self.pairing.pin(pin)
+        await self.pairing.finish()
+        if self.pairing.has_paired:
+            self.player.logger.debug(
+                f"AirPlay device {self.player.name} has successfully paired. "
+                f"Credentials:{self.pairing.service.credentials}"
+            )
+            return str(self.pairing.service.credentials)
+        raise PlayerCommandFailed("Pairing failed")
 
     async def _stderr_reader(self) -> None:
         """Monitor stderr for the running CLIap2 process."""
