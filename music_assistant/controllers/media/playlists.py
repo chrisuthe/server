@@ -12,7 +12,7 @@ from music_assistant_models.errors import (
     MediaNotFoundError,
     ProviderUnavailableError,
 )
-from music_assistant_models.media_items import Playlist, Track
+from music_assistant_models.media_items import BrowseFolder, ItemMapping, Playlist, Track
 
 from music_assistant.constants import DB_TABLE_PLAYLISTS
 from music_assistant.helpers.compare import create_safe_string
@@ -102,6 +102,64 @@ class PlaylistController(MediaControllerBase[Playlist]):
                 yield track
             page += 1
 
+    async def _get_folder_tracks_for_playlist(
+        self,
+        folder_path: str,
+        max_depth: int = 10,
+        current_depth: int = 0,
+    ) -> list[Track]:
+        """Recursively fetch all playable tracks from a folder for adding to playlist.
+
+        :param folder_path: Path in format 'provider_instance://relative/path'
+        :param max_depth: Maximum recursion depth to prevent infinite loops
+        :param current_depth: Current recursion depth
+        """
+        if current_depth >= max_depth:
+            self.logger.warning(
+                "Max recursion depth (%s) reached while expanding folder %s",
+                max_depth,
+                folder_path,
+            )
+            return []
+
+        tracks: list[Track] = []
+
+        try:
+            items = await self.mass.music.browse(folder_path)
+        except Exception as err:
+            self.logger.warning("Error browsing folder %s: %s", folder_path, err)
+            return []
+
+        for item in items:
+            if not item.is_playable:
+                continue
+
+            # Handle tracks
+            if isinstance(item, ItemMapping) and item.media_type == MediaType.TRACK:
+                if item.uri:
+                    # Get full track object
+                    try:
+                        track = await self.mass.music.get_item_by_uri(item.uri)
+                        if isinstance(track, Track):
+                            tracks.append(track)
+                    except Exception as err:
+                        self.logger.debug("Error fetching track %s: %s", item.uri, err)
+
+            elif isinstance(item, Track):
+                tracks.append(item)
+
+            # Recursively handle subfolders
+            elif isinstance(item, BrowseFolder):
+                if item.path:
+                    subfolder_tracks = await self._get_folder_tracks_for_playlist(
+                        item.path,
+                        max_depth,
+                        current_depth + 1,
+                    )
+                    tracks.extend(subfolder_tracks)
+
+        return tracks
+
     async def create_playlist(
         self, name: str, provider_instance_or_domain: str | None = None
     ) -> Playlist:
@@ -188,6 +246,12 @@ class PlaylistController(MediaControllerBase[Playlist]):
                         unwrapped_uris.append(track.uri)
             elif media_type == MediaType.PLAYLIST:
                 async for track in self.tracks(item_id, provider_instance_id_or_domain):
+                    if track.uri is not None:
+                        unwrapped_uris.append(track.uri)
+            elif media_type == MediaType.FOLDER:
+                folder_path = f"{provider_instance_id_or_domain}://{item_id}"
+                folder_tracks = await self._get_folder_tracks_for_playlist(folder_path)
+                for track in folder_tracks:
                     if track.uri is not None:
                         unwrapped_uris.append(track.uri)
             elif media_type == MediaType.TRACK:
