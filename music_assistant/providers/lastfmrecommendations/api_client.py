@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from aiohttp import ClientError
+from music_assistant_models.errors import InvalidDataError
+
 from music_assistant.helpers.throttle_retry import ThrottlerManager
 
 if TYPE_CHECKING:
@@ -32,6 +35,9 @@ class LastFMAPIClient:
 
         :param method: The Last.fm API method to call.
         :param params: Additional query parameters.
+        :raises ClientError: If HTTP request fails.
+        :raises InvalidDataError: If Last.fm returns an error or invalid JSON.
+        :raises asyncio.TimeoutError: If request times out.
         """
         async with self.throttler:
             params.update(
@@ -49,7 +55,8 @@ class LastFMAPIClient:
                 # Last.fm returns errors in the response body
                 if "error" in data:
                     error_msg = data.get("message", "Unknown error")
-                    raise RuntimeError(f"Last.fm API error: {error_msg}")
+                    msg = f"Last.fm API error: {error_msg}"
+                    raise InvalidDataError(msg)
 
                 return data
 
@@ -80,7 +87,7 @@ class LastFMAPIClient:
 
             return similar_artists
 
-        except Exception as err:
+        except (TimeoutError, ClientError, InvalidDataError, KeyError) as err:
             self.logger.debug(
                 "Failed to get similar artists for %s: %s", artist_name, err, exc_info=err
             )
@@ -119,7 +126,7 @@ class LastFMAPIClient:
 
             return similar_tracks
 
-        except Exception as err:
+        except (TimeoutError, ClientError, InvalidDataError, KeyError) as err:
             self.logger.debug(
                 "Failed to get similar tracks for %s - %s: %s",
                 artist_name,
@@ -144,7 +151,7 @@ class LastFMAPIClient:
 
             return artists
 
-        except Exception as err:
+        except (TimeoutError, ClientError, InvalidDataError, KeyError) as err:
             self.logger.warning("Failed to get top artists chart: %s", err, exc_info=err)
             return []
 
@@ -163,6 +170,6 @@ class LastFMAPIClient:
 
             return tracks
 
-        except Exception as err:
+        except (TimeoutError, ClientError, InvalidDataError, KeyError) as err:
             self.logger.warning("Failed to get top tracks chart: %s", err, exc_info=err)
             return []

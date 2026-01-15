@@ -33,18 +33,19 @@ class LastFMRecommendationManager:
         self.mass = provider.mass
 
     async def get_recommendations(self) -> list[RecommendationFolder]:
-        """Get this provider's recommendations organized into folders."""
+        """Get this provider's recommendations organized into folders.
+
+        Note: Individual recommendation methods handle their own errors and
+        return empty lists on failure, so errors should not bubble up here.
+        If they do, it indicates a programming error that should be fixed.
+        """
         folders: list[RecommendationFolder] = []
 
-        try:
-            # Get personalized recommendations based on user's library
-            folders.extend(await self._get_personalized_recommendations())
+        # Get personalized recommendations based on user's library
+        folders.extend(await self._get_personalized_recommendations())
 
-            # Get global discovery recommendations
-            folders.extend(await self._get_global_recommendations())
-
-        except Exception as err:
-            self.logger.warning("Error fetching recommendations: %s", err, exc_info=err)
+        # Get global discovery recommendations
+        folders.extend(await self._get_global_recommendations())
 
         return folders
 

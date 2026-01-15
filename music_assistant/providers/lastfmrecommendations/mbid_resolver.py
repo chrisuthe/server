@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from aiohttp import ClientError
+from music_assistant_models.errors import ProviderUnavailableError
+
 if TYPE_CHECKING:
     from music_assistant.providers.lastfmrecommendations import LastFMRecommendationsProvider
 
@@ -47,13 +50,13 @@ class MBIDResolver:
         # Cache miss - need to query MusicBrainz
         self.logger.debug("ISRC cache miss for MBID %s - querying MusicBrainz", mbid)
 
-        try:
-            # Get MusicBrainz provider (built-in metadata provider)
-            mb_provider = self.mass.get_provider("musicbrainz")
-            if not mb_provider:
-                self.logger.warning("MusicBrainz provider not available")
-                return []
+        # Get MusicBrainz provider (built-in metadata provider)
+        mb_provider = self.mass.get_provider("musicbrainz")
+        if not mb_provider:
+            msg = "MusicBrainz provider not available"
+            raise ProviderUnavailableError(msg)
 
+        try:
             # Query MusicBrainz for recording details
             # Note: MusicBrainz provider has its own 30-day cache and rate limiting
             recording = await mb_provider.get_recording_details(mbid)
@@ -75,7 +78,7 @@ class MBIDResolver:
 
             return isrcs
 
-        except Exception as err:
+        except (TimeoutError, ClientError, AttributeError) as err:
             self.logger.warning("Failed to get ISRCs for MBID %s: %s", mbid, err, exc_info=err)
 
             # Cache the failure (empty list) to avoid repeated failed lookups

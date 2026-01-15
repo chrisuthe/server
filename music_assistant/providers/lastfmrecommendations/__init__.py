@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from aiohttp import ClientError
 from music_assistant_models.enums import ProviderFeature
-from music_assistant_models.errors import SetupFailedError
+from music_assistant_models.errors import InvalidDataError, SetupFailedError
 
 from music_assistant.controllers.cache import use_cache
 from music_assistant.models.music_provider import MusicProvider
@@ -63,15 +64,17 @@ class LastFMRecommendationsProvider(MusicProvider):
         # Validate API key is configured
         api_key = self.config.get_value("api_key")
         if not api_key:
-            raise SetupFailedError("Last.fm API key is required")
+            msg = "Last.fm API key is required"
+            raise SetupFailedError(msg)
 
         # Test API key by making a simple request
         try:
             # Try to get top artists chart (doesn't require authentication)
             await self.api.get_chart_top_artists(limit=1)
             self.logger.info("Last.fm API key validated successfully")
-        except Exception as err:
-            raise SetupFailedError(f"Failed to validate Last.fm API key: {err}") from err
+        except (TimeoutError, ClientError, InvalidDataError, KeyError) as err:
+            msg = f"Failed to validate Last.fm API key: {err}"
+            raise SetupFailedError(msg) from err
 
     @use_cache(3600)  # Cache recommendations for 1 hour
     async def recommendations(self) -> list[RecommendationFolder]:
