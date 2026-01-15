@@ -1,0 +1,20 @@
+{
+  "type": "music",
+  "domain": "lastfmrecommendations",
+  "name": "Last.fm Recommendations",
+  "description": "Get music recommendations from Last.fm based on your listening history",
+  "codeowners": [
+    "ozGav"
+  ],
+  "stage": "beta",
+  "config_entries": [
+    {
+      "key": "api_key",
+      "type": "secure_string",
+      "label": "Last.fm API Key",
+      "required": true,
+      "description": "Get your API key from https://www.last.fm/api/account/create"
+    }
+  ],
+  "documentation": "https://music-assistant.io/integration/lastfmrecommendations"
+}

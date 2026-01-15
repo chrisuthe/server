@@ -1,0 +1,168 @@
+"""Last.fm API client for recommendations."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+from music_assistant.helpers.throttle_retry import ThrottlerManager
+
+if TYPE_CHECKING:
+    from aiohttp import ClientSession
+
+    from music_assistant.providers.lastfmrecommendations import LastFMRecommendationsProvider
+
+
+class LastFMAPIClient:
+    """Last.fm API client for fetching recommendations."""
+
+    BASE_URL = "https://ws.audioscrobbler.com/2.0/"
+    throttler = ThrottlerManager(rate_limit=5, period=1)  # 5 requests per second
+
+    def __init__(self, provider: LastFMRecommendationsProvider) -> None:
+        """Initialize Last.fm API client.
+
+        :param provider: The Last.fm recommendations provider instance.
+        """
+        self.provider = provider
+        self.logger = provider.logger
+        self.http_session: ClientSession = provider.mass.http_session
+
+    async def _get_data(self, method: str, **params: Any) -> dict[str, Any]:
+        """Make a request to the Last.fm API.
+
+        :param method: The Last.fm API method to call.
+        :param params: Additional query parameters.
+        """
+        async with self.throttler:
+            params.update(
+                {
+                    "method": method,
+                    "api_key": self.provider.config.get_value("api_key"),
+                    "format": "json",
+                }
+            )
+
+            async with self.http_session.get(self.BASE_URL, params=params) as response:
+                response.raise_for_status()
+                data = await response.json()
+
+                # Last.fm returns errors in the response body
+                if "error" in data:
+                    error_msg = data.get("message", "Unknown error")
+                    raise RuntimeError(f"Last.fm API error: {error_msg}")
+
+                return data
+
+    async def get_similar_artists(
+        self, artist_name: str, artist_mbid: str | None = None, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        """Get similar artists from Last.fm.
+
+        :param artist_name: Name of the artist.
+        :param artist_mbid: Optional MusicBrainz ID for more accurate matching.
+        :param limit: Maximum number of similar artists to return.
+        """
+        params: dict[str, Any] = {"limit": limit}
+
+        # Prefer MBID if available for more accurate results
+        if artist_mbid:
+            params["mbid"] = artist_mbid
+        else:
+            params["artist"] = artist_name
+
+        try:
+            data = await self._get_data("artist.getSimilar", **params)
+            similar_artists = data.get("similarartists", {}).get("artist", [])
+
+            # Normalize response (can be single dict or list)
+            if isinstance(similar_artists, dict):
+                similar_artists = [similar_artists]
+
+            return similar_artists
+
+        except Exception as err:
+            self.logger.debug(
+                "Failed to get similar artists for %s: %s", artist_name, err, exc_info=err
+            )
+            return []
+
+    async def get_similar_tracks(
+        self,
+        artist_name: str,
+        track_name: str,
+        track_mbid: str | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Get similar tracks from Last.fm.
+
+        :param artist_name: Name of the track's artist.
+        :param track_name: Name of the track.
+        :param track_mbid: Optional MusicBrainz ID for more accurate matching.
+        :param limit: Maximum number of similar tracks to return.
+        """
+        params: dict[str, Any] = {"limit": limit}
+
+        # Prefer MBID if available for more accurate results
+        if track_mbid:
+            params["mbid"] = track_mbid
+        else:
+            params["artist"] = artist_name
+            params["track"] = track_name
+
+        try:
+            data = await self._get_data("track.getSimilar", **params)
+            similar_tracks = data.get("similartracks", {}).get("track", [])
+
+            # Normalize response (can be single dict or list)
+            if isinstance(similar_tracks, dict):
+                similar_tracks = [similar_tracks]
+
+            return similar_tracks
+
+        except Exception as err:
+            self.logger.debug(
+                "Failed to get similar tracks for %s - %s: %s",
+                artist_name,
+                track_name,
+                err,
+                exc_info=err,
+            )
+            return []
+
+    async def get_chart_top_artists(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Get global top artists chart from Last.fm.
+
+        :param limit: Maximum number of artists to return.
+        """
+        try:
+            data = await self._get_data("chart.getTopArtists", limit=limit)
+            artists = data.get("artists", {}).get("artist", [])
+
+            # Normalize response
+            if isinstance(artists, dict):
+                artists = [artists]
+
+            return artists
+
+        except Exception as err:
+            self.logger.warning("Failed to get top artists chart: %s", err, exc_info=err)
+            return []
+
+    async def get_chart_top_tracks(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Get global top tracks chart from Last.fm.
+
+        :param limit: Maximum number of tracks to return.
+        """
+        try:
+            data = await self._get_data("chart.getTopTracks", limit=limit)
+            tracks = data.get("tracks", {}).get("track", [])
+
+            # Normalize response
+            if isinstance(tracks, dict):
+                tracks = [tracks]
+
+            return tracks
+
+        except Exception as err:
+            self.logger.warning("Failed to get top tracks chart: %s", err, exc_info=err)
+            return []
