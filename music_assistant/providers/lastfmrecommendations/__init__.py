@@ -5,7 +5,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from aiohttp import ClientError
-from music_assistant_models.enums import ProviderFeature
+from music_assistant_models.config_entries import ConfigEntry, ConfigValueType
+from music_assistant_models.enums import ConfigEntryType, ProviderFeature
 from music_assistant_models.errors import InvalidDataError, SetupFailedError
 
 from music_assistant.controllers.cache import use_cache
@@ -33,7 +34,26 @@ async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
 ) -> LastFMRecommendationsProvider:
     """Initialize provider(instance) with given configuration."""
-    return LastFMRecommendationsProvider(mass, manifest, config)
+    return LastFMRecommendationsProvider(mass, manifest, config, SUPPORTED_FEATURES)
+
+
+async def get_config_entries(
+    mass: MusicAssistant,  # noqa: ARG001
+    instance_id: str | None = None,  # noqa: ARG001
+    action: str | None = None,  # noqa: ARG001
+    values: dict[str, ConfigValueType] | None = None,
+) -> tuple[ConfigEntry, ...]:
+    """Return Config entries to setup this provider."""
+    return (
+        ConfigEntry(
+            key="api_key",
+            type=ConfigEntryType.SECURE_STRING,
+            label="Last.fm API Key",
+            required=True,
+            description="Get your API key from https://www.last.fm/api/account/create",
+            value=values.get("api_key") if values else None,
+        ),
+    )
 
 
 class LastFMRecommendationsProvider(MusicProvider):
@@ -46,15 +66,20 @@ class LastFMRecommendationsProvider(MusicProvider):
     """
 
     def __init__(
-        self, mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
+        self,
+        mass: MusicAssistant,
+        manifest: ProviderManifest,
+        config: ProviderConfig,
+        supported_features: set[ProviderFeature],
     ) -> None:
         """Initialize the Last.fm Recommendations provider.
 
         :param mass: MusicAssistant instance.
         :param manifest: Provider manifest.
         :param config: Provider configuration.
+        :param supported_features: Set of supported features.
         """
-        super().__init__(mass, manifest, config, SUPPORTED_FEATURES)
+        super().__init__(mass, manifest, config, supported_features)
         self.api = LastFMAPIClient(self)
         self.mbid_resolver = MBIDResolver(self)
         self.recommendations_manager = LastFMRecommendationManager(self)
@@ -73,7 +98,6 @@ class LastFMRecommendationsProvider(MusicProvider):
             await self.api.get_chart_top_artists(limit=1)
             self.logger.info("Last.fm API key validated successfully")
         except (TimeoutError, ClientError, InvalidDataError, KeyError) as err:
-            # Don't include error details to avoid exposing API key
             msg = f"Failed to validate Last.fm API key: {type(err).__name__}"
             raise SetupFailedError(msg) from err
 

@@ -56,11 +56,7 @@ class MBIDResolver:
         )
 
         if cached is not None:
-            self.logger.debug("ISRC cache hit for MBID %s", mbid)
             return cast("list[str]", cached.get("isrcs", []))
-
-        # Cache miss - need to query MusicBrainz
-        self.logger.debug("ISRC cache miss for MBID %s - querying MusicBrainz", mbid)
 
         # Get MusicBrainz provider (built-in metadata provider)
         mb_provider = self.mass.get_provider("musicbrainz")
@@ -83,15 +79,9 @@ class MBIDResolver:
                 expiration=self.CACHE_EXPIRATION,
             )
 
-            if isrcs:
-                self.logger.debug("Found %d ISRC(s) for MBID %s", len(isrcs), mbid)
-            else:
-                self.logger.debug("No ISRCs found for MBID %s", mbid)
-
             return isrcs
 
         except (TimeoutError, ClientError, AttributeError) as err:
-            # Log error type only to avoid verbose stack traces in logs
             self.logger.warning("Failed to get ISRCs for MBID %s: %s", mbid, type(err).__name__)
 
             # Cache the failure (empty list) to avoid repeated failed lookups
