@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from music_assistant_models.enums import ExternalID
 from music_assistant_models.media_items import (
     Artist,
-    MediaItemType,
     RecommendationFolder,
     Track,
     UniqueList,
@@ -99,7 +99,7 @@ class LastFMRecommendationManager:
                         item_id=f"{self.provider.instance_id}_similar_artists",
                         name="Discover Similar Artists",
                         provider=self.provider.instance_id,
-                        items=UniqueList[MediaItemType](similar_artists[:10]),
+                        items=UniqueList(similar_artists[:10]),
                         subtitle=f"Based on your top {len(top_artists)} artists",
                         icon="mdi-account-music-outline",
                     )
@@ -118,7 +118,7 @@ class LastFMRecommendationManager:
                         item_id=f"{self.provider.instance_id}_similar_tracks",
                         name="Discover Similar Tracks",
                         provider=self.provider.instance_id,
-                        items=UniqueList[MediaItemType](similar_tracks[:10]),
+                        items=UniqueList(similar_tracks[:10]),
                         subtitle=f"Based on your top {len(top_tracks)} tracks",
                         icon="mdi-music-note-outline",
                     )
@@ -140,7 +140,7 @@ class LastFMRecommendationManager:
         top_artists_raw = await self.api.get_chart_top_artists(limit=10)
         if top_artists_raw:
             top_artists = [
-                parse_artist(artist_data, self.provider.instance_id)
+                parse_artist(artist_data, self.provider.instance_id, self.provider.domain)
                 for artist_data in top_artists_raw
             ]
 
@@ -149,7 +149,7 @@ class LastFMRecommendationManager:
                     item_id=f"{self.provider.instance_id}_chart_top_artists",
                     name="Last.fm Top Artists",
                     provider=self.provider.instance_id,
-                    items=UniqueList[MediaItemType](top_artists),
+                    items=UniqueList(top_artists),
                     subtitle="Most popular artists worldwide",
                     icon="mdi-chart-line",
                 )
@@ -159,7 +159,9 @@ class LastFMRecommendationManager:
         top_tracks_raw = await self.api.get_chart_top_tracks(limit=10)
         if top_tracks_raw:
             top_tracks = [
-                await parse_track(track_data, self.provider.instance_id, self.mbid_resolver)
+                await parse_track(
+                    track_data, self.provider.instance_id, self.provider.domain, self.mbid_resolver
+                )
                 for track_data in top_tracks_raw
             ]
 
@@ -168,7 +170,7 @@ class LastFMRecommendationManager:
                     item_id=f"{self.provider.instance_id}_chart_top_tracks",
                     name="Last.fm Top Tracks",
                     provider=self.provider.instance_id,
-                    items=UniqueList[MediaItemType](top_tracks),
+                    items=UniqueList(top_tracks),
                     subtitle="Most popular tracks worldwide",
                     icon="mdi-chart-box",
                 )
@@ -189,12 +191,8 @@ class LastFMRecommendationManager:
 
         # Get 3 similar artists for each seed
         for seed_artist in seed_artists:
-            # Extract MBID if available from external_ids
-            mbid = None
-            for ext_id_type, ext_id_value in seed_artist.external_ids:
-                if ext_id_type == "musicbrainz_artist":
-                    mbid = ext_id_value
-                    break
+            # Extract MBID if available using get_external_id helper
+            mbid = seed_artist.get_external_id(ExternalID.MB_ARTIST)
 
             similar = await self.api.get_similar_artists(
                 artist_name=seed_artist.name, artist_mbid=mbid, limit=3
@@ -216,7 +214,7 @@ class LastFMRecommendationManager:
 
         # Parse to Artist objects
         return [
-            parse_artist(artist_data, self.provider.instance_id)
+            parse_artist(artist_data, self.provider.instance_id, self.provider.domain)
             for artist_data in unique_similar[:12]  # Get 12 to ensure we have 10 after filtering
         ]
 
@@ -233,12 +231,8 @@ class LastFMRecommendationManager:
 
         # Get 3 similar tracks for each seed
         for seed_track in seed_tracks:
-            # Extract MBID if available
-            mbid = None
-            for ext_id_type, ext_id_value in seed_track.external_ids:
-                if ext_id_type == "musicbrainz_recording":
-                    mbid = ext_id_value
-                    break
+            # Extract MBID if available using get_external_id helper
+            mbid = seed_track.get_external_id(ExternalID.MB_RECORDING)
 
             # Get artist name (first artist)
             artist_name = seed_track.artists[0].name if seed_track.artists else "Unknown Artist"
@@ -280,6 +274,8 @@ class LastFMRecommendationManager:
 
         # Parse to Track objects (this includes ISRC resolution via MusicBrainz)
         return [
-            await parse_track(track_data, self.provider.instance_id, self.mbid_resolver)
+            await parse_track(
+                track_data, self.provider.instance_id, self.provider.domain, self.mbid_resolver
+            )
             for track_data in top_tracks_data
         ]

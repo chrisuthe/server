@@ -39,7 +39,7 @@ class LastFMAPIClient:
         :raises InvalidDataError: If Last.fm returns an error or invalid JSON.
         :raises asyncio.TimeoutError: If request times out.
         """
-        async with self.throttler:
+        async with self.throttler.acquire():
             params.update(
                 {
                     "method": method,
@@ -50,7 +50,7 @@ class LastFMAPIClient:
 
             async with self.http_session.get(self.BASE_URL, params=params) as response:
                 response.raise_for_status()
-                data = await response.json()
+                data: dict[str, Any] = await response.json()
 
                 # Last.fm returns errors in the response body
                 if "error" in data:
@@ -79,11 +79,13 @@ class LastFMAPIClient:
 
         try:
             data = await self._get_data("artist.getSimilar", **params)
-            similar_artists = data.get("similarartists", {}).get("artist", [])
+            similar_artists: list[dict[str, Any]] | dict[str, Any] = data.get(
+                "similarartists", {}
+            ).get("artist", [])
 
             # Normalize response (can be single dict or list)
             if isinstance(similar_artists, dict):
-                similar_artists = [similar_artists]
+                return [similar_artists]
 
             return similar_artists
 
@@ -119,11 +121,13 @@ class LastFMAPIClient:
 
         try:
             data = await self._get_data("track.getSimilar", **params)
-            similar_tracks = data.get("similartracks", {}).get("track", [])
+            similar_tracks: list[dict[str, Any]] | dict[str, Any] = data.get(
+                "similartracks", {}
+            ).get("track", [])
 
             # Normalize response (can be single dict or list)
             if isinstance(similar_tracks, dict):
-                similar_tracks = [similar_tracks]
+                return [similar_tracks]
 
             return similar_tracks
 
@@ -144,11 +148,13 @@ class LastFMAPIClient:
         """
         try:
             data = await self._get_data("chart.getTopArtists", limit=limit)
-            artists = data.get("artists", {}).get("artist", [])
+            artists: list[dict[str, Any]] | dict[str, Any] = data.get("artists", {}).get(
+                "artist", []
+            )
 
             # Normalize response
             if isinstance(artists, dict):
-                artists = [artists]
+                return [artists]
 
             return artists
 
@@ -164,11 +170,11 @@ class LastFMAPIClient:
         """
         try:
             data = await self._get_data("chart.getTopTracks", limit=limit)
-            tracks = data.get("tracks", {}).get("track", [])
+            tracks: list[dict[str, Any]] | dict[str, Any] = data.get("tracks", {}).get("track", [])
 
             # Normalize response
             if isinstance(tracks, dict):
-                tracks = [tracks]
+                return [tracks]
 
             return tracks
 

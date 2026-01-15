@@ -6,13 +6,16 @@ import contextlib
 from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.enums import ExternalID
-from music_assistant_models.media_items import Artist, ItemMapping, Track
+from music_assistant_models.media_items import Artist, ProviderMapping, Track
+from music_assistant_models.unique_list import UniqueList
 
 if TYPE_CHECKING:
     from music_assistant.providers.lastfmrecommendations.mbid_resolver import MBIDResolver
 
 
-def parse_artist(lastfm_artist: dict[str, Any], provider_instance_id: str) -> Artist:
+def parse_artist(
+    lastfm_artist: dict[str, Any], provider_instance_id: str, provider_domain: str
+) -> Artist:
     """Parse Last.fm artist to Music Assistant Artist.
 
     Extracts artist name and MusicBrainz ID from Last.fm response and
@@ -20,6 +23,7 @@ def parse_artist(lastfm_artist: dict[str, Any], provider_instance_id: str) -> Ar
 
     :param lastfm_artist: Raw Last.fm artist dict with 'name' and 'mbid' fields.
     :param provider_instance_id: Provider instance ID for this artist.
+    :param provider_domain: Provider domain for provider mappings.
     :return: Artist object with name and external IDs populated.
     """
     name = lastfm_artist.get("name", "Unknown Artist")
@@ -28,19 +32,27 @@ def parse_artist(lastfm_artist: dict[str, Any], provider_instance_id: str) -> Ar
     # Build external IDs
     external_ids = set()
     if mbid:
-        external_ids.add((ExternalID.MUSICBRAINZ_ARTIST, mbid))
+        external_ids.add((ExternalID.MB_ARTIST, mbid))
 
     return Artist(
         item_id=mbid or name,  # Use MBID as item_id if available, fallback to name
         provider=provider_instance_id,
         name=name,
         external_ids=external_ids,
+        provider_mappings={
+            ProviderMapping(
+                item_id=mbid or name,
+                provider_domain=provider_domain,
+                provider_instance=provider_instance_id,
+            )
+        },
     )
 
 
 async def parse_track(
     lastfm_track: dict[str, Any],
     provider_instance_id: str,
+    provider_domain: str,
     mbid_resolver: MBIDResolver,
 ) -> Track:
     """Parse Last.fm track to Music Assistant Track.
@@ -51,6 +63,7 @@ async def parse_track(
 
     :param lastfm_track: Raw Last.fm track dict with 'name', 'artist', 'mbid', 'duration'.
     :param provider_instance_id: Provider instance ID for this track.
+    :param provider_domain: Provider domain for provider mappings.
     :param mbid_resolver: MBID resolver instance for ISRC lookups.
     :return: Track object with name, artists, duration, and external IDs (MBID + ISRCs).
     """
@@ -72,28 +85,43 @@ async def parse_track(
 
     if mbid:
         # Add MusicBrainz recording ID
-        external_ids.add((ExternalID.MUSICBRAINZ_RECORDING, mbid))
+        external_ids.add((ExternalID.MB_RECORDING, mbid))
 
         # Resolve MBID to ISRCs via MusicBrainz (with 90-day cache)
         isrcs = await mbid_resolver.get_isrcs_for_recording(mbid)
         for isrc in isrcs:
             external_ids.add((ExternalID.ISRC, isrc))
 
-    # Create artist as ItemMapping
-    artist_item = ItemMapping(
+    # Create artist as full Artist object (not ItemMapping)
+    artist = Artist(
         item_id=artist_mbid or artist_name,
         provider=provider_instance_id,
         name=artist_name,
-        media_type="artist",
+        provider_mappings={
+            ProviderMapping(
+                item_id=artist_mbid or artist_name,
+                provider_domain=provider_domain,
+                provider_instance=provider_instance_id,
+            )
+        },
     )
+    if artist_mbid:
+        artist.external_ids.add((ExternalID.MB_ARTIST, artist_mbid))
 
     # Build track
     track = Track(
         item_id=mbid or f"{artist_name}_{name}",  # Use MBID or fallback to compound ID
         provider=provider_instance_id,
         name=name,
-        artists=[artist_item],
+        artists=UniqueList([artist]),
         external_ids=external_ids,
+        provider_mappings={
+            ProviderMapping(
+                item_id=mbid or f"{artist_name}_{name}",
+                provider_domain=provider_domain,
+                provider_instance=provider_instance_id,
+            )
+        },
     )
 
     # Add duration if available (Last.fm provides it in seconds)

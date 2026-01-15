@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from aiohttp import ClientError
 from music_assistant_models.errors import ProviderUnavailableError
 
 if TYPE_CHECKING:
     from music_assistant.providers.lastfmrecommendations import LastFMRecommendationsProvider
+
+
+CACHE_CATEGORY_MBID_ISRC = 0  # Cache category for MBID->ISRC mappings
 
 
 class MBIDResolver:
@@ -22,7 +25,6 @@ class MBIDResolver:
     minimize API load, as ISRC mappings are permanent and won't change.
     """
 
-    CACHE_CATEGORY = "lastfm_mbid_isrc"
     CACHE_EXPIRATION = 86400 * 90  # 90 days
 
     def __init__(self, provider: LastFMRecommendationsProvider) -> None:
@@ -49,12 +51,12 @@ class MBIDResolver:
         # Check 90-day cache first
         cached = await self.mass.cache.get(
             key=cache_key,
-            category=self.CACHE_CATEGORY,
+            category=CACHE_CATEGORY_MBID_ISRC,
         )
 
         if cached is not None:
             self.logger.debug("ISRC cache hit for MBID %s", mbid)
-            return cached.get("isrcs", [])
+            return cast("list[str]", cached.get("isrcs", []))
 
         # Cache miss - need to query MusicBrainz
         self.logger.debug("ISRC cache miss for MBID %s - querying MusicBrainz", mbid)
@@ -68,7 +70,10 @@ class MBIDResolver:
         try:
             # Query MusicBrainz for recording details
             # Note: MusicBrainz provider has its own 30-day cache and rate limiting
-            recording = await mb_provider.get_recording_details(mbid)
+            # Import here to avoid circular dependency
+            from music_assistant.providers.musicbrainz import MusicbrainzProvider  # noqa: PLC0415
+
+            recording = await cast("MusicbrainzProvider", mb_provider).get_recording_details(mbid)
 
             isrcs = recording.isrcs if recording and recording.isrcs else []
 
@@ -76,7 +81,7 @@ class MBIDResolver:
             await self.mass.cache.set(
                 key=cache_key,
                 data={"isrcs": isrcs},
-                category=self.CACHE_CATEGORY,
+                category=CACHE_CATEGORY_MBID_ISRC,
                 expiration=self.CACHE_EXPIRATION,
             )
 
@@ -95,7 +100,7 @@ class MBIDResolver:
             await self.mass.cache.set(
                 key=cache_key,
                 data={"isrcs": []},
-                category=self.CACHE_CATEGORY,
+                category=CACHE_CATEGORY_MBID_ISRC,
                 expiration=self.CACHE_EXPIRATION,
             )
 
