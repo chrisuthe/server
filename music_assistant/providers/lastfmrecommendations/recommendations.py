@@ -19,7 +19,14 @@ if TYPE_CHECKING:
 
 
 class LastFMRecommendationManager:
-    """Manages Last.fm recommendations."""
+    """Manages Last.fm recommendations.
+
+    This class orchestrates the generation of recommendation folders by:
+    1. Querying user's listening history from Music Assistant
+    2. Fetching similar items from Last.fm API
+    3. Resolving MBIDs to ISRCs for accurate matching
+    4. Organizing results into RecommendationFolder objects
+    """
 
     def __init__(self, provider: LastFMRecommendationsProvider) -> None:
         """Initialize recommendation manager.
@@ -34,6 +41,16 @@ class LastFMRecommendationManager:
 
     async def get_recommendations(self) -> list[RecommendationFolder]:
         """Get this provider's recommendations organized into folders.
+
+        Generates up to 4 recommendation folders:
+        - Discover Similar Artists (personalized)
+        - Discover Similar Tracks (personalized)
+        - Last.fm Top Artists (global)
+        - Last.fm Top Tracks (global)
+
+        Personalized folders only appear if user has listening history.
+
+        :return: List of recommendation folders (may be empty if no data available).
 
         Note: Individual recommendation methods handle their own errors and
         return empty lists on failure, so errors should not bubble up here.
@@ -50,7 +67,13 @@ class LastFMRecommendationManager:
         return folders
 
     async def _get_personalized_recommendations(self) -> list[RecommendationFolder]:
-        """Get personalized recommendations based on user's listening history."""
+        """Get personalized recommendations based on user's listening history.
+
+        Queries MA's library for top played artists/tracks and fetches similar
+        items from Last.fm. Returns up to 2 folders (similar artists, similar tracks).
+
+        :return: List of personalized recommendation folders (empty if no play history).
+        """
         folders: list[RecommendationFolder] = []
 
         # TODO: Consider if users want all-time top items or recent top items (e.g., last week)
@@ -104,7 +127,13 @@ class LastFMRecommendationManager:
         return folders
 
     async def _get_global_recommendations(self) -> list[RecommendationFolder]:
-        """Get global discovery recommendations from Last.fm charts."""
+        """Get global discovery recommendations from Last.fm charts.
+
+        Fetches Last.fm's worldwide top artists and tracks charts.
+        Returns up to 2 folders (top artists, top tracks).
+
+        :return: List of global chart recommendation folders (empty if API fails).
+        """
         folders: list[RecommendationFolder] = []
 
         # Global top artists
@@ -150,7 +179,11 @@ class LastFMRecommendationManager:
     async def _get_similar_artists_from_seeds(self, seed_artists: list[Artist]) -> list[Artist]:
         """Get similar artists based on seed artists.
 
+        For each seed artist, fetches 3 similar artists from Last.fm,
+        deduplicates, and returns top 12 by similarity score.
+
         :param seed_artists: List of seed artists from user's library.
+        :return: List of up to 12 similar Artist objects.
         """
         all_similar: list[dict[str, Any]] = []
 
@@ -190,7 +223,11 @@ class LastFMRecommendationManager:
     async def _get_similar_tracks_from_seeds(self, seed_tracks: list[Track]) -> list[Track]:
         """Get similar tracks based on seed tracks.
 
+        For each seed track, fetches 3 similar tracks from Last.fm,
+        deduplicates, resolves ISRCs via MusicBrainz, and returns top 10.
+
         :param seed_tracks: List of seed tracks from user's library.
+        :return: List of up to 10 similar Track objects with ISRCs resolved.
         """
         all_similar: list[dict[str, Any]] = []
 

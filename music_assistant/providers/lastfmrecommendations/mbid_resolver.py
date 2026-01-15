@@ -12,7 +12,15 @@ if TYPE_CHECKING:
 
 
 class MBIDResolver:
-    """Resolves MusicBrainz IDs to ISRCs with extended caching."""
+    """Resolves MusicBrainz IDs to ISRCs with extended caching.
+
+    This class queries the MusicBrainz provider to resolve MusicBrainz Recording IDs
+    (MBIDs) to International Standard Recording Codes (ISRCs). ISRCs are used by
+    streaming providers for accurate track matching.
+
+    A 90-day cache is implemented on top of MusicBrainz's own 30-day cache to
+    minimize API load, as ISRC mappings are permanent and won't change.
+    """
 
     CACHE_CATEGORY = "lastfm_mbid_isrc"
     CACHE_EXPIRATION = 86400 * 90  # 90 days
@@ -34,6 +42,7 @@ class MBIDResolver:
         so once we've looked up an MBID->ISRC mapping, it won't change.
 
         :param mbid: MusicBrainz recording ID.
+        :return: List of ISRCs for the recording (may be empty if none found).
         """
         cache_key = f"recording_{mbid}"
 
@@ -79,7 +88,8 @@ class MBIDResolver:
             return isrcs
 
         except (TimeoutError, ClientError, AttributeError) as err:
-            self.logger.warning("Failed to get ISRCs for MBID %s: %s", mbid, err, exc_info=err)
+            # Log error type only to avoid verbose stack traces in logs
+            self.logger.warning("Failed to get ISRCs for MBID %s: %s", mbid, type(err).__name__)
 
             # Cache the failure (empty list) to avoid repeated failed lookups
             await self.mass.cache.set(

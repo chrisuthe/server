@@ -88,8 +88,9 @@ class LastFMAPIClient:
             return similar_artists
 
         except (TimeoutError, ClientError, InvalidDataError, KeyError) as err:
+            # Don't log full error to avoid exposing API key in URLs
             self.logger.debug(
-                "Failed to get similar artists for %s: %s", artist_name, err, exc_info=err
+                "Failed to get similar artists for %s: %s", artist_name, type(err).__name__
             )
             return []
 
@@ -127,12 +128,12 @@ class LastFMAPIClient:
             return similar_tracks
 
         except (TimeoutError, ClientError, InvalidDataError, KeyError) as err:
+            # Don't log full error to avoid exposing API key in URLs
             self.logger.debug(
                 "Failed to get similar tracks for %s - %s: %s",
                 artist_name,
                 track_name,
-                err,
-                exc_info=err,
+                type(err).__name__,
             )
             return []
 
@@ -152,7 +153,8 @@ class LastFMAPIClient:
             return artists
 
         except (TimeoutError, ClientError, InvalidDataError, KeyError) as err:
-            self.logger.warning("Failed to get top artists chart: %s", err, exc_info=err)
+            # Don't log full error to avoid exposing API key in URLs
+            self.logger.warning("Failed to get top artists chart: %s", type(err).__name__)
             return []
 
     async def get_chart_top_tracks(self, limit: int = 50) -> list[dict[str, Any]]:
@@ -171,5 +173,6 @@ class LastFMAPIClient:
             return tracks
 
         except (TimeoutError, ClientError, InvalidDataError, KeyError) as err:
-            self.logger.warning("Failed to get top tracks chart: %s", err, exc_info=err)
+            # Don't log full error to avoid exposing API key in URLs
+            self.logger.warning("Failed to get top tracks chart: %s", type(err).__name__)
             return []

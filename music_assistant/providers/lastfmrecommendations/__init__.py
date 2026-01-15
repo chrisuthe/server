@@ -73,7 +73,8 @@ class LastFMRecommendationsProvider(MusicProvider):
             await self.api.get_chart_top_artists(limit=1)
             self.logger.info("Last.fm API key validated successfully")
         except (TimeoutError, ClientError, InvalidDataError, KeyError) as err:
-            msg = f"Failed to validate Last.fm API key: {err}"
+            # Don't include error details to avoid exposing API key
+            msg = f"Failed to validate Last.fm API key: {type(err).__name__}"
             raise SetupFailedError(msg) from err
 
     @use_cache(3600)  # Cache recommendations for 1 hour

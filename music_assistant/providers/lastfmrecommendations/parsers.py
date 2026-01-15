@@ -15,8 +15,12 @@ if TYPE_CHECKING:
 def parse_artist(lastfm_artist: dict[str, Any], provider_instance_id: str) -> Artist:
     """Parse Last.fm artist to Music Assistant Artist.
 
-    :param lastfm_artist: Raw Last.fm artist dict.
+    Extracts artist name and MusicBrainz ID from Last.fm response and
+    creates an Artist object with external IDs for matching.
+
+    :param lastfm_artist: Raw Last.fm artist dict with 'name' and 'mbid' fields.
     :param provider_instance_id: Provider instance ID for this artist.
+    :return: Artist object with name and external IDs populated.
     """
     name = lastfm_artist.get("name", "Unknown Artist")
     mbid = lastfm_artist.get("mbid")
@@ -42,11 +46,13 @@ async def parse_track(
     """Parse Last.fm track to Music Assistant Track.
 
     This async function resolves MBIDs to ISRCs via MusicBrainz for better
-    matching accuracy with streaming providers.
+    matching accuracy with streaming providers. Extracts track name, artist,
+    duration, and MBID from Last.fm response.
 
-    :param lastfm_track: Raw Last.fm track dict.
+    :param lastfm_track: Raw Last.fm track dict with 'name', 'artist', 'mbid', 'duration'.
     :param provider_instance_id: Provider instance ID for this track.
     :param mbid_resolver: MBID resolver instance for ISRC lookups.
+    :return: Track object with name, artists, duration, and external IDs (MBID + ISRCs).
     """
     name = lastfm_track.get("name", "Unknown Track")
     mbid = lastfm_track.get("mbid")
