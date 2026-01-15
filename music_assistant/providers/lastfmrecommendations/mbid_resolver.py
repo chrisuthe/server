@@ -9,6 +9,7 @@ from music_assistant_models.errors import ProviderUnavailableError
 
 if TYPE_CHECKING:
     from music_assistant.providers.lastfmrecommendations import LastFMRecommendationsProvider
+    from music_assistant.providers.musicbrainz import MusicbrainzProvider
 
 
 CACHE_CATEGORY_MBID_ISRC = 0  # Cache category for MBID->ISRC mappings
@@ -70,9 +71,6 @@ class MBIDResolver:
         try:
             # Query MusicBrainz for recording details
             # Note: MusicBrainz provider has its own 30-day cache and rate limiting
-            # Import here to avoid circular dependency
-            from music_assistant.providers.musicbrainz import MusicbrainzProvider  # noqa: PLC0415
-
             recording = await cast("MusicbrainzProvider", mb_provider).get_recording_details(mbid)
 
             isrcs = recording.isrcs if recording and recording.isrcs else []
