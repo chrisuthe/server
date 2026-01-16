@@ -34,7 +34,7 @@ async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
 ) -> LastFMRecommendationsProvider:
     """Initialize provider(instance) with given configuration."""
-    return LastFMRecommendationsProvider(mass, manifest, config, SUPPORTED_FEATURES)
+    return LastFMRecommendationsProvider(mass, manifest, config)
 
 
 async def get_config_entries(
@@ -70,16 +70,14 @@ class LastFMRecommendationsProvider(MusicProvider):
         mass: MusicAssistant,
         manifest: ProviderManifest,
         config: ProviderConfig,
-        supported_features: set[ProviderFeature],
     ) -> None:
         """Initialize the Last.fm Recommendations provider.
 
         :param mass: MusicAssistant instance.
         :param manifest: Provider manifest.
         :param config: Provider configuration.
-        :param supported_features: Set of supported features.
         """
-        super().__init__(mass, manifest, config, supported_features)
+        super().__init__(mass, manifest, config, SUPPORTED_FEATURES)
         self.api = LastFMAPIClient(self)
         self.mbid_resolver = MBIDResolver(self)
         self.recommendations_manager = LastFMRecommendationManager(self)
