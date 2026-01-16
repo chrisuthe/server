@@ -65,27 +65,12 @@ class LastFMRecommendationsProvider(MusicProvider):
     (Last.fm's worldwide top charts).
     """
 
-    def __init__(
-        self,
-        mass: MusicAssistant,
-        manifest: ProviderManifest,
-        config: ProviderConfig,
-        supported_features: set[ProviderFeature],
-    ) -> None:
-        """Initialize the Last.fm Recommendations provider.
-
-        :param mass: MusicAssistant instance.
-        :param manifest: Provider manifest.
-        :param config: Provider configuration.
-        :param supported_features: Set of supported provider features.
-        """
-        super().__init__(mass, manifest, config, supported_features)
+    async def handle_async_init(self) -> None:
+        """Handle async initialization of the provider."""
         self.api = LastFMAPIClient(self)
         self.mbid_resolver = MBIDResolver(self)
         self.recommendations_manager = LastFMRecommendationManager(self)
 
-    async def handle_async_init(self) -> None:
-        """Handle async initialization of the provider."""
         # Test API key by making a simple request
         try:
             await self.api.get_chart_top_artists(limit=1)
