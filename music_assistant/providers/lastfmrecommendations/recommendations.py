@@ -7,18 +7,14 @@ from typing import TYPE_CHECKING, Any
 from music_assistant_models.enums import ExternalID
 from music_assistant_models.media_items import (
     Artist,
-    ItemMapping,
     RecommendationFolder,
     Track,
     UniqueList,
 )
 
-from music_assistant.helpers.compare import compare_media_item
 from music_assistant.providers.lastfmrecommendations.parsers import parse_artist, parse_track
 
 if TYPE_CHECKING:
-    from music_assistant.controllers.media.artists import ArtistsController
-    from music_assistant.controllers.media.tracks import TracksController
     from music_assistant.providers.lastfmrecommendations import LastFMRecommendationsProvider
 
 
@@ -42,91 +38,6 @@ class LastFMRecommendationManager:
         self.mbid_resolver = provider.mbid_resolver
         self.logger = provider.logger
         self.mass = provider.mass
-
-    async def resolve_item_mapping(
-        self, item_mapping: ItemMapping
-    ) -> Artist | Track | ItemMapping | None:
-        """Resolve an ItemMapping to an actual library or provider item.
-
-        Tries to find a matching item in the library or streaming providers
-        using external IDs, then falls back to name-only search.
-
-        :param item_mapping: ItemMapping to resolve.
-        :return: Resolved Artist/Track, or None if no match found.
-        """
-        # First, try to find in library by external IDs
-        ctrl: ArtistsController | TracksController
-        if item_mapping.media_type.value == "artist":
-            ctrl = self.mass.music.artists
-        elif item_mapping.media_type.value == "track":
-            ctrl = self.mass.music.tracks
-        else:
-            return item_mapping
-
-        # Check library first
-        if library_item := await ctrl.get_library_item_by_external_ids(item_mapping.external_ids):
-            self.logger.debug(
-                "Found %s in library: %s", item_mapping.media_type.value, library_item.name
-            )
-            return library_item
-
-        # Not in library - search streaming providers with external ID matching
-        for provider in self.mass.music.providers:
-            if provider.domain == self.provider.domain:
-                continue  # Skip ourselves
-            if not provider.is_streaming_provider:
-                continue
-
-            try:
-                # Search using the name (limit=1 since we only need first match)
-                search_results = await ctrl.search(item_mapping.name, provider.instance_id, limit=1)
-
-                # Find first match using external IDs
-                for result in search_results:
-                    if compare_media_item(item_mapping, result, strict=False):
-                        self.logger.debug(
-                            "Found %s on provider %s via external IDs: %s",
-                            item_mapping.media_type.value,
-                            provider.name,
-                            result.name,
-                        )
-                        return result
-            except Exception as err:
-                self.logger.debug(
-                    "Provider %s search failed: %s", provider.name, type(err).__name__
-                )
-                continue
-
-        # Fallback: Try name-only search without external ID matching
-        for provider in self.mass.music.providers:
-            if provider.domain == self.provider.domain:
-                continue
-            if not provider.is_streaming_provider:
-                continue
-
-            try:
-                search_results = await ctrl.search(item_mapping.name, provider.instance_id, limit=1)
-                if search_results:
-                    # Return first result even without external ID match
-                    result = search_results[0]
-                    self.logger.debug(
-                        "Found %s on provider %s via name search: %s",
-                        item_mapping.media_type.value,
-                        provider.name,
-                        result.name,
-                    )
-                    return result
-            except Exception as err:
-                self.logger.debug(
-                    "Provider %s fallback search failed: %s", provider.name, type(err).__name__
-                )
-                continue
-
-        # No match found anywhere - filter out this item
-        self.logger.debug(
-            "Could not resolve %s: %s", item_mapping.media_type.value, item_mapping.name
-        )
-        return None
 
     async def get_recommendations(self) -> list[RecommendationFolder]:
         """Get this provider's recommendations organized into folders.
@@ -228,12 +139,14 @@ class LastFMRecommendationManager:
         # Global top artists
         top_artists_raw = await self.api.get_chart_top_artists(limit=10)
         if top_artists_raw:
-            top_artists_mappings = [parse_artist(artist_data) for artist_data in top_artists_raw]
-            # Resolve ItemMappings to actual items (filter out None for unresolved items)
+            # Parse and resolve artists (filter out None for unresolved items)
             top_artists = [
-                item
-                for item in [await self.resolve_item_mapping(m) for m in top_artists_mappings]
-                if item is not None
+                artist
+                for artist in [
+                    await parse_artist(artist_data, self.mass, self.provider.instance_id)
+                    for artist_data in top_artists_raw
+                ]
+                if artist is not None
             ]
 
             if top_artists:
@@ -251,14 +164,16 @@ class LastFMRecommendationManager:
         # Global top tracks
         top_tracks_raw = await self.api.get_chart_top_tracks(limit=10)
         if top_tracks_raw:
-            top_tracks_mappings = [
-                await parse_track(track_data, self.mbid_resolver) for track_data in top_tracks_raw
-            ]
-            # Resolve ItemMappings to actual items (filter out None for unresolved items)
+            # Parse and resolve tracks (filter out None for unresolved items)
             top_tracks = [
-                item
-                for item in [await self.resolve_item_mapping(m) for m in top_tracks_mappings]
-                if item is not None
+                track
+                for track in [
+                    await parse_track(
+                        track_data, self.mbid_resolver, self.mass, self.provider.instance_id
+                    )
+                    for track_data in top_tracks_raw
+                ]
+                if track is not None
             ]
 
             if top_tracks:
@@ -275,9 +190,7 @@ class LastFMRecommendationManager:
 
         return folders
 
-    async def _get_similar_artists_from_seeds(
-        self, seed_artists: list[Artist]
-    ) -> list[Artist | Track | ItemMapping]:
+    async def _get_similar_artists_from_seeds(self, seed_artists: list[Artist]) -> list[Artist]:
         """Get similar artists based on seed artists.
 
         For each seed artist, fetches 3 similar artists from Last.fm,
@@ -311,21 +224,19 @@ class LastFMRecommendationManager:
         # Sort by match score (similarity) and take top results
         unique_similar.sort(key=lambda x: float(x.get("match", 0)), reverse=True)
 
-        # Parse to ItemMapping objects and resolve them
-        artist_mappings = [
-            parse_artist(artist_data)
-            for artist_data in unique_similar[:12]  # Get 12 to ensure we have 10 after filtering
-        ]
-        # Resolve ItemMappings to actual items (filter out None for unresolved items)
+        # Parse and resolve artists (filter out None for unresolved items)
         return [
-            item
-            for item in [await self.resolve_item_mapping(m) for m in artist_mappings]
-            if item is not None
+            artist
+            for artist in [
+                await parse_artist(artist_data, self.mass, self.provider.instance_id)
+                for artist_data in unique_similar[
+                    :12
+                ]  # Get 12 to ensure we have 10 after filtering
+            ]
+            if artist is not None
         ]
 
-    async def _get_similar_tracks_from_seeds(
-        self, seed_tracks: list[Track]
-    ) -> list[Artist | Track | ItemMapping]:
+    async def _get_similar_tracks_from_seeds(self, seed_tracks: list[Track]) -> list[Track]:
         """Get similar tracks based on seed tracks.
 
         For each seed track, fetches 3 similar tracks from Last.fm,
@@ -379,13 +290,14 @@ class LastFMRecommendationManager:
         # Only resolve ISRCs for top 10 tracks (optimization)
         top_tracks_data = unique_similar[:10]
 
-        # Parse to ItemMapping objects (this includes ISRC resolution via MusicBrainz)
-        track_mappings = [
-            await parse_track(track_data, self.mbid_resolver) for track_data in top_tracks_data
-        ]
-        # Resolve ItemMappings to actual items (filter out None for unresolved items)
+        # Parse and resolve tracks (this includes ISRC resolution via MusicBrainz)
         return [
-            item
-            for item in [await self.resolve_item_mapping(m) for m in track_mappings]
-            if item is not None
+            track
+            for track in [
+                await parse_track(
+                    track_data, self.mbid_resolver, self.mass, self.provider.instance_id
+                )
+                for track_data in top_tracks_data
+            ]
+            if track is not None
         ]
