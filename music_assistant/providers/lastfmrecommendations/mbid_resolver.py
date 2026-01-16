@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, cast
 
 from aiohttp import ClientError
-from music_assistant_models.errors import ProviderUnavailableError
+from music_assistant_models.errors import InvalidDataError, ProviderUnavailableError
 
 if TYPE_CHECKING:
     from music_assistant.providers.lastfmrecommendations import LastFMRecommendationsProvider
@@ -81,7 +81,7 @@ class MBIDResolver:
 
             return isrcs
 
-        except (TimeoutError, ClientError, AttributeError) as err:
+        except (TimeoutError, ClientError, AttributeError, InvalidDataError) as err:
             self.logger.debug("Failed to get ISRCs for MBID %s: %s", mbid, type(err).__name__)
 
             # Cache the failure (empty list) to avoid repeated failed lookups
