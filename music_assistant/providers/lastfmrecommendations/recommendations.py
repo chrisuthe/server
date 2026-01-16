@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 from music_assistant_models.enums import ExternalID
 from music_assistant_models.media_items import (
     Artist,
+    ItemMapping,
     RecommendationFolder,
     Track,
     UniqueList,
@@ -139,10 +140,7 @@ class LastFMRecommendationManager:
         # Global top artists
         top_artists_raw = await self.api.get_chart_top_artists(limit=10)
         if top_artists_raw:
-            top_artists = [
-                parse_artist(artist_data, self.provider.instance_id, self.provider.domain)
-                for artist_data in top_artists_raw
-            ]
+            top_artists = [parse_artist(artist_data) for artist_data in top_artists_raw]
 
             folders.append(
                 RecommendationFolder(
@@ -159,10 +157,7 @@ class LastFMRecommendationManager:
         top_tracks_raw = await self.api.get_chart_top_tracks(limit=10)
         if top_tracks_raw:
             top_tracks = [
-                await parse_track(
-                    track_data, self.provider.instance_id, self.provider.domain, self.mbid_resolver
-                )
-                for track_data in top_tracks_raw
+                await parse_track(track_data, self.mbid_resolver) for track_data in top_tracks_raw
             ]
 
             folders.append(
@@ -178,14 +173,16 @@ class LastFMRecommendationManager:
 
         return folders
 
-    async def _get_similar_artists_from_seeds(self, seed_artists: list[Artist]) -> list[Artist]:
+    async def _get_similar_artists_from_seeds(
+        self, seed_artists: list[Artist]
+    ) -> list[ItemMapping]:
         """Get similar artists based on seed artists.
 
         For each seed artist, fetches 3 similar artists from Last.fm,
         deduplicates, and returns top 12 by similarity score.
 
         :param seed_artists: List of seed artists from user's library.
-        :return: List of up to 12 similar Artist objects.
+        :return: List of up to 12 similar ItemMapping objects.
         """
         all_similar: list[dict[str, Any]] = []
 
@@ -212,20 +209,20 @@ class LastFMRecommendationManager:
         # Sort by match score (similarity) and take top results
         unique_similar.sort(key=lambda x: float(x.get("match", 0)), reverse=True)
 
-        # Parse to Artist objects
+        # Parse to ItemMapping objects
         return [
-            parse_artist(artist_data, self.provider.instance_id, self.provider.domain)
+            parse_artist(artist_data)
             for artist_data in unique_similar[:12]  # Get 12 to ensure we have 10 after filtering
         ]
 
-    async def _get_similar_tracks_from_seeds(self, seed_tracks: list[Track]) -> list[Track]:
+    async def _get_similar_tracks_from_seeds(self, seed_tracks: list[Track]) -> list[ItemMapping]:
         """Get similar tracks based on seed tracks.
 
         For each seed track, fetches 3 similar tracks from Last.fm,
         deduplicates, resolves ISRCs via MusicBrainz, and returns top 10.
 
         :param seed_tracks: List of seed tracks from user's library.
-        :return: List of up to 10 similar Track objects with ISRCs resolved.
+        :return: List of up to 10 similar ItemMapping objects with ISRCs resolved.
         """
         all_similar: list[dict[str, Any]] = []
 
@@ -272,10 +269,5 @@ class LastFMRecommendationManager:
         # Only resolve ISRCs for top 10 tracks (optimization)
         top_tracks_data = unique_similar[:10]
 
-        # Parse to Track objects (this includes ISRC resolution via MusicBrainz)
-        return [
-            await parse_track(
-                track_data, self.provider.instance_id, self.provider.domain, self.mbid_resolver
-            )
-            for track_data in top_tracks_data
-        ]
+        # Parse to ItemMapping objects (this includes ISRC resolution via MusicBrainz)
+        return [await parse_track(track_data, self.mbid_resolver) for track_data in top_tracks_data]

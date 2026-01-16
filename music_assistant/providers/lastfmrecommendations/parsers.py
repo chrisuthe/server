@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import contextlib
 import logging
 from typing import TYPE_CHECKING, Any
 
-from music_assistant_models.enums import ExternalID
-from music_assistant_models.media_items import Artist, ProviderMapping, Track
-from music_assistant_models.unique_list import UniqueList
+from music_assistant_models.enums import ExternalID, MediaType
+from music_assistant_models.media_items import ItemMapping
 
 from music_assistant.constants import MASS_LOGGER_NAME
 
@@ -18,18 +16,14 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger(f"{MASS_LOGGER_NAME}.lastfmrecommendations")
 
 
-def parse_artist(
-    lastfm_artist: dict[str, Any], provider_instance_id: str, provider_domain: str
-) -> Artist:
-    """Parse Last.fm artist to Music Assistant Artist.
+def parse_artist(lastfm_artist: dict[str, Any]) -> ItemMapping:
+    """Parse Last.fm artist to ItemMapping.
 
-    Extracts artist name and MusicBrainz ID from Last.fm response and
-    creates an Artist object with external IDs for matching.
+    Creates a lightweight reference that MA will use to find the artist
+    in other providers (Spotify, Tidal, etc.) using external IDs.
 
     :param lastfm_artist: Raw Last.fm artist dict with 'name' and 'mbid' fields.
-    :param provider_instance_id: Provider instance ID for this artist.
-    :param provider_domain: Provider domain for provider mappings.
-    :return: Artist object with name and external IDs populated.
+    :return: ItemMapping with name and external IDs for matching.
     """
     LOGGER.debug("Last.fm artist data: %s", lastfm_artist)
 
@@ -41,38 +35,28 @@ def parse_artist(
     if mbid:
         external_ids.add((ExternalID.MB_ARTIST, mbid))
 
-    return Artist(
-        item_id=mbid or name,  # Use MBID as item_id if available, fallback to name
-        provider=provider_instance_id,
+    return ItemMapping(
+        media_type=MediaType.ARTIST,
+        item_id=mbid or name,
+        provider="library",  # ItemMappings use "library" as provider
         name=name,
         external_ids=external_ids,
-        provider_mappings={
-            ProviderMapping(
-                item_id=mbid or name,
-                provider_domain=provider_domain,
-                provider_instance=provider_instance_id,
-            )
-        },
     )
 
 
 async def parse_track(
     lastfm_track: dict[str, Any],
-    provider_instance_id: str,
-    provider_domain: str,
     mbid_resolver: MBIDResolver,
-) -> Track:
-    """Parse Last.fm track to Music Assistant Track.
+) -> ItemMapping:
+    """Parse Last.fm track to ItemMapping.
 
-    This async function resolves MBIDs to ISRCs via MusicBrainz for better
-    matching accuracy with streaming providers. Extracts track name, artist,
-    duration, and MBID from Last.fm response.
+    Creates a lightweight reference that MA will use to find the track
+    in other providers (Spotify, Tidal, etc.) using external IDs.
+    Resolves MBIDs to ISRCs via MusicBrainz for better matching accuracy.
 
     :param lastfm_track: Raw Last.fm track dict with 'name', 'artist', 'mbid', 'duration'.
-    :param provider_instance_id: Provider instance ID for this track.
-    :param provider_domain: Provider domain for provider mappings.
     :param mbid_resolver: MBID resolver instance for ISRC lookups.
-    :return: Track object with name, artists, duration, and external IDs (MBID + ISRCs).
+    :return: ItemMapping with name, artist, and external IDs (MBID + ISRCs) for matching.
     """
     LOGGER.debug("Last.fm track data: %s", lastfm_track)
 
@@ -84,10 +68,8 @@ async def parse_track(
     if isinstance(artist_data, str):
         # Sometimes artist is just a string
         artist_name = artist_data
-        artist_mbid = None
     else:
         artist_name = artist_data.get("name", "Unknown Artist")
-        artist_mbid = artist_data.get("mbid")
 
     # Build external IDs
     external_ids = set()
@@ -101,41 +83,10 @@ async def parse_track(
         for isrc in isrcs:
             external_ids.add((ExternalID.ISRC, isrc))
 
-    # Create artist as full Artist object (not ItemMapping)
-    artist = Artist(
-        item_id=artist_mbid or artist_name,
-        provider=provider_instance_id,
-        name=artist_name,
-        provider_mappings={
-            ProviderMapping(
-                item_id=artist_mbid or artist_name,
-                provider_domain=provider_domain,
-                provider_instance=provider_instance_id,
-            )
-        },
-    )
-    if artist_mbid:
-        artist.external_ids.add((ExternalID.MB_ARTIST, artist_mbid))
-
-    # Build track
-    track = Track(
-        item_id=mbid or f"{artist_name}_{name}",  # Use MBID or fallback to compound ID
-        provider=provider_instance_id,
-        name=name,
-        artists=UniqueList([artist]),
+    return ItemMapping(
+        media_type=MediaType.TRACK,
+        item_id=mbid or f"{artist_name}_{name}",
+        provider="library",  # ItemMappings use "library" as provider
+        name=f"{artist_name} - {name}",  # Include artist in name for display
         external_ids=external_ids,
-        provider_mappings={
-            ProviderMapping(
-                item_id=mbid or f"{artist_name}_{name}",
-                provider_domain=provider_domain,
-                provider_instance=provider_instance_id,
-            )
-        },
     )
-
-    # Add duration if available (Last.fm provides it in seconds)
-    if duration := lastfm_track.get("duration"):
-        with contextlib.suppress(ValueError, TypeError):
-            track.duration = int(duration)
-
-    return track
