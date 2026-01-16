@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.enums import ExternalID
 from music_assistant_models.media_items import Artist, ProviderMapping, Track
 from music_assistant_models.unique_list import UniqueList
 
+from music_assistant.constants import MASS_LOGGER_NAME
+
 if TYPE_CHECKING:
     from music_assistant.providers.lastfmrecommendations.mbid_resolver import MBIDResolver
+
+LOGGER = logging.getLogger(f"{MASS_LOGGER_NAME}.lastfmrecommendations")
 
 
 def parse_artist(
@@ -26,6 +31,8 @@ def parse_artist(
     :param provider_domain: Provider domain for provider mappings.
     :return: Artist object with name and external IDs populated.
     """
+    LOGGER.debug("Last.fm artist data: %s", lastfm_artist)
+
     name = lastfm_artist.get("name", "Unknown Artist")
     mbid = lastfm_artist.get("mbid")
 
@@ -67,6 +74,8 @@ async def parse_track(
     :param mbid_resolver: MBID resolver instance for ISRC lookups.
     :return: Track object with name, artists, duration, and external IDs (MBID + ISRCs).
     """
+    LOGGER.debug("Last.fm track data: %s", lastfm_track)
+
     name = lastfm_track.get("name", "Unknown Track")
     mbid = lastfm_track.get("mbid")
 
