@@ -8,6 +8,7 @@ from aiohttp import ClientError
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueType
 from music_assistant_models.enums import ConfigEntryType, ProviderFeature
 from music_assistant_models.errors import InvalidDataError, SetupFailedError
+from music_assistant_models.media_items import RecommendationFolder  # noqa: TC002
 
 from music_assistant.controllers.cache import use_cache
 from music_assistant.models.music_provider import MusicProvider
@@ -19,7 +20,6 @@ from music_assistant.providers.lastfmrecommendations.recommendations import (
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ProviderConfig
-    from music_assistant_models.media_items import RecommendationFolder
     from music_assistant_models.provider import ProviderManifest
 
     from music_assistant.mass import MusicAssistant
