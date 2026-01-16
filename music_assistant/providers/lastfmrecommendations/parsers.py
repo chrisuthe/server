@@ -5,8 +5,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from music_assistant_models.enums import ExternalID, MediaType
-from music_assistant_models.media_items import ItemMapping
+from music_assistant_models.enums import ExternalID, ImageType, MediaType
+from music_assistant_models.media_items import ItemMapping, MediaItemImage
 
 from music_assistant.constants import MASS_LOGGER_NAME
 
@@ -14,6 +14,32 @@ if TYPE_CHECKING:
     from music_assistant.providers.lastfmrecommendations.mbid_resolver import MBIDResolver
 
 LOGGER = logging.getLogger(f"{MASS_LOGGER_NAME}.lastfmrecommendations")
+
+
+def _extract_image_url(image_array: list[dict[str, Any]]) -> str | None:
+    """Extract the best quality image URL from Last.fm's image array.
+
+    Last.fm returns images in multiple sizes: small, medium, large, extralarge, mega.
+    This function returns the largest available image URL.
+
+    :param image_array: List of image dicts from Last.fm API.
+    :return: URL string of the best quality image, or None if no valid images.
+    """
+    if not image_array:
+        return None
+
+    # Prefer larger sizes first
+    size_priority = ["mega", "extralarge", "large", "medium", "small"]
+
+    for size in size_priority:
+        for img in image_array:
+            if img.get("size") == size and img.get("#text"):
+                url = str(img["#text"]).strip()
+                # Filter out placeholder/empty images
+                if url and not url.endswith("/default.png"):
+                    return url
+
+    return None
 
 
 def parse_artist(lastfm_artist: dict[str, Any]) -> ItemMapping:
@@ -35,12 +61,22 @@ def parse_artist(lastfm_artist: dict[str, Any]) -> ItemMapping:
     if mbid:
         external_ids.add((ExternalID.MB_ARTIST, mbid))
 
+    # Extract image
+    image = None
+    if image_url := _extract_image_url(lastfm_artist.get("image", [])):
+        image = MediaItemImage(
+            type=ImageType.THUMB,
+            path=image_url,
+            provider="lastfm",
+        )
+
     return ItemMapping(
         media_type=MediaType.ARTIST,
         item_id=mbid or name,  # Use MBID if available, fallback to name
         provider="library",  # Library provider - MA will try to find this in library
         name=name,
         external_ids=external_ids,
+        image=image,
     )
 
 
@@ -83,10 +119,20 @@ async def parse_track(
         for isrc in isrcs:
             external_ids.add((ExternalID.ISRC, isrc))
 
+    # Extract image
+    image = None
+    if image_url := _extract_image_url(lastfm_track.get("image", [])):
+        image = MediaItemImage(
+            type=ImageType.THUMB,
+            path=image_url,
+            provider="lastfm",
+        )
+
     return ItemMapping(
         media_type=MediaType.TRACK,
         item_id=mbid or f"{artist_name}_{name}",  # Use MBID if available
         provider="library",  # Library provider - MA will try to find this in library
         name=f"{artist_name} - {name}",  # Include artist in name for display
         external_ids=external_ids,
+        image=image,
     )

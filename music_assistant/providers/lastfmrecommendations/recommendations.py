@@ -43,15 +43,16 @@ class LastFMRecommendationManager:
         self.logger = provider.logger
         self.mass = provider.mass
 
-    async def resolve_item_mapping(self, item_mapping: ItemMapping) -> Artist | Track | ItemMapping:
+    async def resolve_item_mapping(
+        self, item_mapping: ItemMapping
+    ) -> Artist | Track | ItemMapping | None:
         """Resolve an ItemMapping to an actual library or provider item.
 
         Tries to find a matching item in the library or streaming providers
-        using external IDs. Returns the matched item if found, otherwise
-        returns the original ItemMapping.
+        using external IDs, then falls back to name-only search.
 
         :param item_mapping: ItemMapping to resolve.
-        :return: Resolved Artist/Track or original ItemMapping if no match found.
+        :return: Resolved Artist/Track, or None if no match found.
         """
         # First, try to find in library by external IDs
         ctrl: ArtistsController | TracksController
@@ -69,7 +70,7 @@ class LastFMRecommendationManager:
             )
             return library_item
 
-        # Not in library - search streaming providers
+        # Not in library - search streaming providers with external ID matching
         for provider in self.mass.music.providers:
             if provider.domain == self.provider.domain:
                 continue  # Skip ourselves
@@ -84,7 +85,7 @@ class LastFMRecommendationManager:
                 for result in search_results:
                     if compare_media_item(item_mapping, result, strict=False):
                         self.logger.debug(
-                            "Found %s on provider %s: %s",
+                            "Found %s on provider %s via external IDs: %s",
                             item_mapping.media_type.value,
                             provider.name,
                             result.name,
@@ -96,11 +97,36 @@ class LastFMRecommendationManager:
                 )
                 continue
 
-        # No match found - return original ItemMapping
+        # Fallback: Try name-only search without external ID matching
+        for provider in self.mass.music.providers:
+            if provider.domain == self.provider.domain:
+                continue
+            if not provider.is_streaming_provider:
+                continue
+
+            try:
+                search_results = await ctrl.search(item_mapping.name, provider.instance_id, limit=1)
+                if search_results:
+                    # Return first result even without external ID match
+                    result = search_results[0]
+                    self.logger.debug(
+                        "Found %s on provider %s via name search: %s",
+                        item_mapping.media_type.value,
+                        provider.name,
+                        result.name,
+                    )
+                    return result
+            except Exception as err:
+                self.logger.debug(
+                    "Provider %s fallback search failed: %s", provider.name, type(err).__name__
+                )
+                continue
+
+        # No match found anywhere - filter out this item
         self.logger.debug(
             "Could not resolve %s: %s", item_mapping.media_type.value, item_mapping.name
         )
-        return item_mapping
+        return None
 
     async def get_recommendations(self) -> list[RecommendationFolder]:
         """Get this provider's recommendations organized into folders.
@@ -203,19 +229,24 @@ class LastFMRecommendationManager:
         top_artists_raw = await self.api.get_chart_top_artists(limit=10)
         if top_artists_raw:
             top_artists_mappings = [parse_artist(artist_data) for artist_data in top_artists_raw]
-            # Resolve ItemMappings to actual items
-            top_artists = [await self.resolve_item_mapping(item) for item in top_artists_mappings]
+            # Resolve ItemMappings to actual items (filter out None for unresolved items)
+            top_artists = [
+                item
+                for item in [await self.resolve_item_mapping(m) for m in top_artists_mappings]
+                if item is not None
+            ]
 
-            folders.append(
-                RecommendationFolder(
-                    item_id=f"{self.provider.instance_id}_chart_top_artists",
-                    name="Last.fm Top Artists",
-                    provider=self.provider.instance_id,
-                    items=UniqueList(top_artists),
-                    subtitle="Most popular artists worldwide",
-                    icon="mdi-chart-line",
+            if top_artists:
+                folders.append(
+                    RecommendationFolder(
+                        item_id=f"{self.provider.instance_id}_chart_top_artists",
+                        name="Last.fm Top Artists",
+                        provider=self.provider.instance_id,
+                        items=UniqueList(top_artists),
+                        subtitle="Most popular artists worldwide",
+                        icon="mdi-chart-line",
+                    )
                 )
-            )
 
         # Global top tracks
         top_tracks_raw = await self.api.get_chart_top_tracks(limit=10)
@@ -223,19 +254,24 @@ class LastFMRecommendationManager:
             top_tracks_mappings = [
                 await parse_track(track_data, self.mbid_resolver) for track_data in top_tracks_raw
             ]
-            # Resolve ItemMappings to actual items
-            top_tracks = [await self.resolve_item_mapping(item) for item in top_tracks_mappings]
+            # Resolve ItemMappings to actual items (filter out None for unresolved items)
+            top_tracks = [
+                item
+                for item in [await self.resolve_item_mapping(m) for m in top_tracks_mappings]
+                if item is not None
+            ]
 
-            folders.append(
-                RecommendationFolder(
-                    item_id=f"{self.provider.instance_id}_chart_top_tracks",
-                    name="Last.fm Top Tracks",
-                    provider=self.provider.instance_id,
-                    items=UniqueList(top_tracks),
-                    subtitle="Most popular tracks worldwide",
-                    icon="mdi-chart-box",
+            if top_tracks:
+                folders.append(
+                    RecommendationFolder(
+                        item_id=f"{self.provider.instance_id}_chart_top_tracks",
+                        name="Last.fm Top Tracks",
+                        provider=self.provider.instance_id,
+                        items=UniqueList(top_tracks),
+                        subtitle="Most popular tracks worldwide",
+                        icon="mdi-chart-box",
+                    )
                 )
-            )
 
         return folders
 
@@ -280,8 +316,12 @@ class LastFMRecommendationManager:
             parse_artist(artist_data)
             for artist_data in unique_similar[:12]  # Get 12 to ensure we have 10 after filtering
         ]
-        # Resolve ItemMappings to actual items
-        return [await self.resolve_item_mapping(item) for item in artist_mappings]
+        # Resolve ItemMappings to actual items (filter out None for unresolved items)
+        return [
+            item
+            for item in [await self.resolve_item_mapping(m) for m in artist_mappings]
+            if item is not None
+        ]
 
     async def _get_similar_tracks_from_seeds(
         self, seed_tracks: list[Track]
@@ -343,5 +383,9 @@ class LastFMRecommendationManager:
         track_mappings = [
             await parse_track(track_data, self.mbid_resolver) for track_data in top_tracks_data
         ]
-        # Resolve ItemMappings to actual items
-        return [await self.resolve_item_mapping(item) for item in track_mappings]
+        # Resolve ItemMappings to actual items (filter out None for unresolved items)
+        return [
+            item
+            for item in [await self.resolve_item_mapping(m) for m in track_mappings]
+            if item is not None
+        ]
