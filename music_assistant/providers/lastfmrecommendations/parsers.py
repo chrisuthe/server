@@ -37,8 +37,8 @@ def parse_artist(lastfm_artist: dict[str, Any]) -> ItemMapping:
 
     return ItemMapping(
         media_type=MediaType.ARTIST,
-        item_id=name,  # Use name as temporary ID for resolution
-        provider="",  # Empty provider signals this needs to be resolved
+        item_id=mbid or name,  # Use MBID if available, fallback to name
+        provider="library",  # Library provider - MA will try to find this in library
         name=name,
         external_ids=external_ids,
     )
@@ -85,8 +85,8 @@ async def parse_track(
 
     return ItemMapping(
         media_type=MediaType.TRACK,
-        item_id=f"{artist_name}_{name}",  # Use name as temporary ID for resolution
-        provider="",  # Empty provider signals this needs to be resolved
+        item_id=mbid or f"{artist_name}_{name}",  # Use MBID if available
+        provider="library",  # Library provider - MA will try to find this in library
         name=f"{artist_name} - {name}",  # Include artist in name for display
         external_ids=external_ids,
     )
