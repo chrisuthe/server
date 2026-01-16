@@ -34,7 +34,7 @@ async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
 ) -> LastFMRecommendationsProvider:
     """Initialize provider(instance) with given configuration."""
-    return LastFMRecommendationsProvider(mass, manifest, config, SUPPORTED_FEATURES)
+    return LastFMRecommendationsProvider(mass, manifest, config)
 
 
 async def get_config_entries(
@@ -70,31 +70,22 @@ class LastFMRecommendationsProvider(MusicProvider):
         mass: MusicAssistant,
         manifest: ProviderManifest,
         config: ProviderConfig,
-        supported_features: set[ProviderFeature],
     ) -> None:
         """Initialize the Last.fm Recommendations provider.
 
         :param mass: MusicAssistant instance.
         :param manifest: Provider manifest.
         :param config: Provider configuration.
-        :param supported_features: Set of supported features.
         """
-        super().__init__(mass, manifest, config, supported_features)
+        super().__init__(mass, manifest, config)
         self.api = LastFMAPIClient(self)
         self.mbid_resolver = MBIDResolver(self)
         self.recommendations_manager = LastFMRecommendationManager(self)
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
-        # Validate API key is configured
-        api_key = self.config.get_value("api_key")
-        if not api_key:
-            msg = "Last.fm API key is required"
-            raise SetupFailedError(msg)
-
         # Test API key by making a simple request
         try:
-            # Try to get top artists chart (doesn't require authentication)
             await self.api.get_chart_top_artists(limit=1)
             self.logger.info("Last.fm API key validated successfully")
         except (TimeoutError, ClientError, InvalidDataError, KeyError) as err:

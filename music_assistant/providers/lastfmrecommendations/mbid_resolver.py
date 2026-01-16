@@ -23,7 +23,7 @@ class MBIDResolver:
     streaming providers for accurate track matching.
 
     A 90-day cache is implemented on top of MusicBrainz's own 30-day cache to
-    minimize API load, as ISRC mappings are permanent and won't change.
+    minimize API load, as ISRC mappings tend not to change.
     """
 
     CACHE_EXPIRATION = 86400 * 90  # 90 days
@@ -41,8 +41,8 @@ class MBIDResolver:
         """Get ISRCs for a recording MBID via MusicBrainz.
 
         This method implements a 90-day cache on top of MusicBrainz's own caching
-        to minimize API calls to MusicBrainz. ISRCs are permanent identifiers,
-        so once we've looked up an MBID->ISRC mapping, it won't change.
+        to minimize API calls to MusicBrainz. ISRC mappings tend not to change,
+        so once we've looked up an MBID->ISRC mapping, it should remain valid.
 
         :param mbid: MusicBrainz recording ID.
         :return: List of ISRCs for the recording (may be empty if none found).
@@ -82,7 +82,7 @@ class MBIDResolver:
             return isrcs
 
         except (TimeoutError, ClientError, AttributeError) as err:
-            self.logger.warning("Failed to get ISRCs for MBID %s: %s", mbid, type(err).__name__)
+            self.logger.debug("Failed to get ISRCs for MBID %s: %s", mbid, type(err).__name__)
 
             # Cache the failure (empty list) to avoid repeated failed lookups
             await self.mass.cache.set(

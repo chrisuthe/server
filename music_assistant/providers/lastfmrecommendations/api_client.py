@@ -139,7 +139,7 @@ class LastFMAPIClient:
             )
             return []
 
-    async def get_chart_top_artists(self, limit: int = 50) -> list[dict[str, Any]]:
+    async def get_chart_top_artists(self, limit: int = 10) -> list[dict[str, Any]]:
         """Get global top artists chart from Last.fm.
 
         :param limit: Maximum number of artists to return.
@@ -160,7 +160,7 @@ class LastFMAPIClient:
             self.logger.warning("Failed to get top artists chart: %s", type(err).__name__)
             return []
 
-    async def get_chart_top_tracks(self, limit: int = 50) -> list[dict[str, Any]]:
+    async def get_chart_top_tracks(self, limit: int = 10) -> list[dict[str, Any]]:
         """Get global top tracks chart from Last.fm.
 
         :param limit: Maximum number of tracks to return.
