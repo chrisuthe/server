@@ -77,10 +77,8 @@ class LastFMRecommendationManager:
                 continue
 
             try:
-                # Search using the name
-                search_results = await ctrl.search(
-                    item_mapping.name, provider.instance_id, limit=10
-                )
+                # Search using the name (limit=1 since we only need first match)
+                search_results = await ctrl.search(item_mapping.name, provider.instance_id, limit=1)
 
                 # Find first match using external IDs
                 for result in search_results:
