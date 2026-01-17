@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.enums import ExternalID
 from music_assistant_models.media_items import (
@@ -16,6 +16,9 @@ from music_assistant.providers.lastfmrecommendations.parsers import parse_artist
 
 if TYPE_CHECKING:
     from music_assistant.providers.lastfmrecommendations import LastFMRecommendationsProvider
+
+# Cache category for resolved Artist/Track objects
+CACHE_CATEGORY_RESOLVED_ITEMS = 1
 
 
 class LastFMRecommendationManager:
@@ -42,8 +45,26 @@ class LastFMRecommendationManager:
         # Cache resolved items by their unique key (MBID or name) to avoid re-resolving
         self._resolved_cache: dict[str, Artist | Track] = {}
 
+    async def clear_cache(self) -> None:
+        """Clear both in-memory and persistent caches.
+
+        Useful when a streaming provider is removed or when recommendations
+        are returning stale/incorrect results.
+        """
+        # Clear in-memory cache
+        self._resolved_cache.clear()
+
+        # Clear persistent cache for this category
+        await self.mass.cache.clear(category_filter=CACHE_CATEGORY_RESOLVED_ITEMS)
+
+        self.logger.info("Cleared all recommendation caches (in-memory and persistent)")
+
     async def _get_or_resolve_artist(self, lastfm_artist: dict[str, Any]) -> Artist | None:
         """Get artist from cache or resolve it.
+
+        Uses a two-tier caching strategy:
+        1. In-memory cache (fast, cleared on restart)
+        2. Persistent cache (survives restarts, 90-day expiry)
 
         :param lastfm_artist: Raw Last.fm artist dict.
         :return: Resolved Artist or None if not found.
@@ -53,20 +74,42 @@ class LastFMRecommendationManager:
         if not cache_key:
             return None
 
-        # Check cache first
+        # Check in-memory cache first (fastest)
         if cache_key in self._resolved_cache:
             cached = self._resolved_cache[cache_key]
             if isinstance(cached, Artist):
                 return cached
 
-        # Not in cache - resolve it
+        # Check persistent cache (survives restarts)
+        persistent_cache_key = f"artist_{cache_key}"
+        cached_artist = await self.mass.cache.get(
+            key=persistent_cache_key, category=CACHE_CATEGORY_RESOLVED_ITEMS
+        )
+        if cached_artist is not None and isinstance(cached_artist, Artist):
+            # Store in memory cache for faster subsequent access
+            artist_obj = cast("Artist", cached_artist)
+            self._resolved_cache[cache_key] = artist_obj
+            return artist_obj
+
+        # Not in any cache - resolve it
         artist = await parse_artist(lastfm_artist, self.mass, self.provider.instance_id)
         if artist:
+            # Store in both caches
             self._resolved_cache[cache_key] = artist
+            await self.mass.cache.set(
+                persistent_cache_key,
+                artist,
+                category=CACHE_CATEGORY_RESOLVED_ITEMS,
+                expiration=60 * 60 * 24 * 90,  # 90 days
+            )
         return artist
 
     async def _get_or_resolve_track(self, lastfm_track: dict[str, Any]) -> Track | None:
         """Get track from cache or resolve it.
+
+        Uses a two-tier caching strategy:
+        1. In-memory cache (fast, cleared on restart)
+        2. Persistent cache (survives restarts, 90-day expiry)
 
         :param lastfm_track: Raw Last.fm track dict.
         :return: Resolved Track or None if not found.
@@ -84,18 +127,36 @@ class LastFMRecommendationManager:
         if not cache_key:
             return None
 
-        # Check cache first
+        # Check in-memory cache first (fastest)
         if cache_key in self._resolved_cache:
             cached = self._resolved_cache[cache_key]
             if isinstance(cached, Track):
                 return cached
 
-        # Not in cache - resolve it
+        # Check persistent cache (survives restarts)
+        persistent_cache_key = f"track_{cache_key}"
+        cached_track = await self.mass.cache.get(
+            key=persistent_cache_key, category=CACHE_CATEGORY_RESOLVED_ITEMS
+        )
+        if cached_track is not None and isinstance(cached_track, Track):
+            # Store in memory cache for faster subsequent access
+            track_obj = cast("Track", cached_track)
+            self._resolved_cache[cache_key] = track_obj
+            return track_obj
+
+        # Not in any cache - resolve it
         track = await parse_track(
             lastfm_track, self.mbid_resolver, self.mass, self.provider.instance_id
         )
         if track:
+            # Store in both caches
             self._resolved_cache[cache_key] = track
+            await self.mass.cache.set(
+                persistent_cache_key,
+                track,
+                category=CACHE_CATEGORY_RESOLVED_ITEMS,
+                expiration=60 * 60 * 24 * 90,  # 90 days
+            )
         return track
 
     async def get_recommendations(self) -> list[RecommendationFolder]:

@@ -28,6 +28,9 @@ SUPPORTED_FEATURES = {
     ProviderFeature.RECOMMENDATIONS,
 }
 
+# Config action constants
+CONF_ACTION_CLEAR_CACHE = "clear_cache"
+
 
 async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
@@ -37,12 +40,19 @@ async def setup(
 
 
 async def get_config_entries(
-    mass: MusicAssistant,  # noqa: ARG001
-    instance_id: str | None = None,  # noqa: ARG001
-    action: str | None = None,  # noqa: ARG001
+    mass: MusicAssistant,
+    instance_id: str | None = None,
+    action: str | None = None,
     values: dict[str, ConfigValueType] | None = None,
 ) -> tuple[ConfigEntry, ...]:
     """Return Config entries to setup this provider."""
+    # Handle clear cache action
+    if action == CONF_ACTION_CLEAR_CACHE and instance_id:
+        # Get the provider instance and clear its cache
+        provider = mass.get_provider(instance_id)
+        if isinstance(provider, LastFMRecommendationsProvider):
+            await provider.recommendations_manager.clear_cache()
+
     return (
         ConfigEntry(
             key="api_key",
@@ -92,6 +102,19 @@ async def get_config_entries(
             default_value=False,
             description="Show Last.fm's worldwide top tracks chart",
             category="recommendations",
+        ),
+        ConfigEntry(
+            key=CONF_ACTION_CLEAR_CACHE,
+            type=ConfigEntryType.ACTION,
+            label="Clear Recommendation Cache",
+            description=(
+                "Clear all cached recommendations. "
+                "Use if a provider was removed or recommendations are stale."
+            ),
+            action=CONF_ACTION_CLEAR_CACHE,
+            action_label="Clear Cache",
+            category="cache",
+            required=False,
         ),
     )
 
