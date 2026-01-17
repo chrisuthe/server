@@ -11,7 +11,6 @@ from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.media_items import Artist, ItemMapping, MediaItemImage, Track
 
 from music_assistant.constants import MASS_LOGGER_NAME
-from music_assistant.helpers.compare import compare_media_item
 
 if TYPE_CHECKING:
     from music_assistant import MusicAssistant
@@ -20,6 +19,21 @@ if TYPE_CHECKING:
     from music_assistant.providers.lastfm_recommendations.mbid_resolver import MBIDResolver
 
 LOGGER = logging.getLogger(f"{MASS_LOGGER_NAME}.lastfm_recommendations")
+
+
+def _has_matching_external_ids(item_mapping: ItemMapping, media_item: Artist | Track) -> bool:
+    """Check if an ItemMapping has any matching external IDs with a media item.
+
+    :param item_mapping: ItemMapping with external IDs from Last.fm.
+    :param media_item: Artist or Track to compare against.
+    :return: True if any external IDs match, False otherwise.
+    """
+    if not item_mapping.external_ids:
+        return False
+
+    # external_ids is a set of tuples (ExternalID, str)
+    # Check if any external IDs overlap
+    return bool(item_mapping.external_ids & media_item.external_ids)
 
 
 def _extract_image_url(image_array: list[dict[str, Any]]) -> str | None:
@@ -69,7 +83,7 @@ async def _search_provider(
 
         result = search_results[0]
         # If strict matching, verify external IDs match
-        if strict_match and not compare_media_item(item_mapping, result, strict=False):
+        if strict_match and not _has_matching_external_ids(item_mapping, result):
             return None
 
         LOGGER.debug(
