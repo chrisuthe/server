@@ -7,6 +7,7 @@ import logging
 from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.enums import ExternalID, ImageType, MediaType
+from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.media_items import Artist, ItemMapping, MediaItemImage, Track
 
 from music_assistant.constants import MASS_LOGGER_NAME
@@ -78,7 +79,8 @@ async def _search_provider(
             result.name,
         )
         return result
-    except Exception as err:
+    except MusicAssistantError as err:
+        # Expected errors from provider searches (e.g., provider unavailable, timeout, etc.)
         LOGGER.debug("Provider %s search failed: %s", provider.name, type(err).__name__)
         return None
 
