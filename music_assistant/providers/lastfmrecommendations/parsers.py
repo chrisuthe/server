@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, cast
 
@@ -46,10 +47,49 @@ def _extract_image_url(image_array: list[dict[str, Any]]) -> str | None:
     return None
 
 
+async def _search_provider(
+    ctrl: ArtistsController | TracksController,
+    item_mapping: ItemMapping,
+    provider: Any,
+    strict_match: bool,
+) -> Artist | Track | None:
+    """Search a single provider for a matching item.
+
+    :param ctrl: Controller for the media type.
+    :param item_mapping: ItemMapping to search for.
+    :param provider: Provider instance to search.
+    :param strict_match: If True, use external ID matching. If False, accept any match.
+    :return: Matched item or None.
+    """
+    try:
+        search_results = await ctrl.search(item_mapping.name, provider.instance_id, limit=1)
+        if not search_results:
+            return None
+
+        result = search_results[0]
+        # If strict matching, verify external IDs match
+        if strict_match and not compare_media_item(item_mapping, result, strict=False):
+            return None
+
+        LOGGER.debug(
+            "Found %s on provider %s: %s",
+            item_mapping.media_type.value,
+            provider.name,
+            result.name,
+        )
+        return result
+    except Exception as err:
+        LOGGER.debug("Provider %s search failed: %s", provider.name, type(err).__name__)
+        return None
+
+
 async def _resolve_item(
     item_mapping: ItemMapping, mass: MusicAssistant, provider_instance_to_skip: str
 ) -> Artist | Track | None:
     """Resolve an ItemMapping to an actual library or provider item.
+
+    Searches all providers concurrently and returns the first match found.
+    This is much faster than sequential search, especially with rate-limited providers.
 
     :param item_mapping: ItemMapping with metadata and external IDs from Last.fm.
     :param mass: MusicAssistant instance.
@@ -70,53 +110,50 @@ async def _resolve_item(
         LOGGER.debug("Found %s in library: %s", item_mapping.media_type.value, library_item.name)
         return library_item
 
-    # Search streaming providers with external ID matching
-    for provider in mass.music.providers:
-        if provider.instance_id == provider_instance_to_skip:
-            continue
-        if not provider.is_streaming_provider:
-            continue
+    # Get list of streaming providers
+    streaming_providers = [
+        p
+        for p in mass.music.providers
+        if p.instance_id != provider_instance_to_skip and p.is_streaming_provider
+    ]
 
-        try:
-            search_results = await ctrl.search(item_mapping.name, provider.instance_id, limit=1)
-            for result in search_results:
-                if compare_media_item(item_mapping, result, strict=False):
-                    LOGGER.debug(
-                        "Found %s on provider %s via external IDs: %s",
-                        item_mapping.media_type.value,
-                        provider.name,
-                        result.name,
-                    )
-                    return result
-        except Exception as err:
-            LOGGER.debug("Provider %s search failed: %s", provider.name, type(err).__name__)
-            continue
+    if not streaming_providers:
+        LOGGER.debug("No streaming providers available for resolution")
+        return None
 
-    # Fallback: name-only search
-    for provider in mass.music.providers:
-        if provider.instance_id == provider_instance_to_skip:
-            continue
-        if not provider.is_streaming_provider:
-            continue
+    # Search all providers concurrently with external ID matching (strict)
+    # Create tasks so we can cancel them if we find a match early
+    strict_tasks = [
+        asyncio.create_task(_search_provider(ctrl, item_mapping, provider, strict_match=True))
+        for provider in streaming_providers
+    ]
 
-        try:
-            search_results = await ctrl.search(item_mapping.name, provider.instance_id, limit=1)
-            if search_results:
-                result = search_results[0]
-                LOGGER.debug(
-                    "Found %s on provider %s via name search: %s",
-                    item_mapping.media_type.value,
-                    provider.name,
-                    result.name,
-                )
-                return result
-        except Exception as err:
-            LOGGER.debug(
-                "Provider %s fallback search failed: %s", provider.name, type(err).__name__
-            )
-            continue
+    # Return as soon as we find the first match
+    for task in asyncio.as_completed(strict_tasks):
+        result = await task
+        if result is not None:
+            # Found a match! Cancel remaining tasks
+            for t in strict_tasks:
+                if not t.done():
+                    t.cancel()
+            return result
 
-    # No match found
+    # No match with external IDs - try name-only search (fallback)
+    fallback_tasks = [
+        asyncio.create_task(_search_provider(ctrl, item_mapping, provider, strict_match=False))
+        for provider in streaming_providers
+    ]
+
+    for task in asyncio.as_completed(fallback_tasks):
+        result = await task
+        if result is not None:
+            # Found a match! Cancel remaining tasks
+            for t in fallback_tasks:
+                if not t.done():
+                    t.cancel()
+            return result
+
+    # No match found anywhere
     LOGGER.debug("Could not resolve %s: %s", item_mapping.media_type.value, item_mapping.name)
     return None
 

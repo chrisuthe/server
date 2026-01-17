@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
 from aiohttp import ClientError
@@ -78,6 +79,24 @@ class LastFMRecommendationsProvider(MusicProvider):
         except (TimeoutError, ClientError, InvalidDataError, KeyError) as err:
             msg = f"Failed to validate Last.fm API key: {type(err).__name__}"
             raise SetupFailedError(msg) from err
+
+        # Start background task to warm up cache after 60 seconds
+        # This prevents blocking on first homepage load
+        self.mass.create_task(self._warmup_cache())
+
+    async def _warmup_cache(self) -> None:
+        """Warm up the recommendations cache in the background.
+
+        Waits 60 seconds after initialization, then pre-populates the cache
+        so the first homepage visit is instant.
+        """
+        await asyncio.sleep(60)  # Wait for MA to fully start up
+        try:
+            self.logger.info("Starting background cache warmup for recommendations")
+            await self.recommendations()  # This will populate the cache
+            self.logger.info("Recommendations cache warmup complete")
+        except Exception as err:
+            self.logger.warning("Failed to warm up recommendations cache: %s", err)
 
     @use_cache(86400)  # Cache recommendations for 24 hours
     async def recommendations(self) -> list[RecommendationFolder]:
