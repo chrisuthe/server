@@ -21,6 +21,14 @@ class LastFMAPIClient:
     BASE_URL = "https://ws.audioscrobbler.com/2.0/"
     throttler = ThrottlerManager(rate_limit=5, period=1)  # 5 requests per second
 
+    # Last.fm error codes that should be logged as warnings
+    CRITICAL_ERROR_CODES = {
+        4,  # Authentication Failed
+        10,  # Invalid API key
+        26,  # Suspended API key
+        29,  # Rate limit exceeded
+    }
+
     def __init__(self, provider: LastFMRecommendationsProvider) -> None:
         """Initialize Last.fm API client.
 
@@ -54,8 +62,26 @@ class LastFMAPIClient:
 
                 # Last.fm returns errors in the response body
                 if "error" in data:
+                    error_code = data.get("error", 0)
                     error_msg = data.get("message", "Unknown error")
-                    msg = f"Last.fm API error: {error_msg}"
+
+                    # Log critical errors as warnings, others as debug
+                    if error_code in self.CRITICAL_ERROR_CODES:
+                        self.logger.warning(
+                            "Last.fm API error %s: %s (method: %s)",
+                            error_code,
+                            error_msg,
+                            method,
+                        )
+                    else:
+                        self.logger.debug(
+                            "Last.fm API error %s: %s (method: %s)",
+                            error_code,
+                            error_msg,
+                            method,
+                        )
+
+                    msg = f"Last.fm API error {error_code}: {error_msg}"
                     raise InvalidDataError(msg)
 
                 return data
@@ -89,10 +115,8 @@ class LastFMAPIClient:
 
             return similar_artists
 
-        except (TimeoutError, ClientError, InvalidDataError, KeyError) as err:
-            self.logger.debug(
-                "Failed to get similar artists for %s: %s", artist_name, type(err).__name__
-            )
+        except (TimeoutError, ClientError, InvalidDataError, KeyError):
+            # Error already logged in _get_data with full details
             return []
 
     async def get_similar_tracks(
@@ -130,13 +154,8 @@ class LastFMAPIClient:
 
             return similar_tracks
 
-        except (TimeoutError, ClientError, InvalidDataError, KeyError) as err:
-            self.logger.debug(
-                "Failed to get similar tracks for %s - %s: %s",
-                artist_name,
-                track_name,
-                type(err).__name__,
-            )
+        except (TimeoutError, ClientError, InvalidDataError, KeyError):
+            # Error already logged in _get_data with full details
             return []
 
     async def get_chart_top_artists(self, limit: int = 10) -> list[dict[str, Any]]:
@@ -156,8 +175,8 @@ class LastFMAPIClient:
 
             return artists
 
-        except (TimeoutError, ClientError, InvalidDataError, KeyError) as err:
-            self.logger.warning("Failed to get top artists chart: %s", type(err).__name__)
+        except (TimeoutError, ClientError, InvalidDataError, KeyError):
+            # Error already logged in _get_data with full details
             return []
 
     async def get_chart_top_tracks(self, limit: int = 10) -> list[dict[str, Any]]:
@@ -175,6 +194,6 @@ class LastFMAPIClient:
 
             return tracks
 
-        except (TimeoutError, ClientError, InvalidDataError, KeyError) as err:
-            self.logger.warning("Failed to get top tracks chart: %s", type(err).__name__)
+        except (TimeoutError, ClientError, InvalidDataError, KeyError):
+            # Error already logged in _get_data with full details
             return []
