@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueType
 from music_assistant_models.enums import ConfigEntryType, ProviderFeature
+from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.media_items import RecommendationFolder  # noqa: TC002
 
 from music_assistant.models.music_provider import MusicProvider
@@ -157,7 +158,8 @@ class LastFMRecommendationsProvider(MusicProvider):
             self._recommendation_folders = folders
             self._recommendations_populated = True
             self.logger.info("Recommendations populated with %d folders", len(folders))
-        except Exception as err:
+        except MusicAssistantError as err:
+            # Expected MA errors (provider unavailable, database errors, etc.)
             self.logger.warning("Failed to populate recommendations: %s", err)
 
     def _schedule_refresh(self) -> None:
@@ -195,7 +197,8 @@ class LastFMRecommendationsProvider(MusicProvider):
         try:
             self.logger.info("Refreshing Last.fm recommendations (scheduled)")
             await self._populate_recommendations()
-        except Exception as err:
+        except MusicAssistantError as err:
+            # Expected MA errors (provider unavailable, database errors, etc.)
             self.logger.warning("Failed to refresh recommendations: %s", err)
         finally:
             # Reschedule next refresh
