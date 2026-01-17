@@ -79,7 +79,7 @@ class LastFMRecommendationsProvider(MusicProvider):
             msg = f"Failed to validate Last.fm API key: {type(err).__name__}"
             raise SetupFailedError(msg) from err
 
-    @use_cache(3600)  # Cache recommendations for 1 hour
+    @use_cache(86400)  # Cache recommendations for 24 hours
     async def recommendations(self) -> list[RecommendationFolder]:
         """Get this provider's recommendations organized into folders.
 
