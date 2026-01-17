@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import TYPE_CHECKING
 
 from aiohttp import ClientError
@@ -11,7 +10,6 @@ from music_assistant_models.enums import ConfigEntryType, ProviderFeature
 from music_assistant_models.errors import InvalidDataError, SetupFailedError
 from music_assistant_models.media_items import RecommendationFolder  # noqa: TC002
 
-from music_assistant.controllers.cache import use_cache
 from music_assistant.models.music_provider import MusicProvider
 from music_assistant.providers.lastfmrecommendations.api_client import LastFMAPIClient
 from music_assistant.providers.lastfmrecommendations.mbid_resolver import MBIDResolver
@@ -72,6 +70,10 @@ class LastFMRecommendationsProvider(MusicProvider):
         self.mbid_resolver = MBIDResolver(self)
         self.recommendations_manager = LastFMRecommendationManager(self)
 
+        # Initialize empty recommendation folders (will be populated progressively)
+        self._recommendation_folders: list[RecommendationFolder] = []
+        self._recommendations_populated = False
+
         # Test API key by making a simple request
         try:
             await self.api.get_chart_top_artists(limit=1)
@@ -80,27 +82,33 @@ class LastFMRecommendationsProvider(MusicProvider):
             msg = f"Failed to validate Last.fm API key: {type(err).__name__}"
             raise SetupFailedError(msg) from err
 
-        # Start background task to warm up cache after 60 seconds
-        # This prevents blocking on first homepage load
-        self.mass.create_task(self._warmup_cache())
+        # Start background task to populate recommendations immediately
+        self.mass.create_task(self._populate_recommendations())
 
-    async def _warmup_cache(self) -> None:
-        """Warm up the recommendations cache in the background.
+    async def _populate_recommendations(self) -> None:
+        """Populate recommendation folders in the background.
 
-        Waits 60 seconds after initialization, then pre-populates the cache
-        so the first homepage visit is instant.
+        This runs immediately after initialization, building recommendation
+        folders progressively. The instance variable is updated as folders
+        are populated, so each homepage visit shows more items.
         """
-        await asyncio.sleep(60)  # Wait for MA to fully start up
         try:
-            self.logger.info("Starting background cache warmup for recommendations")
-            await self.recommendations()  # This will populate the cache
-            self.logger.info("Recommendations cache warmup complete")
+            self.logger.info("Starting background population of recommendations")
+            # Fetch and store recommendation folders
+            folders = await self.recommendations_manager.get_recommendations()
+            self._recommendation_folders = folders
+            self._recommendations_populated = True
+            self.logger.info("Recommendations populated with %d folders", len(folders))
         except Exception as err:
-            self.logger.warning("Failed to warm up recommendations cache: %s", err)
+            self.logger.warning("Failed to populate recommendations: %s", err)
 
-    @use_cache(86400)  # Cache recommendations for 24 hours
     async def recommendations(self) -> list[RecommendationFolder]:
         """Get this provider's recommendations organized into folders.
+
+        Returns the current state of recommendation folders. On first call (before
+        background population completes), this returns an empty list. Each subsequent
+        call returns progressively more populated folders as the background task
+        resolves items.
 
         Returns up to 4 recommendation folders:
         1. Discover Similar Artists (personalized, based on your listening)
@@ -111,4 +119,5 @@ class LastFMRecommendationsProvider(MusicProvider):
         Personalized folders only appear if the user has listening history.
         If the library is empty, only global charts will be shown.
         """
-        return await self.recommendations_manager.get_recommendations()
+        # Return current state (empty on first call, populated later)
+        return self._recommendation_folders
