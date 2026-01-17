@@ -39,6 +39,65 @@ class LastFMRecommendationManager:
         self.logger = provider.logger
         self.mass = provider.mass
 
+        # Cache resolved items by their unique key (MBID or name) to avoid re-resolving
+        self._resolved_cache: dict[str, Artist | Track] = {}
+
+    async def _get_or_resolve_artist(self, lastfm_artist: dict[str, Any]) -> Artist | None:
+        """Get artist from cache or resolve it.
+
+        :param lastfm_artist: Raw Last.fm artist dict.
+        :return: Resolved Artist or None if not found.
+        """
+        # Create cache key (prefer MBID, fallback to name)
+        cache_key = lastfm_artist.get("mbid") or lastfm_artist.get("name", "")
+        if not cache_key:
+            return None
+
+        # Check cache first
+        if cache_key in self._resolved_cache:
+            cached = self._resolved_cache[cache_key]
+            if isinstance(cached, Artist):
+                return cached
+
+        # Not in cache - resolve it
+        artist = await parse_artist(lastfm_artist, self.mass, self.provider.instance_id)
+        if artist:
+            self._resolved_cache[cache_key] = artist
+        return artist
+
+    async def _get_or_resolve_track(self, lastfm_track: dict[str, Any]) -> Track | None:
+        """Get track from cache or resolve it.
+
+        :param lastfm_track: Raw Last.fm track dict.
+        :return: Resolved Track or None if not found.
+        """
+        # Create cache key (prefer MBID, fallback to artist_name)
+        cache_key = lastfm_track.get("mbid")
+        if not cache_key:
+            artist_data = lastfm_track.get("artist", {})
+            artist_name = (
+                artist_data if isinstance(artist_data, str) else artist_data.get("name", "")
+            )
+            track_name = lastfm_track.get("name", "")
+            cache_key = f"{artist_name}_{track_name}" if artist_name and track_name else ""
+
+        if not cache_key:
+            return None
+
+        # Check cache first
+        if cache_key in self._resolved_cache:
+            cached = self._resolved_cache[cache_key]
+            if isinstance(cached, Track):
+                return cached
+
+        # Not in cache - resolve it
+        track = await parse_track(
+            lastfm_track, self.mbid_resolver, self.mass, self.provider.instance_id
+        )
+        if track:
+            self._resolved_cache[cache_key] = track
+        return track
+
     async def get_recommendations(self) -> list[RecommendationFolder]:
         """Get this provider's recommendations organized into folders.
 
@@ -146,11 +205,11 @@ class LastFMRecommendationManager:
         if self.provider.config.get_value("enable_top_artists"):
             top_artists_raw = await self.api.get_chart_top_artists(limit=10)
             if top_artists_raw:
-                # Parse and resolve artists (filter out None for unresolved items)
+                # Parse and resolve artists (uses cache to avoid re-resolving)
                 top_artists = [
                     artist
                     for artist in [
-                        await parse_artist(artist_data, self.mass, self.provider.instance_id)
+                        await self._get_or_resolve_artist(artist_data)
                         for artist_data in top_artists_raw
                     ]
                     if artist is not None
@@ -172,13 +231,11 @@ class LastFMRecommendationManager:
         if self.provider.config.get_value("enable_top_tracks"):
             top_tracks_raw = await self.api.get_chart_top_tracks(limit=10)
             if top_tracks_raw:
-                # Parse and resolve tracks (filter out None for unresolved items)
+                # Parse and resolve tracks (uses cache to avoid re-resolving)
                 top_tracks = [
                     track
                     for track in [
-                        await parse_track(
-                            track_data, self.mbid_resolver, self.mass, self.provider.instance_id
-                        )
+                        await self._get_or_resolve_track(track_data)
                         for track_data in top_tracks_raw
                     ]
                     if track is not None
@@ -232,11 +289,11 @@ class LastFMRecommendationManager:
         # Sort by match score (similarity) and take top results
         unique_similar.sort(key=lambda x: float(x.get("match", 0)), reverse=True)
 
-        # Parse and resolve artists (filter out None for unresolved items)
+        # Parse and resolve artists (uses cache to avoid re-resolving)
         return [
             artist
             for artist in [
-                await parse_artist(artist_data, self.mass, self.provider.instance_id)
+                await self._get_or_resolve_artist(artist_data)
                 for artist_data in unique_similar[
                     :12
                 ]  # Get 12 to ensure we have 10 after filtering
@@ -298,14 +355,11 @@ class LastFMRecommendationManager:
         # Only resolve ISRCs for top 10 tracks (optimization)
         top_tracks_data = unique_similar[:10]
 
-        # Parse and resolve tracks (this includes ISRC resolution via MusicBrainz)
+        # Parse and resolve tracks (uses cache to avoid re-resolving)
         return [
             track
             for track in [
-                await parse_track(
-                    track_data, self.mbid_resolver, self.mass, self.provider.instance_id
-                )
-                for track_data in top_tracks_data
+                await self._get_or_resolve_track(track_data) for track_data in top_tracks_data
             ]
             if track is not None
         ]

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import TYPE_CHECKING
 
 from aiohttp import ClientError
@@ -52,6 +51,15 @@ async def get_config_entries(
             required=True,
             description="Get your API key from https://www.last.fm/api/account/create",
             value=values.get("api_key") if values else None,
+        ),
+        ConfigEntry(
+            key="refresh_interval",
+            type=ConfigEntryType.INTEGER,
+            label="Refresh Interval (hours)",
+            default_value=6,
+            description="How often to refresh recommendations (0 to disable automatic refresh)",
+            category="recommendations",
+            range=(0, 168),  # 0 to 1 week
         ),
         ConfigEntry(
             key="enable_similar_artists",
@@ -118,8 +126,8 @@ class LastFMRecommendationsProvider(MusicProvider):
         # Start background task to populate recommendations immediately
         self.mass.create_task(self._populate_recommendations())
 
-        # Schedule periodic refresh (every 6 hours)
-        self.mass.create_task(self._schedule_refresh())
+        # Schedule periodic refresh using MA's scheduler
+        self._schedule_refresh()
 
     async def _populate_recommendations(self) -> None:
         """Populate recommendation folders in the background.
@@ -138,20 +146,46 @@ class LastFMRecommendationsProvider(MusicProvider):
         except Exception as err:
             self.logger.warning("Failed to populate recommendations: %s", err)
 
-    async def _schedule_refresh(self) -> None:
-        """Schedule periodic refresh of recommendations.
+    def _schedule_refresh(self) -> None:
+        """Schedule periodic refresh of recommendations using MA's scheduler.
 
-        Refreshes recommendations every 6 hours to ensure data stays current
-        based on user's evolving listening history.
+        Uses the configured refresh interval (default: 6 hours). Set to 0 to disable.
         """
-        while True:
-            # Wait 6 hours before refreshing
-            await asyncio.sleep(6 * 3600)
-            try:
-                self.logger.info("Refreshing Last.fm recommendations (scheduled)")
-                await self._populate_recommendations()
-            except Exception as err:
-                self.logger.warning("Failed to refresh recommendations: %s", err)
+        refresh_interval_value = self.config.get_value("refresh_interval")
+        if isinstance(refresh_interval_value, (int, float)):
+            refresh_interval_hours = int(refresh_interval_value)
+        else:
+            refresh_interval_hours = 6  # Default
+        if refresh_interval_hours <= 0:
+            self.logger.info("Automatic refresh disabled (interval set to 0)")
+            return
+
+        # Convert hours to seconds
+        refresh_interval_seconds = float(refresh_interval_hours * 3600)
+
+        # Schedule next refresh using MA's call_later
+        self.mass.call_later(
+            refresh_interval_seconds,
+            self._refresh_recommendations,
+            task_id=f"lastfm_recommendations_refresh_{self.instance_id}",
+        )
+        self.logger.info(
+            "Scheduled next recommendations refresh in %d hours", refresh_interval_hours
+        )
+
+    async def _refresh_recommendations(self) -> None:
+        """Refresh recommendations (called by scheduler).
+
+        Re-populates recommendations and reschedules next refresh.
+        """
+        try:
+            self.logger.info("Refreshing Last.fm recommendations (scheduled)")
+            await self._populate_recommendations()
+        except Exception as err:
+            self.logger.warning("Failed to refresh recommendations: %s", err)
+        finally:
+            # Reschedule next refresh
+            self._schedule_refresh()
 
     async def recommendations(self) -> list[RecommendationFolder]:
         """Get this provider's recommendations organized into folders.
