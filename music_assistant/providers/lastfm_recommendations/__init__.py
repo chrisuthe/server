@@ -4,16 +4,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from aiohttp import ClientError
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueType
 from music_assistant_models.enums import ConfigEntryType, ProviderFeature
-from music_assistant_models.errors import InvalidDataError, SetupFailedError
 from music_assistant_models.media_items import RecommendationFolder  # noqa: TC002
 
 from music_assistant.models.music_provider import MusicProvider
-from music_assistant.providers.lastfmrecommendations.api_client import LastFMAPIClient
-from music_assistant.providers.lastfmrecommendations.mbid_resolver import MBIDResolver
-from music_assistant.providers.lastfmrecommendations.recommendations import (
+from music_assistant.providers.lastfm_recommendations.api_client import LastFMAPIClient
+from music_assistant.providers.lastfm_recommendations.mbid_resolver import MBIDResolver
+from music_assistant.providers.lastfm_recommendations.recommendations import (
     LastFMRecommendationManager,
 )
 
@@ -90,17 +88,17 @@ async def get_config_entries(
         ConfigEntry(
             key="enable_top_artists",
             type=ConfigEntryType.BOOLEAN,
-            label="Enable Last.fm Top Artists (Global)",
+            label="Enable Global Top Artists",
             default_value=False,
-            description="Show Last.fm's worldwide top artists chart",
+            description="Show worldwide top artists chart from Last.fm",
             category="recommendations",
         ),
         ConfigEntry(
             key="enable_top_tracks",
             type=ConfigEntryType.BOOLEAN,
-            label="Enable Last.fm Top Tracks (Global)",
+            label="Enable Global Top Tracks",
             default_value=False,
-            description="Show Last.fm's worldwide top tracks chart",
+            description="Show worldwide top tracks chart from Last.fm",
             category="recommendations",
         ),
         ConfigEntry(
@@ -138,15 +136,8 @@ class LastFMRecommendationsProvider(MusicProvider):
         self._recommendation_folders: list[RecommendationFolder] = []
         self._recommendations_populated = False
 
-        # Test API key by making a simple request
-        try:
-            await self.api.get_chart_top_artists(limit=1)
-            self.logger.info("Last.fm API key validated successfully")
-        except (TimeoutError, ClientError, InvalidDataError, KeyError) as err:
-            msg = f"Failed to validate Last.fm API key: {type(err).__name__}"
-            raise SetupFailedError(msg) from err
-
         # Start background task to populate recommendations immediately
+        # API key validation happens during first populate attempt
         self.mass.create_task(self._populate_recommendations())
 
         # Schedule periodic refresh using MA's scheduler
@@ -221,8 +212,8 @@ class LastFMRecommendationsProvider(MusicProvider):
         Returns up to 4 recommendation folders:
         1. Discover Similar Artists (personalized, based on your listening)
         2. Discover Similar Tracks (personalized, based on your listening)
-        3. Last.fm Top Artists (global chart)
-        4. Last.fm Top Tracks (global chart)
+        3. Global Top Artists (worldwide chart from Last.fm)
+        4. Global Top Tracks (worldwide chart from Last.fm)
 
         Personalized folders only appear if the user has listening history.
         If the library is empty, only global charts will be shown.

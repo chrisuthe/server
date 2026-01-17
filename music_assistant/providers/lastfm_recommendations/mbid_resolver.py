@@ -8,7 +8,7 @@ from aiohttp import ClientError
 from music_assistant_models.errors import InvalidDataError, ProviderUnavailableError
 
 if TYPE_CHECKING:
-    from music_assistant.providers.lastfmrecommendations import LastFMRecommendationsProvider
+    from music_assistant.providers.lastfm_recommendations import LastFMRecommendationsProvider
     from music_assistant.providers.musicbrainz import MusicbrainzProvider
 
 

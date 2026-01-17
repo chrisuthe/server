@@ -17,9 +17,9 @@ if TYPE_CHECKING:
     from music_assistant import MusicAssistant
     from music_assistant.controllers.media.artists import ArtistsController
     from music_assistant.controllers.media.tracks import TracksController
-    from music_assistant.providers.lastfmrecommendations.mbid_resolver import MBIDResolver
+    from music_assistant.providers.lastfm_recommendations.mbid_resolver import MBIDResolver
 
-LOGGER = logging.getLogger(f"{MASS_LOGGER_NAME}.lastfmrecommendations")
+LOGGER = logging.getLogger(f"{MASS_LOGGER_NAME}.lastfm_recommendations")
 
 
 def _extract_image_url(image_array: list[dict[str, Any]]) -> str | None:
@@ -195,7 +195,7 @@ async def parse_artist(
     item_mapping = ItemMapping(
         media_type=MediaType.ARTIST,
         item_id="temp",  # Temporary ID, not used
-        provider="lastfmrecommendations",  # Temporary provider
+        provider="lastfm_recommendations",  # Temporary provider
         name=name,
         external_ids=external_ids,
         image=image,
@@ -260,7 +260,7 @@ async def parse_track(
     item_mapping = ItemMapping(
         media_type=MediaType.TRACK,
         item_id="temp",  # Temporary ID, not used
-        provider="lastfmrecommendations",  # Temporary provider
+        provider="lastfm_recommendations",  # Temporary provider
         name=f"{artist_name} - {name}",  # Include artist in name for display
         external_ids=external_ids,
         image=image,

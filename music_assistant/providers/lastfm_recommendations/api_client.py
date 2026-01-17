@@ -12,7 +12,7 @@ from music_assistant.helpers.throttle_retry import ThrottlerManager
 if TYPE_CHECKING:
     from aiohttp import ClientSession
 
-    from music_assistant.providers.lastfmrecommendations import LastFMRecommendationsProvider
+    from music_assistant.providers.lastfm_recommendations import LastFMRecommendationsProvider
 
 
 class LastFMAPIClient:

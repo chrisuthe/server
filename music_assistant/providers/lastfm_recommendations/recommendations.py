@@ -12,10 +12,10 @@ from music_assistant_models.media_items import (
     UniqueList,
 )
 
-from music_assistant.providers.lastfmrecommendations.parsers import parse_artist, parse_track
+from music_assistant.providers.lastfm_recommendations.parsers import parse_artist, parse_track
 
 if TYPE_CHECKING:
-    from music_assistant.providers.lastfmrecommendations import LastFMRecommendationsProvider
+    from music_assistant.providers.lastfm_recommendations import LastFMRecommendationsProvider
 
 # Cache category for resolved Artist/Track objects
 CACHE_CATEGORY_RESOLVED_ITEMS = 1
@@ -165,8 +165,8 @@ class LastFMRecommendationManager:
         Generates up to 4 recommendation folders:
         - Discover Similar Artists (personalized)
         - Discover Similar Tracks (personalized)
-        - Last.fm Top Artists (global)
-        - Last.fm Top Tracks (global)
+        - Global Top Artists
+        - Global Top Tracks
 
         Personalized folders only appear if user has listening history.
 
@@ -280,7 +280,7 @@ class LastFMRecommendationManager:
                     folders.append(
                         RecommendationFolder(
                             item_id=f"{self.provider.instance_id}_chart_top_artists",
-                            name="Last.fm Top Artists",
+                            name="Global Top Artists",
                             provider=self.provider.instance_id,
                             items=UniqueList(top_artists),
                             subtitle="Most popular artists worldwide",
@@ -306,7 +306,7 @@ class LastFMRecommendationManager:
                     folders.append(
                         RecommendationFolder(
                             item_id=f"{self.provider.instance_id}_chart_top_tracks",
-                            name="Last.fm Top Tracks",
+                            name="Global Top Tracks",
                             provider=self.provider.instance_id,
                             items=UniqueList(top_tracks),
                             subtitle="Most popular tracks worldwide",
