@@ -84,45 +84,51 @@ class LastFMRecommendationManager:
         # - Weighted combination: play recent items more heavily
         # Need user feedback to determine best approach.
 
-        # Get top 5 most played artists from library
-        top_artists = await self.mass.music.artists.library_items(
-            limit=5, order_by="play_count_desc"
-        )
+        # Similar Artists (only if enabled)
+        if self.provider.config.get_value("enable_similar_artists"):
+            # Get top 5 most played artists from library
+            top_artists = await self.mass.music.artists.library_items(
+                limit=5, order_by="play_count_desc"
+            )
 
-        if top_artists:
-            # Get similar artists based on user's favorites
-            similar_artists = await self._get_similar_artists_from_seeds(top_artists)
+            if top_artists:
+                # Get similar artists based on user's favorites
+                similar_artists = await self._get_similar_artists_from_seeds(top_artists)
 
-            if similar_artists:
-                folders.append(
-                    RecommendationFolder(
-                        item_id=f"{self.provider.instance_id}_similar_artists",
-                        name="Discover Similar Artists",
-                        provider=self.provider.instance_id,
-                        items=UniqueList(similar_artists[:10]),
-                        subtitle=f"Based on your top {len(top_artists)} artists",
-                        icon="mdi-account-music-outline",
+                if similar_artists:
+                    folders.append(
+                        RecommendationFolder(
+                            item_id=f"{self.provider.instance_id}_similar_artists",
+                            name="Discover Similar Artists",
+                            provider=self.provider.instance_id,
+                            items=UniqueList(similar_artists[:10]),
+                            subtitle=f"Based on your top {len(top_artists)} artists",
+                            icon="mdi-account-music-outline",
+                        )
                     )
-                )
 
-        # Get top 5 most played tracks from library
-        top_tracks = await self.mass.music.tracks.library_items(limit=5, order_by="play_count_desc")
+        # Similar Tracks (only if enabled)
+        if self.provider.config.get_value("enable_similar_tracks"):
+            # Get top 5 most played tracks from library
+            top_tracks = await self.mass.music.tracks.library_items(
+                limit=5, order_by="play_count_desc"
+            )
 
-        if top_tracks:
-            # Get similar tracks based on user's favorites
-            similar_tracks = await self._get_similar_tracks_from_seeds(top_tracks)
+            if top_tracks:
+                # Get similar tracks based on user's favorites
+                similar_tracks = await self._get_similar_tracks_from_seeds(top_tracks)
 
-            if similar_tracks:
-                folders.append(
-                    RecommendationFolder(
-                        item_id=f"{self.provider.instance_id}_similar_tracks",
-                        name="Discover Similar Tracks",
-                        provider=self.provider.instance_id,
-                        items=UniqueList(similar_tracks[:10]),
-                        subtitle=f"Based on your top {len(top_tracks)} tracks",
-                        icon="mdi-music-note-outline",
+                if similar_tracks:
+                    folders.append(
+                        RecommendationFolder(
+                            item_id=f"{self.provider.instance_id}_similar_tracks",
+                            name="Discover Similar Tracks",
+                            provider=self.provider.instance_id,
+                            items=UniqueList(similar_tracks[:10]),
+                            subtitle=f"Based on your top {len(top_tracks)} tracks",
+                            icon="mdi-music-note-outline",
+                        )
                     )
-                )
 
         return folders
 
@@ -136,57 +142,59 @@ class LastFMRecommendationManager:
         """
         folders: list[RecommendationFolder] = []
 
-        # Global top artists
-        top_artists_raw = await self.api.get_chart_top_artists(limit=10)
-        if top_artists_raw:
-            # Parse and resolve artists (filter out None for unresolved items)
-            top_artists = [
-                artist
-                for artist in [
-                    await parse_artist(artist_data, self.mass, self.provider.instance_id)
-                    for artist_data in top_artists_raw
+        # Global Top Artists (only if enabled)
+        if self.provider.config.get_value("enable_top_artists"):
+            top_artists_raw = await self.api.get_chart_top_artists(limit=10)
+            if top_artists_raw:
+                # Parse and resolve artists (filter out None for unresolved items)
+                top_artists = [
+                    artist
+                    for artist in [
+                        await parse_artist(artist_data, self.mass, self.provider.instance_id)
+                        for artist_data in top_artists_raw
+                    ]
+                    if artist is not None
                 ]
-                if artist is not None
-            ]
 
-            if top_artists:
-                folders.append(
-                    RecommendationFolder(
-                        item_id=f"{self.provider.instance_id}_chart_top_artists",
-                        name="Last.fm Top Artists",
-                        provider=self.provider.instance_id,
-                        items=UniqueList(top_artists),
-                        subtitle="Most popular artists worldwide",
-                        icon="mdi-chart-line",
+                if top_artists:
+                    folders.append(
+                        RecommendationFolder(
+                            item_id=f"{self.provider.instance_id}_chart_top_artists",
+                            name="Last.fm Top Artists",
+                            provider=self.provider.instance_id,
+                            items=UniqueList(top_artists),
+                            subtitle="Most popular artists worldwide",
+                            icon="mdi-chart-line",
+                        )
                     )
-                )
 
-        # Global top tracks
-        top_tracks_raw = await self.api.get_chart_top_tracks(limit=10)
-        if top_tracks_raw:
-            # Parse and resolve tracks (filter out None for unresolved items)
-            top_tracks = [
-                track
-                for track in [
-                    await parse_track(
-                        track_data, self.mbid_resolver, self.mass, self.provider.instance_id
-                    )
-                    for track_data in top_tracks_raw
+        # Global Top Tracks (only if enabled)
+        if self.provider.config.get_value("enable_top_tracks"):
+            top_tracks_raw = await self.api.get_chart_top_tracks(limit=10)
+            if top_tracks_raw:
+                # Parse and resolve tracks (filter out None for unresolved items)
+                top_tracks = [
+                    track
+                    for track in [
+                        await parse_track(
+                            track_data, self.mbid_resolver, self.mass, self.provider.instance_id
+                        )
+                        for track_data in top_tracks_raw
+                    ]
+                    if track is not None
                 ]
-                if track is not None
-            ]
 
-            if top_tracks:
-                folders.append(
-                    RecommendationFolder(
-                        item_id=f"{self.provider.instance_id}_chart_top_tracks",
-                        name="Last.fm Top Tracks",
-                        provider=self.provider.instance_id,
-                        items=UniqueList(top_tracks),
-                        subtitle="Most popular tracks worldwide",
-                        icon="mdi-chart-box",
+                if top_tracks:
+                    folders.append(
+                        RecommendationFolder(
+                            item_id=f"{self.provider.instance_id}_chart_top_tracks",
+                            name="Last.fm Top Tracks",
+                            provider=self.provider.instance_id,
+                            items=UniqueList(top_tracks),
+                            subtitle="Most popular tracks worldwide",
+                            icon="mdi-chart-box",
+                        )
                     )
-                )
 
         return folders
 

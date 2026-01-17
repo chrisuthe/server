@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
 from aiohttp import ClientError
@@ -52,6 +53,38 @@ async def get_config_entries(
             description="Get your API key from https://www.last.fm/api/account/create",
             value=values.get("api_key") if values else None,
         ),
+        ConfigEntry(
+            key="enable_similar_artists",
+            type=ConfigEntryType.BOOLEAN,
+            label="Enable Similar Artists (Personalized)",
+            default_value=False,
+            description="Show similar artists based on your listening history",
+            category="recommendations",
+        ),
+        ConfigEntry(
+            key="enable_similar_tracks",
+            type=ConfigEntryType.BOOLEAN,
+            label="Enable Similar Tracks (Personalized)",
+            default_value=False,
+            description="Show similar tracks based on your listening history",
+            category="recommendations",
+        ),
+        ConfigEntry(
+            key="enable_top_artists",
+            type=ConfigEntryType.BOOLEAN,
+            label="Enable Last.fm Top Artists (Global)",
+            default_value=False,
+            description="Show Last.fm's worldwide top artists chart",
+            category="recommendations",
+        ),
+        ConfigEntry(
+            key="enable_top_tracks",
+            type=ConfigEntryType.BOOLEAN,
+            label="Enable Last.fm Top Tracks (Global)",
+            default_value=False,
+            description="Show Last.fm's worldwide top tracks chart",
+            category="recommendations",
+        ),
     )
 
 
@@ -85,6 +118,9 @@ class LastFMRecommendationsProvider(MusicProvider):
         # Start background task to populate recommendations immediately
         self.mass.create_task(self._populate_recommendations())
 
+        # Schedule periodic refresh (every 6 hours)
+        self.mass.create_task(self._schedule_refresh())
+
     async def _populate_recommendations(self) -> None:
         """Populate recommendation folders in the background.
 
@@ -101,6 +137,21 @@ class LastFMRecommendationsProvider(MusicProvider):
             self.logger.info("Recommendations populated with %d folders", len(folders))
         except Exception as err:
             self.logger.warning("Failed to populate recommendations: %s", err)
+
+    async def _schedule_refresh(self) -> None:
+        """Schedule periodic refresh of recommendations.
+
+        Refreshes recommendations every 6 hours to ensure data stays current
+        based on user's evolving listening history.
+        """
+        while True:
+            # Wait 6 hours before refreshing
+            await asyncio.sleep(6 * 3600)
+            try:
+                self.logger.info("Refreshing Last.fm recommendations (scheduled)")
+                await self._populate_recommendations()
+            except Exception as err:
+                self.logger.warning("Failed to refresh recommendations: %s", err)
 
     async def recommendations(self) -> list[RecommendationFolder]:
         """Get this provider's recommendations organized into folders.
