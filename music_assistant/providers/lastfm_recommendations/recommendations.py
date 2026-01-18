@@ -519,11 +519,8 @@ class LastFMRecommendationManager:
             # Extract MBID if available using get_external_id helper
             mbid = seed_artist.get_external_id(ExternalID.MB_ARTIST)
 
-            # Use sort_name (normalized) if available, fallback to name
-            artist_name = seed_artist.sort_name or seed_artist.name
-
             similar = await self.api.get_similar_artists(
-                artist_name=artist_name, artist_mbid=mbid, limit=3
+                artist_name=seed_artist.name, artist_mbid=mbid, limit=3
             )
             all_similar.extend(similar)
 
@@ -568,19 +565,12 @@ class LastFMRecommendationManager:
             # Extract MBID if available using get_external_id helper
             mbid = seed_track.get_external_id(ExternalID.MB_RECORDING)
 
-            # Get artist name (first artist) - use sort_name if available
-            if seed_track.artists:
-                first_artist = seed_track.artists[0]
-                artist_name = first_artist.sort_name or first_artist.name
-            else:
-                artist_name = "Unknown Artist"
-
-            # Use track's sort_name if available, fallback to name
-            track_name = seed_track.sort_name or seed_track.name
+            # Get artist name (first artist)
+            artist_name = seed_track.artists[0].name if seed_track.artists else "Unknown Artist"
 
             similar = await self.api.get_similar_tracks(
                 artist_name=artist_name,
-                track_name=track_name,
+                track_name=seed_track.name,
                 track_mbid=mbid,
                 limit=3,
             )
