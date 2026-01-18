@@ -6,13 +6,18 @@ from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.enums import ExternalID
 from music_assistant_models.media_items import (
+    Album,
     Artist,
     RecommendationFolder,
     Track,
     UniqueList,
 )
 
-from music_assistant.providers.lastfm_recommendations.parsers import parse_artist, parse_track
+from music_assistant.providers.lastfm_recommendations.parsers import (
+    parse_album,
+    parse_artist,
+    parse_track,
+)
 
 if TYPE_CHECKING:
     from music_assistant.providers.lastfm_recommendations import LastFMRecommendationsProvider
@@ -43,7 +48,7 @@ class LastFMRecommendationManager:
         self.mass = provider.mass
 
         # Cache resolved items by their unique key (MBID or name) to avoid re-resolving
-        self._resolved_cache: dict[str, Artist | Track] = {}
+        self._resolved_cache: dict[str, Artist | Album | Track] = {}
 
     async def clear_cache(self) -> None:
         """Clear both in-memory and persistent caches.
@@ -159,16 +164,73 @@ class LastFMRecommendationManager:
             )
         return track
 
+    async def _get_or_resolve_album(self, lastfm_album: dict[str, Any]) -> Album | None:
+        """Get album from cache or resolve it.
+
+        Uses a two-tier caching strategy:
+        1. In-memory cache (fast, cleared on restart)
+        2. Persistent cache (survives restarts, 90-day expiry)
+
+        :param lastfm_album: Raw Last.fm album dict.
+        :return: Resolved Album or None if not found.
+        """
+        # Create cache key (prefer MBID, fallback to artist+album name)
+        cache_key = lastfm_album.get("mbid")
+        if not cache_key:
+            artist_data = lastfm_album.get("artist", {})
+            artist_name = (
+                artist_data if isinstance(artist_data, str) else artist_data.get("name", "")
+            )
+            album_name = lastfm_album.get("name", "")
+            cache_key = f"{artist_name}_{album_name}" if artist_name and album_name else ""
+
+        if not cache_key:
+            return None
+
+        # Check in-memory cache first (fastest)
+        if cache_key in self._resolved_cache:
+            cached = self._resolved_cache[cache_key]
+            if isinstance(cached, Album):
+                return cached
+
+        # Check persistent cache (survives restarts)
+        persistent_cache_key = f"album_{cache_key}"
+        cached_album = await self.mass.cache.get(
+            key=persistent_cache_key, category=CACHE_CATEGORY_RESOLVED_ITEMS
+        )
+        if cached_album is not None and isinstance(cached_album, Album):
+            # Store in memory cache for faster subsequent access
+            album_obj = cast("Album", cached_album)
+            self._resolved_cache[cache_key] = album_obj
+            return album_obj
+
+        # Not in any cache - resolve it
+        album = await parse_album(lastfm_album, self.mass, self.provider.instance_id)
+        if album:
+            # Store in both caches
+            self._resolved_cache[cache_key] = album
+            await self.mass.cache.set(
+                persistent_cache_key,
+                album,
+                category=CACHE_CATEGORY_RESOLVED_ITEMS,
+                expiration=60 * 60 * 24 * 90,  # 90 days
+            )
+        return album
+
     async def get_recommendations(self) -> list[RecommendationFolder]:
         """Get this provider's recommendations organized into folders.
 
-        Generates up to 4 recommendation folders:
+        Generates up to 7 recommendation folders:
         - Discover Similar Artists (personalized)
         - Discover Similar Tracks (personalized)
         - Global Top Artists
         - Global Top Tracks
+        - Discover <Genre> Artists (based on user's top tag)
+        - Discover <Genre> Albums (based on user's top tag)
+        - Discover <Genre> Tracks (based on user's top tag)
 
         Personalized folders only appear if user has listening history.
+        Genre folders only appear if username is configured.
 
         :return: List of recommendation folders (may be empty if no data available).
 
@@ -183,6 +245,9 @@ class LastFMRecommendationManager:
 
         # Get global discovery recommendations
         folders.extend(await self._get_global_recommendations())
+
+        # Get genre-based recommendations (requires username)
+        folders.extend(await self._get_genre_based_recommendations())
 
         return folders
 
@@ -311,6 +376,110 @@ class LastFMRecommendationManager:
                             items=UniqueList(top_tracks),
                             subtitle="Most popular tracks worldwide",
                             icon="mdi-chart-box",
+                        )
+                    )
+
+        return folders
+
+    async def _get_genre_based_recommendations(self) -> list[RecommendationFolder]:
+        """Get genre-based recommendations using user's top tag.
+
+        Fetches the user's most played genre/tag from Last.fm and uses it to fetch
+        top albums, artists, and tracks for that genre.
+        Returns up to 3 folders (genre albums, artists, tracks).
+
+        Requires username to be configured.
+
+        :return: List of genre-based recommendation folders (empty if no username or API fails).
+        """
+        folders: list[RecommendationFolder] = []
+
+        # Check if username is configured
+        username = self.provider.config.get_value("username")
+        if not username or not isinstance(username, str):
+            return folders
+
+        # Get user's top tag (most played genre)
+        top_tags = await self.api.get_user_top_tags(username, limit=1)
+        if not top_tags:
+            return folders
+
+        tag_name = top_tags[0].get("name")
+        if not tag_name:
+            return folders
+
+        # Genre Artists (only if enabled)
+        if self.provider.config.get_value("enable_genre_artists"):
+            genre_artists_raw = await self.api.get_tag_top_artists(tag_name, limit=10)
+            if genre_artists_raw:
+                genre_artists = [
+                    artist
+                    for artist in [
+                        await self._get_or_resolve_artist(artist_data)
+                        for artist_data in genre_artists_raw
+                    ]
+                    if artist is not None
+                ]
+
+                if genre_artists:
+                    folders.append(
+                        RecommendationFolder(
+                            item_id=f"{self.provider.instance_id}_genre_artists",
+                            name=f"Discover {tag_name.title()} Artists",
+                            provider=self.provider.instance_id,
+                            items=UniqueList(genre_artists),
+                            subtitle="Top artists in your most played genre",
+                            icon="mdi-account-music",
+                        )
+                    )
+
+        # Genre Albums (only if enabled)
+        if self.provider.config.get_value("enable_genre_albums"):
+            genre_albums_raw = await self.api.get_tag_top_albums(tag_name, limit=10)
+            if genre_albums_raw:
+                genre_albums = [
+                    album
+                    for album in [
+                        await self._get_or_resolve_album(album_data)
+                        for album_data in genre_albums_raw
+                    ]
+                    if album is not None
+                ]
+
+                if genre_albums:
+                    folders.append(
+                        RecommendationFolder(
+                            item_id=f"{self.provider.instance_id}_genre_albums",
+                            name=f"Discover {tag_name.title()} Albums",
+                            provider=self.provider.instance_id,
+                            items=UniqueList(genre_albums),
+                            subtitle="Top albums in your most played genre",
+                            icon="mdi-album",
+                        )
+                    )
+
+        # Genre Tracks (only if enabled)
+        if self.provider.config.get_value("enable_genre_tracks"):
+            genre_tracks_raw = await self.api.get_tag_top_tracks(tag_name, limit=10)
+            if genre_tracks_raw:
+                genre_tracks = [
+                    track
+                    for track in [
+                        await self._get_or_resolve_track(track_data)
+                        for track_data in genre_tracks_raw
+                    ]
+                    if track is not None
+                ]
+
+                if genre_tracks:
+                    folders.append(
+                        RecommendationFolder(
+                            item_id=f"{self.provider.instance_id}_genre_tracks",
+                            name=f"Discover {tag_name.title()} Tracks",
+                            provider=self.provider.instance_id,
+                            items=UniqueList(genre_tracks),
+                            subtitle="Top tracks in your most played genre",
+                            icon="mdi-music",
                         )
                     )
 

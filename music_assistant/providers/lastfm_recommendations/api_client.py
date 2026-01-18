@@ -197,3 +197,85 @@ class LastFMAPIClient:
         except (TimeoutError, ClientError, InvalidDataError, KeyError):
             # Error already logged in _get_data with full details
             return []
+
+    async def get_user_top_tags(self, username: str, limit: int = 1) -> list[dict[str, Any]]:
+        """Get a user's top tags from Last.fm.
+
+        :param username: Last.fm username.
+        :param limit: Maximum number of tags to return (default 1 for top genre).
+        """
+        try:
+            data = await self._get_data("user.getTopTags", user=username, limit=limit)
+            tags: list[dict[str, Any]] | dict[str, Any] = data.get("toptags", {}).get("tag", [])
+
+            # Normalize response
+            if isinstance(tags, dict):
+                return [tags]
+
+            return tags
+
+        except (TimeoutError, ClientError, InvalidDataError, KeyError):
+            # Error already logged in _get_data with full details
+            return []
+
+    async def get_tag_top_artists(self, tag: str, limit: int = 10) -> list[dict[str, Any]]:
+        """Get top artists for a tag from Last.fm.
+
+        :param tag: Tag name (genre).
+        :param limit: Maximum number of artists to return.
+        """
+        try:
+            data = await self._get_data("tag.getTopArtists", tag=tag, limit=limit)
+            artists: list[dict[str, Any]] | dict[str, Any] = data.get("topartists", {}).get(
+                "artist", []
+            )
+
+            # Normalize response
+            if isinstance(artists, dict):
+                return [artists]
+
+            return artists
+
+        except (TimeoutError, ClientError, InvalidDataError, KeyError):
+            # Error already logged in _get_data with full details
+            return []
+
+    async def get_tag_top_albums(self, tag: str, limit: int = 10) -> list[dict[str, Any]]:
+        """Get top albums for a tag from Last.fm.
+
+        :param tag: Tag name (genre).
+        :param limit: Maximum number of albums to return.
+        """
+        try:
+            data = await self._get_data("tag.getTopAlbums", tag=tag, limit=limit)
+            albums: list[dict[str, Any]] | dict[str, Any] = data.get("albums", {}).get("album", [])
+
+            # Normalize response
+            if isinstance(albums, dict):
+                return [albums]
+
+            return albums
+
+        except (TimeoutError, ClientError, InvalidDataError, KeyError):
+            # Error already logged in _get_data with full details
+            return []
+
+    async def get_tag_top_tracks(self, tag: str, limit: int = 10) -> list[dict[str, Any]]:
+        """Get top tracks for a tag from Last.fm.
+
+        :param tag: Tag name (genre).
+        :param limit: Maximum number of tracks to return.
+        """
+        try:
+            data = await self._get_data("tag.getTopTracks", tag=tag, limit=limit)
+            tracks: list[dict[str, Any]] | dict[str, Any] = data.get("tracks", {}).get("track", [])
+
+            # Normalize response
+            if isinstance(tracks, dict):
+                return [tracks]
+
+            return tracks
+
+        except (TimeoutError, ClientError, InvalidDataError, KeyError):
+            # Error already logged in _get_data with full details
+            return []

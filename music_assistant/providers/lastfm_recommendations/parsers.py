@@ -8,12 +8,13 @@ from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.enums import ExternalID, ImageType, MediaType
 from music_assistant_models.errors import MusicAssistantError
-from music_assistant_models.media_items import Artist, ItemMapping, MediaItemImage, Track
+from music_assistant_models.media_items import Album, Artist, ItemMapping, MediaItemImage, Track
 
 from music_assistant.constants import MASS_LOGGER_NAME
 
 if TYPE_CHECKING:
     from music_assistant import MusicAssistant
+    from music_assistant.controllers.media.albums import AlbumsController
     from music_assistant.controllers.media.artists import ArtistsController
     from music_assistant.controllers.media.tracks import TracksController
     from music_assistant.providers.lastfm_recommendations.mbid_resolver import MBIDResolver
@@ -21,7 +22,9 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger(f"{MASS_LOGGER_NAME}.lastfm_recommendations")
 
 
-def _has_matching_external_ids(item_mapping: ItemMapping, media_item: Artist | Track) -> bool:
+def _has_matching_external_ids(
+    item_mapping: ItemMapping, media_item: Artist | Album | Track
+) -> bool:
     """Check if an ItemMapping has any matching external IDs with a media item.
 
     :param item_mapping: ItemMapping with external IDs from Last.fm.
@@ -63,11 +66,11 @@ def _extract_image_url(image_array: list[dict[str, Any]]) -> str | None:
 
 
 async def _search_provider(
-    ctrl: ArtistsController | TracksController,
+    ctrl: ArtistsController | AlbumsController | TracksController,
     item_mapping: ItemMapping,
     provider: Any,
     strict_match: bool,
-) -> Artist | Track | None:
+) -> Artist | Album | Track | None:
     """Search a single provider for a matching item.
 
     :param ctrl: Controller for the media type.
@@ -101,7 +104,7 @@ async def _search_provider(
 
 async def _resolve_item(
     item_mapping: ItemMapping, mass: MusicAssistant, provider_instance_to_skip: str
-) -> Artist | Track | None:
+) -> Artist | Album | Track | None:
     """Resolve an ItemMapping to an actual library or provider item.
 
     Searches all providers concurrently and returns the first match found.
@@ -110,12 +113,14 @@ async def _resolve_item(
     :param item_mapping: ItemMapping with metadata and external IDs from Last.fm.
     :param mass: MusicAssistant instance.
     :param provider_instance_to_skip: Provider instance to skip (ourselves).
-    :return: Resolved Artist/Track or None if not found.
+    :return: Resolved Artist/Album/Track or None if not found.
     """
     # Get the appropriate controller
-    ctrl: ArtistsController | TracksController
+    ctrl: ArtistsController | AlbumsController | TracksController
     if item_mapping.media_type == MediaType.ARTIST:
         ctrl = mass.music.artists
+    elif item_mapping.media_type == MediaType.ALBUM:
+        ctrl = mass.music.albums
     elif item_mapping.media_type == MediaType.TRACK:
         ctrl = mass.music.tracks
     else:
@@ -282,3 +287,56 @@ async def parse_track(
 
     # Resolve to actual Track object
     return cast("Track | None", await _resolve_item(item_mapping, mass, provider_instance))
+
+
+async def parse_album(
+    lastfm_album: dict[str, Any], mass: MusicAssistant, provider_instance: str
+) -> Album | None:
+    """Parse Last.fm album and resolve to a full Album object.
+
+    Resolves the Last.fm album to an actual provider item using external IDs and name matching.
+
+    :param lastfm_album: Raw Last.fm album dict with 'name', 'artist', 'mbid'.
+    :param mass: MusicAssistant instance for accessing library and providers.
+    :param provider_instance: Provider instance ID to skip when searching.
+    :return: Resolved Album object or None if not found.
+    """
+    LOGGER.debug("Last.fm album data: %s", lastfm_album)
+
+    name = lastfm_album.get("name", "Unknown Album")
+    mbid = lastfm_album.get("mbid")
+
+    # Parse artist info
+    artist_data = lastfm_album.get("artist", {})
+    if isinstance(artist_data, str):
+        # Sometimes artist is just a string
+        artist_name = artist_data
+    else:
+        artist_name = artist_data.get("name", "Unknown Artist")
+
+    # Build external IDs
+    external_ids = set()
+    if mbid:
+        external_ids.add((ExternalID.MB_ALBUM, mbid))
+
+    # Extract image
+    image = None
+    if image_url := _extract_image_url(lastfm_album.get("image", [])):
+        image = MediaItemImage(
+            type=ImageType.THUMB,
+            path=image_url,
+            provider="lastfm",
+        )
+
+    # Create temporary ItemMapping for matching
+    item_mapping = ItemMapping(
+        media_type=MediaType.ALBUM,
+        item_id="temp",  # Temporary ID, not used
+        provider="lastfm_recommendations",  # Temporary provider
+        name=f"{artist_name} - {name}",  # Include artist in name for display
+        external_ids=external_ids,
+        image=image,
+    )
+
+    # Resolve to actual Album object
+    return cast("Album | None", await _resolve_item(item_mapping, mass, provider_instance))
