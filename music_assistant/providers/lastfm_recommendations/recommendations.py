@@ -220,7 +220,7 @@ class LastFMRecommendationManager:
     async def get_recommendations(self) -> list[RecommendationFolder]:
         """Get this provider's recommendations organized into folders.
 
-        Generates up to 7 recommendation folders:
+        Generates up to 9 recommendation folders:
         - Discover Similar Artists (personalized)
         - Discover Similar Tracks (personalized)
         - Global Top Artists
@@ -228,9 +228,12 @@ class LastFMRecommendationManager:
         - Discover <Genre> Artists (based on user's top tag)
         - Discover <Genre> Albums (based on user's top tag)
         - Discover <Genre> Tracks (based on user's top tag)
+        - Top Artists in <Country> (geography-based)
+        - Top Tracks in <Country> (geography-based)
 
         Personalized folders only appear if user has listening history.
         Genre folders only appear if username is configured.
+        Geography folders only appear if enabled in config.
 
         :return: List of recommendation folders (may be empty if no data available).
 
@@ -248,6 +251,9 @@ class LastFMRecommendationManager:
 
         # Get genre-based recommendations (requires username)
         folders.extend(await self._get_genre_based_recommendations())
+
+        # Get geography-based recommendations
+        folders.extend(await self._get_geo_based_recommendations())
 
         return folders
 
@@ -498,6 +504,88 @@ class LastFMRecommendationManager:
                             items=UniqueList(genre_tracks),
                             subtitle="Top tracks in your most played genre",
                             icon="mdi-music",
+                        )
+                    )
+
+        return folders
+
+    async def _get_geo_based_recommendations(self) -> list[RecommendationFolder]:
+        """Get geography-based recommendations using selected country.
+
+        Fetches top artists and tracks for the configured country from Last.fm.
+        Returns up to 2 folders (geo artists, geo tracks).
+
+        Requires country to be configured.
+
+        :return: List of geo-based recommendation folders.
+            Returns empty list if country not configured or API fails.
+        """
+        folders: list[RecommendationFolder] = []
+
+        # Get configured country
+        country = self.provider.config.get_value("geo_country")
+        if not country or not isinstance(country, str):
+            return folders
+
+        # Geo Top Artists (only if enabled)
+        if self.provider.config.get_value("enable_geo_artists"):
+            geo_artists_raw = await self.api.get_geo_top_artists(country, limit=50)
+            if geo_artists_raw:
+                # Resolve all artists
+                resolved_artists = [
+                    artist
+                    for artist in [
+                        await self._get_or_resolve_artist(artist_data)
+                        for artist_data in geo_artists_raw
+                    ]
+                    if artist is not None
+                ]
+
+                # Filter out items already in library
+                geo_artists = [
+                    artist for artist in resolved_artists if artist.provider != "library"
+                ][:10]  # Take first 10 after filtering
+
+                if geo_artists:
+                    folders.append(
+                        RecommendationFolder(
+                            item_id=f"{self.provider.instance_id}_geo_artists",
+                            name=f"Top Artists in {country}",
+                            provider=self.provider.instance_id,
+                            items=UniqueList(geo_artists),
+                            subtitle=f"Most popular artists in {country}",
+                            icon="mdi-earth",
+                        )
+                    )
+
+        # Geo Top Tracks (only if enabled)
+        if self.provider.config.get_value("enable_geo_tracks"):
+            geo_tracks_raw = await self.api.get_geo_top_tracks(country, limit=50)
+            if geo_tracks_raw:
+                # Resolve all tracks
+                resolved_tracks = [
+                    track
+                    for track in [
+                        await self._get_or_resolve_track(track_data)
+                        for track_data in geo_tracks_raw
+                    ]
+                    if track is not None
+                ]
+
+                # Filter out items already in library
+                geo_tracks = [track for track in resolved_tracks if track.provider != "library"][
+                    :10
+                ]  # Take first 10 after filtering
+
+                if geo_tracks:
+                    folders.append(
+                        RecommendationFolder(
+                            item_id=f"{self.provider.instance_id}_geo_tracks",
+                            name=f"Top Tracks in {country}",
+                            provider=self.provider.instance_id,
+                            items=UniqueList(geo_tracks),
+                            subtitle=f"Most popular tracks in {country}",
+                            icon="mdi-earth",
                         )
                     )
 

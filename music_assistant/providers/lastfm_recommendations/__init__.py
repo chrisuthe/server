@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from music_assistant_models.config_entries import ConfigEntry, ConfigValueType
+from music_assistant_models.config_entries import (
+    ConfigEntry,
+    ConfigValueOption,
+    ConfigValueType,
+)
 from music_assistant_models.enums import ConfigEntryType, ProviderFeature
 from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.media_items import RecommendationFolder  # noqa: TC002
@@ -29,6 +33,49 @@ SUPPORTED_FEATURES = {
 
 # Config action constants
 CONF_ACTION_CLEAR_CACHE = "clear_cache"
+
+# Curated list of popular countries for Last.fm geo charts
+# Last.fm API expects full country names (not ISO codes)
+# This list covers major music markets and can be expanded based on user requests
+GEO_COUNTRIES = [
+    "United States",
+    "United Kingdom",
+    "Germany",
+    "France",
+    "Spain",
+    "Italy",
+    "Netherlands",
+    "Belgium",
+    "Switzerland",
+    "Austria",
+    "Portugal",
+    "Ireland",
+    "Sweden",
+    "Norway",
+    "Denmark",
+    "Finland",
+    "Iceland",
+    "Poland",
+    "Czech Republic",
+    "Russia",
+    "Ukraine",
+    "Japan",
+    "Australia",
+    "New Zealand",
+    "South Korea",
+    "India",
+    "Singapore",
+    "Thailand",
+    "Philippines",
+    "Israel",
+    "Turkey",
+    "United Arab Emirates",
+    "South Africa",
+    "Canada",
+    "Mexico",
+    "Brazil",
+    "Argentina",
+]
 
 
 async def setup(
@@ -132,6 +179,31 @@ async def get_config_entries(
             label="Enable Genre Tracks",
             default_value=False,
             description="Show top tracks from your most played genre (requires username)",
+            category="recommendations",
+        ),
+        ConfigEntry(
+            key="geo_country",
+            type=ConfigEntryType.STRING,
+            label="Country for Geographic Charts",
+            default_value="United States",
+            description="Select country for geography-based top artists and tracks",
+            options=[ConfigValueOption(country, country) for country in GEO_COUNTRIES],
+            category="recommendations",
+        ),
+        ConfigEntry(
+            key="enable_geo_artists",
+            type=ConfigEntryType.BOOLEAN,
+            label="Enable Geographic Top Artists",
+            default_value=False,
+            description="Show top artists from selected country",
+            category="recommendations",
+        ),
+        ConfigEntry(
+            key="enable_geo_tracks",
+            type=ConfigEntryType.BOOLEAN,
+            label="Enable Geographic Top Tracks",
+            default_value=False,
+            description="Show top tracks from selected country",
             category="recommendations",
         ),
         ConfigEntry(

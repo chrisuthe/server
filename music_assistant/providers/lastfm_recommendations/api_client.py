@@ -296,3 +296,49 @@ class LastFMAPIClient:
         except (TimeoutError, ClientError, InvalidDataError, KeyError):
             # Error already logged in _get_data with full details
             return []
+
+    async def get_geo_top_artists(self, country: str, limit: int = 10) -> list[dict[str, Any]]:
+        """Get top artists for a country from Last.fm.
+
+        :param country: Country name (e.g., "United States", "Spain").
+        :param limit: Maximum number of artists to return.
+        """
+        try:
+            self.logger.debug(
+                "Fetching geo top artists for country: %s (limit: %d)", country, limit
+            )
+            data = await self._get_data("geo.getTopArtists", country=country, limit=limit)
+            artists: list[dict[str, Any]] | dict[str, Any] = data.get("topartists", {}).get(
+                "artist", []
+            )
+
+            # Normalize response
+            if isinstance(artists, dict):
+                return [artists]
+
+            return artists
+
+        except (TimeoutError, ClientError, InvalidDataError, KeyError):
+            # Error already logged in _get_data with full details
+            return []
+
+    async def get_geo_top_tracks(self, country: str, limit: int = 10) -> list[dict[str, Any]]:
+        """Get top tracks for a country from Last.fm.
+
+        :param country: Country name (e.g., "United States", "Spain").
+        :param limit: Maximum number of tracks to return.
+        """
+        try:
+            self.logger.debug("Fetching geo top tracks for country: %s (limit: %d)", country, limit)
+            data = await self._get_data("geo.getTopTracks", country=country, limit=limit)
+            tracks: list[dict[str, Any]] | dict[str, Any] = data.get("tracks", {}).get("track", [])
+
+            # Normalize response
+            if isinstance(tracks, dict):
+                return [tracks]
+
+            return tracks
+
+        except (TimeoutError, ClientError, InvalidDataError, KeyError):
+            # Error already logged in _get_data with full details
+            return []
