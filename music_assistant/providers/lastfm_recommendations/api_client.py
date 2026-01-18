@@ -104,6 +104,11 @@ class LastFMAPIClient:
             params["artist"] = artist_name
 
         try:
+            self.logger.debug(
+                "Fetching similar artists for: %s (MBID: %s)",
+                artist_name,
+                artist_mbid or "none",
+            )
             data = await self._get_data("artist.getSimilar", **params)
             similar_artists: list[dict[str, Any]] | dict[str, Any] = data.get(
                 "similarartists", {}
@@ -143,6 +148,12 @@ class LastFMAPIClient:
             params["track"] = track_name
 
         try:
+            self.logger.debug(
+                "Fetching similar tracks for: %s - %s (MBID: %s)",
+                artist_name,
+                track_name,
+                track_mbid or "none",
+            )
             data = await self._get_data("track.getSimilar", **params)
             similar_tracks: list[dict[str, Any]] | dict[str, Any] = data.get(
                 "similartracks", {}
@@ -205,6 +216,7 @@ class LastFMAPIClient:
         :param limit: Maximum number of tags to return (default 1 for top genre).
         """
         try:
+            self.logger.debug("Fetching top tags for user: %s", username)
             data = await self._get_data("user.getTopTags", user=username, limit=limit)
             tags: list[dict[str, Any]] | dict[str, Any] = data.get("toptags", {}).get("tag", [])
 
@@ -225,6 +237,7 @@ class LastFMAPIClient:
         :param limit: Maximum number of artists to return.
         """
         try:
+            self.logger.debug("Fetching top artists for tag: %s (limit: %d)", tag, limit)
             data = await self._get_data("tag.getTopArtists", tag=tag, limit=limit)
             artists: list[dict[str, Any]] | dict[str, Any] = data.get("topartists", {}).get(
                 "artist", []
@@ -247,6 +260,7 @@ class LastFMAPIClient:
         :param limit: Maximum number of albums to return.
         """
         try:
+            self.logger.debug("Fetching top albums for tag: %s (limit: %d)", tag, limit)
             data = await self._get_data("tag.getTopAlbums", tag=tag, limit=limit)
             albums: list[dict[str, Any]] | dict[str, Any] = data.get("albums", {}).get("album", [])
 
@@ -267,6 +281,7 @@ class LastFMAPIClient:
         :param limit: Maximum number of tracks to return.
         """
         try:
+            self.logger.debug("Fetching top tracks for tag: %s (limit: %d)", tag, limit)
             data = await self._get_data("tag.getTopTracks", tag=tag, limit=limit)
             tracks: list[dict[str, Any]] | dict[str, Any] = data.get("tracks", {}).get("track", [])
 
