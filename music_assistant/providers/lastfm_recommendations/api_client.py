@@ -102,6 +102,7 @@ class LastFMAPIClient:
             params["mbid"] = artist_mbid
         else:
             params["artist"] = artist_name
+            params["autocorrect"] = 1  # Let Last.fm correct artist name variations
 
         try:
             self.logger.debug(
@@ -146,6 +147,7 @@ class LastFMAPIClient:
         else:
             params["artist"] = artist_name
             params["track"] = track_name
+            params["autocorrect"] = 1  # Let Last.fm correct artist/track name variations
 
         try:
             self.logger.debug(
