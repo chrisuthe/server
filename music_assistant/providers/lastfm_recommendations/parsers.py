@@ -6,7 +6,7 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, cast
 
-from music_assistant_models.enums import ExternalID, ImageType, MediaType
+from music_assistant_models.enums import ExternalID, ImageType, MediaType, ProviderFeature
 from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.media_items import Album, Artist, ItemMapping, MediaItemImage, Track
 
@@ -151,15 +151,27 @@ async def _resolve_item(
         LOGGER.debug("Found %s in library: %s", item_mapping.media_type.value, library_item.name)
         return library_item
 
-    # Get list of streaming providers (exclude radio/podcast providers)
-    # Radio providers like Tune-In don't have on-demand catalogs we can search
-    streaming_providers = [
-        p
-        for p in mass.music.providers
-        if p.instance_id != provider_instance_to_skip
-        and p.is_streaming_provider
-        and p.domain not in ("tunein", "radiobrowser")  # Exclude radio-only providers
-    ]
+    # Get list of streaming providers that support the media type we're searching for
+    # This automatically excludes radio-only providers (which only have LIBRARY_RADIOS)
+    streaming_providers = []
+    for p in mass.music.providers:
+        if p.instance_id == provider_instance_to_skip:
+            continue
+        if not p.is_streaming_provider:
+            continue
+
+        # Check if provider supports the media type we're searching for
+        if item_mapping.media_type == MediaType.ARTIST:
+            if ProviderFeature.LIBRARY_ARTISTS not in p.supported_features:
+                continue
+        elif item_mapping.media_type == MediaType.ALBUM:
+            if ProviderFeature.LIBRARY_ALBUMS not in p.supported_features:
+                continue
+        elif item_mapping.media_type == MediaType.TRACK:
+            if ProviderFeature.LIBRARY_TRACKS not in p.supported_features:
+                continue
+
+        streaming_providers.append(p)
 
     if not streaming_providers:
         LOGGER.debug("No streaming providers available for resolution")
