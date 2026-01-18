@@ -410,9 +410,10 @@ class LastFMRecommendationManager:
 
         # Genre Artists (only if enabled)
         if self.provider.config.get_value("enable_genre_artists"):
-            genre_artists_raw = await self.api.get_tag_top_artists(tag_name, limit=10)
+            genre_artists_raw = await self.api.get_tag_top_artists(tag_name, limit=50)
             if genre_artists_raw:
-                genre_artists = [
+                # Resolve all artists
+                resolved_artists = [
                     artist
                     for artist in [
                         await self._get_or_resolve_artist(artist_data)
@@ -420,6 +421,11 @@ class LastFMRecommendationManager:
                     ]
                     if artist is not None
                 ]
+
+                # Filter out items already in library
+                genre_artists = [
+                    artist for artist in resolved_artists if artist.provider != "library"
+                ][:10]  # Take first 10 after filtering
 
                 if genre_artists:
                     folders.append(
@@ -435,9 +441,10 @@ class LastFMRecommendationManager:
 
         # Genre Albums (only if enabled)
         if self.provider.config.get_value("enable_genre_albums"):
-            genre_albums_raw = await self.api.get_tag_top_albums(tag_name, limit=10)
+            genre_albums_raw = await self.api.get_tag_top_albums(tag_name, limit=50)
             if genre_albums_raw:
-                genre_albums = [
+                # Resolve all albums
+                resolved_albums = [
                     album
                     for album in [
                         await self._get_or_resolve_album(album_data)
@@ -445,6 +452,11 @@ class LastFMRecommendationManager:
                     ]
                     if album is not None
                 ]
+
+                # Filter out items already in library
+                genre_albums = [album for album in resolved_albums if album.provider != "library"][
+                    :10
+                ]  # Take first 10 after filtering
 
                 if genre_albums:
                     folders.append(
@@ -460,9 +472,10 @@ class LastFMRecommendationManager:
 
         # Genre Tracks (only if enabled)
         if self.provider.config.get_value("enable_genre_tracks"):
-            genre_tracks_raw = await self.api.get_tag_top_tracks(tag_name, limit=10)
+            genre_tracks_raw = await self.api.get_tag_top_tracks(tag_name, limit=50)
             if genre_tracks_raw:
-                genre_tracks = [
+                # Resolve all tracks
+                resolved_tracks = [
                     track
                     for track in [
                         await self._get_or_resolve_track(track_data)
@@ -470,6 +483,11 @@ class LastFMRecommendationManager:
                     ]
                     if track is not None
                 ]
+
+                # Filter out items already in library
+                genre_tracks = [track for track in resolved_tracks if track.provider != "library"][
+                    :10
+                ]  # Take first 10 after filtering
 
                 if genre_tracks:
                     folders.append(
