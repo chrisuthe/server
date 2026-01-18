@@ -80,13 +80,26 @@ async def _search_provider(
     :return: Matched item or None.
     """
     try:
+        LOGGER.debug(
+            "Searching %s on %s for: %s (strict=%s)",
+            item_mapping.media_type.value,
+            provider.name,
+            item_mapping.name,
+            strict_match,
+        )
         search_results = await ctrl.search(item_mapping.name, provider.instance_id, limit=1)
         if not search_results:
+            LOGGER.debug("No search results from %s", provider.name)
             return None
 
         result = search_results[0]
         # If strict matching, verify external IDs match
         if strict_match and not _has_matching_external_ids(item_mapping, result):
+            LOGGER.debug(
+                "Strict match failed on %s: found '%s' but external IDs don't match",
+                provider.name,
+                result.name,
+            )
             return None
 
         LOGGER.debug(
@@ -126,6 +139,13 @@ async def _resolve_item(
     else:
         return None
 
+    LOGGER.debug(
+        "Resolving %s: %s (external IDs: %s)",
+        item_mapping.media_type.value,
+        item_mapping.name,
+        item_mapping.external_ids or "none",
+    )
+
     # First, check library by external IDs
     if library_item := await ctrl.get_library_item_by_external_ids(item_mapping.external_ids):
         LOGGER.debug("Found %s in library: %s", item_mapping.media_type.value, library_item.name)
@@ -141,6 +161,9 @@ async def _resolve_item(
     if not streaming_providers:
         LOGGER.debug("No streaming providers available for resolution")
         return None
+
+    provider_names = [p.name for p in streaming_providers]
+    LOGGER.debug("Searching %d providers: %s", len(streaming_providers), ", ".join(provider_names))
 
     # Search all providers concurrently with external ID matching (strict)
     # Create tasks so we can cancel them if we find a match early
@@ -160,6 +183,7 @@ async def _resolve_item(
             return result
 
     # No match with external IDs - try name-only search (fallback)
+    LOGGER.debug("No strict matches found, trying fallback name-only search")
     fallback_tasks = [
         asyncio.create_task(_search_provider(ctrl, item_mapping, provider, strict_match=False))
         for provider in streaming_providers
