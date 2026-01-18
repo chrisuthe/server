@@ -151,11 +151,14 @@ async def _resolve_item(
         LOGGER.debug("Found %s in library: %s", item_mapping.media_type.value, library_item.name)
         return library_item
 
-    # Get list of streaming providers
+    # Get list of streaming providers (exclude radio/podcast providers)
+    # Radio providers like Tune-In don't have on-demand catalogs we can search
     streaming_providers = [
         p
         for p in mass.music.providers
-        if p.instance_id != provider_instance_to_skip and p.is_streaming_provider
+        if p.instance_id != provider_instance_to_skip
+        and p.is_streaming_provider
+        and p.domain not in ("tunein", "radiobrowser")  # Exclude radio-only providers
     ]
 
     if not streaming_providers:
@@ -165,25 +168,29 @@ async def _resolve_item(
     provider_names = [p.name for p in streaming_providers]
     LOGGER.debug("Searching %d providers: %s", len(streaming_providers), ", ".join(provider_names))
 
-    # Search all providers concurrently with external ID matching (strict)
-    # Create tasks so we can cancel them if we find a match early
-    strict_tasks = [
-        asyncio.create_task(_search_provider(ctrl, item_mapping, provider, strict_match=True))
-        for provider in streaming_providers
-    ]
+    # Only do strict matching if we have external IDs to match on (ISRC, MBID, etc.)
+    if item_mapping.external_ids:
+        LOGGER.debug("Have external IDs, trying strict matching first")
+        # Search all providers concurrently with external ID matching (strict)
+        # Create tasks so we can cancel them if we find a match early
+        strict_tasks = [
+            asyncio.create_task(_search_provider(ctrl, item_mapping, provider, strict_match=True))
+            for provider in streaming_providers
+        ]
 
-    # Return as soon as we find the first match
-    for task in asyncio.as_completed(strict_tasks):
-        result = await task
-        if result is not None:
-            # Found a match! Cancel remaining tasks
-            for t in strict_tasks:
-                if not t.done():
-                    t.cancel()
-            return result
+        # Return as soon as we find the first match
+        for task in asyncio.as_completed(strict_tasks):
+            result = await task
+            if result is not None:
+                # Found a match! Cancel remaining tasks
+                for t in strict_tasks:
+                    if not t.done():
+                        t.cancel()
+                return result
 
-    # No match with external IDs - try name-only search (fallback)
-    LOGGER.debug("No strict matches found, trying fallback name-only search")
+        LOGGER.debug("No strict matches found, trying name-only search")
+    else:
+        LOGGER.debug("No external IDs available, skipping strict matching")
     fallback_tasks = [
         asyncio.create_task(_search_provider(ctrl, item_mapping, provider, strict_match=False))
         for provider in streaming_providers
@@ -286,9 +293,16 @@ async def parse_track(
         external_ids.add((ExternalID.MB_RECORDING, mbid))
 
         # Resolve MBID to ISRCs via MusicBrainz (with 90-day cache)
+        LOGGER.debug("Resolving MBID %s to ISRCs via MusicBrainz", mbid)
         isrcs = await mbid_resolver.get_isrcs_for_recording(mbid)
-        for isrc in isrcs:
-            external_ids.add((ExternalID.ISRC, isrc))
+        if isrcs:
+            LOGGER.debug("Found %d ISRCs for MBID %s: %s", len(isrcs), mbid, isrcs)
+            for isrc in isrcs:
+                external_ids.add((ExternalID.ISRC, isrc))
+        else:
+            LOGGER.debug("No ISRCs found for MBID %s", mbid)
+    else:
+        LOGGER.debug("Track has no MBID, cannot resolve ISRCs")
 
     # Extract image
     image = None
