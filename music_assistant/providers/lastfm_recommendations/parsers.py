@@ -65,6 +65,38 @@ def _extract_image_url(image_array: list[dict[str, Any]]) -> str | None:
     return None
 
 
+def _get_streaming_providers(
+    mass: MusicAssistant, item_mapping: ItemMapping, provider_instance_to_skip: str
+) -> list[Any]:
+    """Get list of streaming providers that support the media type we're searching for.
+
+    :param mass: MusicAssistant instance.
+    :param item_mapping: ItemMapping with the media type to search for.
+    :param provider_instance_to_skip: Provider instance to skip (ourselves).
+    :return: List of streaming providers that support the media type.
+    """
+    streaming_providers = []
+    for p in mass.music.providers:
+        if p.instance_id == provider_instance_to_skip:
+            continue
+        if not p.is_streaming_provider:
+            continue
+
+        # Check if provider supports the media type we're searching for
+        if item_mapping.media_type == MediaType.ARTIST:
+            if ProviderFeature.LIBRARY_ARTISTS not in p.supported_features:
+                continue
+        elif item_mapping.media_type == MediaType.ALBUM:
+            if ProviderFeature.LIBRARY_ALBUMS not in p.supported_features:
+                continue
+        elif item_mapping.media_type == MediaType.TRACK:
+            if ProviderFeature.LIBRARY_TRACKS not in p.supported_features:
+                continue
+
+        streaming_providers.append(p)
+    return streaming_providers
+
+
 async def _search_provider(
     ctrl: ArtistsController | AlbumsController | TracksController,
     item_mapping: ItemMapping,
@@ -115,6 +147,38 @@ async def _search_provider(
         return None
 
 
+async def _search_providers_concurrent(
+    ctrl: ArtistsController | AlbumsController | TracksController,
+    item_mapping: ItemMapping,
+    providers: list[Any],
+    strict_match: bool,
+) -> Artist | Album | Track | None:
+    """Search multiple providers concurrently and return the first match.
+
+    :param ctrl: Controller for the media type.
+    :param item_mapping: ItemMapping to search for.
+    :param providers: List of providers to search.
+    :param strict_match: If True, use external ID matching. If False, accept any match.
+    :return: First matched item or None if not found.
+    """
+    tasks = [
+        asyncio.create_task(_search_provider(ctrl, item_mapping, provider, strict_match))
+        for provider in providers
+    ]
+
+    # Return as soon as we find the first match
+    for task in asyncio.as_completed(tasks):
+        result = await task
+        if result is not None:
+            # Found a match! Cancel remaining tasks
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            return result
+
+    return None
+
+
 async def _resolve_item(
     item_mapping: ItemMapping, mass: MusicAssistant, provider_instance_to_skip: str
 ) -> Artist | Album | Track | None:
@@ -151,28 +215,8 @@ async def _resolve_item(
         LOGGER.debug("Found %s in library: %s", item_mapping.media_type.value, library_item.name)
         return library_item
 
-    # Get list of streaming providers that support the media type we're searching for
-    # This automatically excludes radio-only providers (which only have LIBRARY_RADIOS)
-    streaming_providers = []
-    for p in mass.music.providers:
-        if p.instance_id == provider_instance_to_skip:
-            continue
-        if not p.is_streaming_provider:
-            continue
-
-        # Check if provider supports the media type we're searching for
-        if item_mapping.media_type == MediaType.ARTIST:
-            if ProviderFeature.LIBRARY_ARTISTS not in p.supported_features:
-                continue
-        elif item_mapping.media_type == MediaType.ALBUM:
-            if ProviderFeature.LIBRARY_ALBUMS not in p.supported_features:
-                continue
-        elif item_mapping.media_type == MediaType.TRACK:
-            if ProviderFeature.LIBRARY_TRACKS not in p.supported_features:
-                continue
-
-        streaming_providers.append(p)
-
+    # Get list of streaming providers that support the media type
+    streaming_providers = _get_streaming_providers(mass, item_mapping, provider_instance_to_skip)
     if not streaming_providers:
         LOGGER.debug("No streaming providers available for resolution")
         return None
@@ -180,46 +224,37 @@ async def _resolve_item(
     provider_names = [p.name for p in streaming_providers]
     LOGGER.debug("Searching %d providers: %s", len(streaming_providers), ", ".join(provider_names))
 
-    # Only do strict matching if we have external IDs to match on (ISRC, MBID, etc.)
-    if item_mapping.external_ids:
+    # Determine if we should do strict matching
+    # For tracks: only if we have ISRCs (streaming providers don't use MBIDs)
+    # For artists/albums: any external IDs (MBIDs) are fine
+    should_strict_match = False
+    if item_mapping.media_type == MediaType.TRACK:
+        # For tracks, only strict match if we have ISRCs
+        has_isrc = any(ext_id[0] == ExternalID.ISRC for ext_id in item_mapping.external_ids)
+        if has_isrc:
+            LOGGER.debug("Have ISRCs, trying strict matching first")
+            should_strict_match = True
+        else:
+            LOGGER.debug("No ISRCs available for track, skipping strict matching")
+    elif item_mapping.external_ids:
+        # For artists/albums, any external IDs (like MBIDs) are good
         LOGGER.debug("Have external IDs, trying strict matching first")
-        # Search all providers concurrently with external ID matching (strict)
-        # Create tasks so we can cancel them if we find a match early
-        strict_tasks = [
-            asyncio.create_task(_search_provider(ctrl, item_mapping, provider, strict_match=True))
-            for provider in streaming_providers
-        ]
-
-        # Return as soon as we find the first match
-        for task in asyncio.as_completed(strict_tasks):
-            result = await task
-            if result is not None:
-                # Found a match! Cancel remaining tasks
-                for t in strict_tasks:
-                    if not t.done():
-                        t.cancel()
-                return result
-
-        LOGGER.debug("No strict matches found, trying name-only search")
+        should_strict_match = True
     else:
         LOGGER.debug("No external IDs available, skipping strict matching")
-    fallback_tasks = [
-        asyncio.create_task(_search_provider(ctrl, item_mapping, provider, strict_match=False))
-        for provider in streaming_providers
-    ]
 
-    for task in asyncio.as_completed(fallback_tasks):
-        result = await task
+    # Try strict matching first if applicable
+    if should_strict_match:
+        result = await _search_providers_concurrent(ctrl, item_mapping, streaming_providers, True)
         if result is not None:
-            # Found a match! Cancel remaining tasks
-            for t in fallback_tasks:
-                if not t.done():
-                    t.cancel()
             return result
+        LOGGER.debug("No strict matches found, trying name-only search")
 
-    # No match found anywhere
-    LOGGER.debug("Could not resolve %s: %s", item_mapping.media_type.value, item_mapping.name)
-    return None
+    # Fallback to name-only matching
+    result = await _search_providers_concurrent(ctrl, item_mapping, streaming_providers, False)
+    if result is None:
+        LOGGER.debug("Could not resolve %s: %s", item_mapping.media_type.value, item_mapping.name)
+    return result
 
 
 async def parse_artist(
