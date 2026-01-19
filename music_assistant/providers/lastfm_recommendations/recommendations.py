@@ -550,7 +550,7 @@ class LastFMRecommendationManager:
                     folders.append(
                         RecommendationFolder(
                             item_id=f"{self.provider.instance_id}_geo_artists",
-                            name=f"Top Artists in {country}",
+                            name=f"Top artists for {country}",
                             provider=self.provider.instance_id,
                             items=UniqueList(geo_artists),
                             subtitle=f"Most popular artists in {country}",
@@ -581,7 +581,7 @@ class LastFMRecommendationManager:
                     folders.append(
                         RecommendationFolder(
                             item_id=f"{self.provider.instance_id}_geo_tracks",
-                            name=f"Top Tracks in {country}",
+                            name=f"Top tracks for {country}",
                             provider=self.provider.instance_id,
                             items=UniqueList(geo_tracks),
                             subtitle=f"Most popular tracks in {country}",

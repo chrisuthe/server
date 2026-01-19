@@ -38,6 +38,7 @@ CONF_ACTION_CLEAR_CACHE = "clear_cache"
 # Last.fm API expects full country names (not ISO codes)
 # This list covers major music markets and can be expanded based on user requests
 GEO_COUNTRIES = [
+    "United States",
     "Argentina",
     "Australia",
     "Austria",
@@ -79,7 +80,6 @@ GEO_COUNTRIES = [
     "Ukraine",
     "United Arab Emirates",
     "United Kingdom",
-    "United States",
 ]
 
 
