@@ -38,7 +38,6 @@ CONF_ACTION_CLEAR_CACHE = "clear_cache"
 # Last.fm API expects full country names (not ISO codes)
 # This list covers major music markets and can be expanded based on user requests
 GEO_COUNTRIES = [
-    "United States",
     "Argentina",
     "Australia",
     "Austria",
@@ -80,6 +79,7 @@ GEO_COUNTRIES = [
     "Ukraine",
     "United Arab Emirates",
     "United Kingdom",
+    "United States",
 ]
 
 
@@ -190,7 +190,7 @@ async def get_config_entries(
             key="geo_country",
             type=ConfigEntryType.STRING,
             label="Country for Geographic Charts",
-            default_value="United States",
+            default_value="Argentina",
             description="Select country for geography-based top artists and tracks",
             options=[ConfigValueOption(country, country) for country in GEO_COUNTRIES],
             category="recommendations",
