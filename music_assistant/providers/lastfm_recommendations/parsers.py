@@ -101,23 +101,20 @@ async def _search_provider(
     ctrl: ArtistsController | AlbumsController | TracksController,
     item_mapping: ItemMapping,
     provider: Any,
-    strict_match: bool,
 ) -> Artist | Album | Track | None:
     """Search a single provider for a matching item.
 
     :param ctrl: Controller for the media type.
     :param item_mapping: ItemMapping to search for.
     :param provider: Provider instance to search.
-    :param strict_match: If True, use external ID matching. If False, accept any match.
     :return: Matched item or None.
     """
     try:
         LOGGER.debug(
-            "Searching %s on %s for: %s (strict=%s)",
+            "Searching %s on %s for: %s",
             item_mapping.media_type.value,
             provider.name,
             item_mapping.name,
-            strict_match,
         )
         search_results = await ctrl.search(item_mapping.name, provider.instance_id, limit=1)
         if not search_results:
@@ -125,15 +122,6 @@ async def _search_provider(
             return None
 
         result = search_results[0]
-        # If strict matching, verify external IDs match
-        if strict_match and not _has_matching_external_ids(item_mapping, result):
-            LOGGER.debug(
-                "Strict match failed on %s: found '%s' but external IDs don't match",
-                provider.name,
-                result.name,
-            )
-            return None
-
         LOGGER.debug(
             "Found %s on provider %s: %s",
             item_mapping.media_type.value,
@@ -151,32 +139,84 @@ async def _search_providers_concurrent(
     ctrl: ArtistsController | AlbumsController | TracksController,
     item_mapping: ItemMapping,
     providers: list[Any],
-    strict_match: bool,
+    require_external_id_match: bool,
 ) -> Artist | Album | Track | None:
-    """Search multiple providers concurrently and return the first match.
+    """Search multiple providers concurrently with smart result prioritization.
+
+    Optimized to make only ONE API call per provider by intelligently handling results:
+    - If we require external ID matching (have ISRCs/MBIDs):
+      1. Return immediately on external ID match
+      2. Reject results with non-matching external IDs
+      3. Save results without external IDs as fallback
+      4. Return fallback if no external ID match found
+    - If we don't require external ID matching:
+      1. Return first result
 
     :param ctrl: Controller for the media type.
     :param item_mapping: ItemMapping to search for.
     :param providers: List of providers to search.
-    :param strict_match: If True, use external ID matching. If False, accept any match.
-    :return: First matched item or None if not found.
+    :param require_external_id_match: If True, try to match on external IDs.
+    :return: Best matched item or None if not found.
     """
     tasks = [
-        asyncio.create_task(_search_provider(ctrl, item_mapping, provider, strict_match))
+        asyncio.create_task(_search_provider(ctrl, item_mapping, provider))
         for provider in providers
     ]
 
-    # Return as soon as we find the first match
+    fallback_result = None
+
+    # Process results as they complete
     for task in asyncio.as_completed(tasks):
         result = await task
-        if result is not None:
-            # Found a match! Cancel remaining tasks
+        if result is None:
+            continue
+
+        if not require_external_id_match:
+            # No external IDs to match - accept first result
             for t in tasks:
                 if not t.done():
                     t.cancel()
             return result
 
-    return None
+        # We have external IDs - try to match them
+        if _has_matching_external_ids(item_mapping, result):
+            # Perfect match! Return immediately
+            LOGGER.debug(
+                "External ID match on %s: %s",
+                result.provider,
+                result.name,
+            )
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            return result
+
+        # Check if result has any of the external ID types we're looking for
+        result_has_external_ids = any(
+            ext_id[0] in {ext_id_check[0] for ext_id_check in item_mapping.external_ids}
+            for ext_id in result.external_ids
+        )
+
+        if result_has_external_ids:
+            # Has external IDs but they don't match - reject this result
+            LOGGER.debug(
+                "Rejecting %s from %s: has external IDs but they don't match",
+                result.name,
+                result.provider,
+            )
+        elif not fallback_result:
+            # No external IDs to compare - save as fallback
+            LOGGER.debug(
+                "Saving %s from %s as fallback (no external IDs to verify)",
+                result.name,
+                result.provider,
+            )
+            fallback_result = result
+
+    # All providers returned - use fallback if we have one
+    if fallback_result:
+        LOGGER.debug("No external ID matches found, using fallback result")
+    return fallback_result
 
 
 async def _resolve_item(
@@ -224,34 +264,30 @@ async def _resolve_item(
     provider_names = [p.name for p in streaming_providers]
     LOGGER.debug("Searching %d providers: %s", len(streaming_providers), ", ".join(provider_names))
 
-    # Determine if we should do strict matching
+    # Determine if we should try to match on external IDs
     # For tracks: only if we have ISRCs (streaming providers don't use MBIDs)
     # For artists/albums: any external IDs (MBIDs) are fine
-    should_strict_match = False
+    require_external_id_match = False
     if item_mapping.media_type == MediaType.TRACK:
-        # For tracks, only strict match if we have ISRCs
+        # For tracks, only match on external IDs if we have ISRCs
         has_isrc = any(ext_id[0] == ExternalID.ISRC for ext_id in item_mapping.external_ids)
         if has_isrc:
-            LOGGER.debug("Have ISRCs, trying strict matching first")
-            should_strict_match = True
+            LOGGER.debug("Have ISRCs, will prioritize ISRC matches")
+            require_external_id_match = True
         else:
-            LOGGER.debug("No ISRCs available for track, skipping strict matching")
+            LOGGER.debug("No ISRCs available, accepting any name match")
     elif item_mapping.external_ids:
         # For artists/albums, any external IDs (like MBIDs) are good
-        LOGGER.debug("Have external IDs, trying strict matching first")
-        should_strict_match = True
+        LOGGER.debug("Have external IDs, will prioritize external ID matches")
+        require_external_id_match = True
     else:
-        LOGGER.debug("No external IDs available, skipping strict matching")
+        LOGGER.debug("No external IDs available, accepting any name match")
 
-    # Try strict matching first if applicable
-    if should_strict_match:
-        result = await _search_providers_concurrent(ctrl, item_mapping, streaming_providers, True)
-        if result is not None:
-            return result
-        LOGGER.debug("No strict matches found, trying name-only search")
-
-    # Fallback to name-only matching
-    result = await _search_providers_concurrent(ctrl, item_mapping, streaming_providers, False)
+    # Search all providers once with smart prioritization
+    # This makes only ONE API call per provider (instead of two)
+    result = await _search_providers_concurrent(
+        ctrl, item_mapping, streaming_providers, require_external_id_match
+    )
     if result is None:
         LOGGER.debug("Could not resolve %s: %s", item_mapping.media_type.value, item_mapping.name)
     return result
