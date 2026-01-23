@@ -769,7 +769,6 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
             cache = cast("tuple[str, str]", cache)
         return (cache[0], StreamType(cache[1]))
     stream_type = StreamType.HTTP
-    resolved_url = url
     timeout = ClientTimeout(total=None, connect=10, sock_read=5)
     try:
         async with mass.http_session_no_ssl.get(
@@ -826,7 +825,7 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
         LOGGER.warning("Failed to connect to or parse radio URL %s", url)
         raise
 
-    result = (resolved_url, stream_type)
+    result = (url, stream_type)
     cache_expiration = 3600 * 3
     await mass.cache.set(
         url,
@@ -872,7 +871,7 @@ async def _validate_shoutcast_stream(url: str) -> bool:
         await writer.wait_closed()
 
         # Check if response starts with "ICY"
-        decoded_line = response_line.decode('latin-1', errors='ignore').strip()
+        decoded_line = response_line.decode("latin-1", errors="ignore").strip()
         return decoded_line.startswith("ICY")
 
     except TimeoutError:
@@ -1043,7 +1042,7 @@ async def get_shoutcast_stream(
                 break
             if b":" in line:
                 try:
-                    key, value = line.decode('latin-1', errors='ignore').split(":", 1)
+                    key, value = line.decode("latin-1", errors="ignore").split(":", 1)
                     headers[key.strip().lower()] = value.strip()
                 except (UnicodeDecodeError, ValueError):
                     # Skip malformed header lines
