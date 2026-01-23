@@ -841,9 +841,9 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
 async def _validate_shoutcast_stream(url: str) -> bool:
     """
     Validate if a URL is a legacy Shoutcast stream that returns "ICY 200 OK".
-    
+
     Makes a raw socket connection to check the response line.
-    
+
     :param url: The URL to validate.
     """
     try:
@@ -853,28 +853,28 @@ async def _validate_shoutcast_stream(url: str) -> bool:
         path = parsed.path or "/"
         if parsed.query:
             path = f"{path}?{parsed.query}"
-        
+
         # Open raw socket connection with timeout
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout=10
         )
-        
+
         # Send minimal HTTP request with ICY metadata header
         request = f"GET {path} HTTP/1.1\r\nHost: {host}\r\nIcy-MetaData: 1\r\n\r\n"
         writer.write(request.encode())
         await writer.drain()
-        
+
         # Read just the response line
         response_line = await asyncio.wait_for(reader.readline(), timeout=5)
-        
+
         # Clean up connection
         writer.close()
         await writer.wait_closed()
-        
+
         # Check if response starts with "ICY"
         decoded_line = response_line.decode('latin-1', errors='ignore').strip()
         return decoded_line.startswith("ICY")
-        
+
     except asyncio.TimeoutError:
         LOGGER.debug("Timeout during Shoutcast validation for %s", url)
         return False
@@ -988,19 +988,19 @@ async def get_shoutcast_stream(
     mass: MusicAssistant, url: str, streamdetails: StreamDetails
 ) -> AsyncGenerator[bytes, None]:
     """Get (radio) audio stream from legacy Shoutcast server using raw socket connection.
-    
+
     Legacy Shoutcast servers return "ICY 200 OK" instead of "HTTP/1.1 200 OK",
     which aiohttp cannot parse. This function handles the connection manually.
     """
     LOGGER.debug("Start streaming from legacy Shoutcast server: %s", url)
-    
+
     parsed = urlparse(url)
     host = parsed.hostname
     port = parsed.port or 80
     path = parsed.path or "/"
     if parsed.query:
         path = f"{path}?{parsed.query}"
-    
+
     try:
         # Open raw socket connection
         reader, writer = await asyncio.wait_for(
@@ -1010,22 +1010,22 @@ async def get_shoutcast_stream(
         raise AudioError(f"Timeout connecting to Shoutcast stream {url}") from err
     except (OSError, ConnectionError) as err:
         raise AudioError(f"Failed to connect to Shoutcast stream {url}") from err
-    
+
     try:
         # Send HTTP request with ICY metadata header
         request = f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {HTTP_HEADERS['User-Agent']}\r\nIcy-MetaData: 1\r\n\r\n"
         writer.write(request.encode())
         await writer.drain()
-        
+
         # Read and parse response line
         try:
             response_line = await asyncio.wait_for(reader.readline(), timeout=10)
         except asyncio.TimeoutError as err:
             raise AudioError("Timeout reading Shoutcast response") from err
-            
+
         if not response_line.startswith(b"ICY"):
             raise InvalidDataError("Invalid Shoutcast response")
-        
+
         # Read headers until empty line
         headers = {}
         while True:
@@ -1033,7 +1033,7 @@ async def get_shoutcast_stream(
                 line = await asyncio.wait_for(reader.readline(), timeout=5)
             except asyncio.TimeoutError as err:
                 raise AudioError("Timeout reading Shoutcast headers") from err
-                
+
             if line in (b"\r\n", b"\n", b""):
                 break
             if b":" in line:
@@ -1043,48 +1043,48 @@ async def get_shoutcast_stream(
                 except (UnicodeDecodeError, ValueError):
                     # Skip malformed header lines
                     continue
-        
+
         # Get metadata interval
         meta_int_str = headers.get("icy-metaint")
         if not meta_int_str:
             raise InvalidDataError("No icy-metaint header in Shoutcast response")
-        
+
         try:
             meta_int = int(meta_int_str)
         except ValueError as err:
             raise InvalidDataError("Invalid icy-metaint value") from err
-        
+
         LOGGER.debug("Connected to Shoutcast stream %s (icy-metaint: %s)", url, meta_int)
-        
+
         # Stream audio data with metadata parsing
         while True:
             try:
                 # Read audio chunk
                 audio_chunk = await reader.readexactly(meta_int)
                 yield audio_chunk
-                
+
                 # Read metadata length
                 meta_byte = await reader.readexactly(1)
                 if meta_byte == b"\x00":
                     continue
-                    
+
                 meta_length = ord(meta_byte) * 16
                 meta_data = await reader.readexactly(meta_length)
-                
+
                 if not meta_data:
                     continue
-                    
+
                 # Parse metadata
                 meta_data = meta_data.rstrip(b"\0")
                 stream_title_re = re.search(rb"StreamTitle='([^']*)';", meta_data)
                 if not stream_title_re:
                     continue
-                    
+
                 try:
                     stream_title = stream_title_re.group(1).decode("utf-8")
                 except UnicodeDecodeError:
                     stream_title = stream_title_re.group(1).decode("iso-8859-1", errors="replace")
-                    
+
                 cleaned_stream_title = clean_stream_title(stream_title)
                 if cleaned_stream_title != streamdetails.stream_title:
                     LOGGER.log(
@@ -1098,11 +1098,11 @@ async def get_shoutcast_stream(
                         cleaned_stream_title,
                     )
                     streamdetails.stream_title = cleaned_stream_title
-                    
+
             except asyncio.exceptions.IncompleteReadError:
                 # End of stream
                 break
-                
+
     finally:
         writer.close()
         await writer.wait_closed()
