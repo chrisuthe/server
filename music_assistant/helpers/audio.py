@@ -804,7 +804,7 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
     except TimeoutError as err:
         LOGGER.warning("Timeout while parsing radio URL %s", url)
         raise InvalidDataError(f"Timeout connecting to {url}") from err
-    except aiohttp.ClientError as err:
+    except aiohttp.ClientError:
         # This catches connection errors, parse errors, AND ClientResponseError
         # Try to determine if it's a Shoutcast stream
         LOGGER.debug(
