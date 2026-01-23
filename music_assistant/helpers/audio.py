@@ -802,16 +802,14 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
             except IsHLSPlaylist:
                 stream_type = StreamType.HLS
 
-    except aiohttp.ClientResponseError as err:
-        # Distinguish between HTTP errors (404, 403, etc.) and protocol parse errors
-        if err.status is not None:
-            # This is a real HTTP status error (404, 403, etc.), not a Shoutcast stream
-            LOGGER.warning("HTTP error %s while parsing radio URL %s", err.status, url)
-            raise
-        # Response parsing failed - aiohttp couldn't parse the response line
-        # This might be a legacy Shoutcast server returning "ICY 200 OK"
+    except asyncio.TimeoutError as err:
+        LOGGER.warning("Timeout while parsing radio URL %s", url)
+        raise InvalidDataError(f"Timeout connecting to {url}") from err
+    except aiohttp.ClientError as err:
+        # This catches connection errors, parse errors, AND ClientResponseError
+        # Try to determine if it's a Shoutcast stream
         LOGGER.debug(
-            "aiohttp failed to parse response for %s, validating if Shoutcast stream", url
+            "aiohttp error for %s, checking if legacy Shoutcast stream", url
         )
         if await _validate_shoutcast_stream(url):
             # Shoutcast stream confirmed - cache and return immediately
@@ -825,14 +823,8 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
             )
             return result
         # Not a Shoutcast stream, re-raise the original error
-        LOGGER.warning("Failed to parse radio URL %s", url)
+        LOGGER.warning("Failed to connect to or parse radio URL %s", url)
         raise
-    except asyncio.TimeoutError as err:
-        LOGGER.warning("Timeout while parsing radio URL %s", url)
-        raise InvalidDataError(f"Timeout connecting to {url}") from err
-    except aiohttp.ClientError as err:
-        LOGGER.warning("Client error while parsing radio URL %s", url)
-        raise InvalidDataError(f"Failed to connect to {url}") from err
 
     result = (resolved_url, stream_type)
     cache_expiration = 3600 * 3
