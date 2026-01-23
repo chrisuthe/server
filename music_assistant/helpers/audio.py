@@ -814,11 +814,19 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
             "aiohttp failed to parse response for %s, validating if Shoutcast stream", url
         )
         if await _validate_shoutcast_stream(url):
-            stream_type = StreamType.SHOUTCAST
-        else:
-            # Not a Shoutcast stream, re-raise the original error
-            LOGGER.warning("Failed to parse radio URL %s", url)
-            raise
+            # Shoutcast stream confirmed - cache and return immediately
+            result = (url, StreamType.SHOUTCAST)
+            await mass.cache.set(
+                url,
+                result,
+                expiration=3600 * 3,
+                provider=CACHE_PROVIDER,
+                category=CACHE_CATEGORY_RESOLVED_RADIO_URL,
+            )
+            return result
+        # Not a Shoutcast stream, re-raise the original error
+        LOGGER.warning("Failed to parse radio URL %s", url)
+        raise
     except asyncio.TimeoutError as err:
         LOGGER.warning("Timeout while parsing radio URL %s", url)
         raise InvalidDataError(f"Timeout connecting to {url}") from err
@@ -1661,6 +1669,9 @@ async def analyze_loudness(
     elif stream_type == StreamType.ICY:
         assert isinstance(streamdetails.path, str)  # for type checking
         audio_source = get_icy_radio_stream(mass, streamdetails.path, streamdetails)
+    elif stream_type == StreamType.SHOUTCAST:
+        assert isinstance(streamdetails.path, str)  # for type checking
+        audio_source = get_shoutcast_stream(mass, streamdetails.path, streamdetails)
     elif stream_type == StreamType.HLS:
         assert isinstance(streamdetails.path, str)  # for type checking
         substream = await get_hls_substream(mass, streamdetails.path)
