@@ -536,7 +536,7 @@ async def get_media_stream(
         seek_position = 0  # seeking not possible on radio streams
     elif stream_type == StreamType.SHOUTCAST:
         assert isinstance(streamdetails.path, str)  # for type checking
-        audio_source = get_shoutcast_stream(mass, streamdetails.path, streamdetails)
+        audio_source = get_shoutcast_stream(streamdetails.path, streamdetails)
         seek_position = 0  # seeking not possible on radio streams
     elif stream_type == StreamType.HLS:
         assert isinstance(streamdetails.path, str)  # for type checking
@@ -802,7 +802,7 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
             except IsHLSPlaylist:
                 stream_type = StreamType.HLS
 
-    except asyncio.TimeoutError as err:
+    except TimeoutError as err:
         LOGGER.warning("Timeout while parsing radio URL %s", url)
         raise InvalidDataError(f"Timeout connecting to {url}") from err
     except aiohttp.ClientError as err:
@@ -875,7 +875,7 @@ async def _validate_shoutcast_stream(url: str) -> bool:
         decoded_line = response_line.decode('latin-1', errors='ignore').strip()
         return decoded_line.startswith("ICY")
 
-    except asyncio.TimeoutError:
+    except TimeoutError:
         LOGGER.debug("Timeout during Shoutcast validation for %s", url)
         return False
     except (OSError, ConnectionError):
@@ -985,7 +985,7 @@ async def get_icy_radio_stream(
 
 
 async def get_shoutcast_stream(
-    mass: MusicAssistant, url: str, streamdetails: StreamDetails
+    url: str, streamdetails: StreamDetails
 ) -> AsyncGenerator[bytes, None]:
     """Get (radio) audio stream from legacy Shoutcast server using raw socket connection.
 
@@ -1006,21 +1006,26 @@ async def get_shoutcast_stream(
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout=30
         )
-    except asyncio.TimeoutError as err:
+    except TimeoutError as err:
         raise AudioError(f"Timeout connecting to Shoutcast stream {url}") from err
     except (OSError, ConnectionError) as err:
         raise AudioError(f"Failed to connect to Shoutcast stream {url}") from err
 
     try:
         # Send HTTP request with ICY metadata header
-        request = f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {HTTP_HEADERS['User-Agent']}\r\nIcy-MetaData: 1\r\n\r\n"
+        request = (
+                    f"GET {path} HTTP/1.1\r\n"
+                    f"Host: {host}\r\n"
+                    f"User-Agent: {HTTP_HEADERS['User-Agent']}\r\n"
+                    f"Icy-MetaData: 1\r\n\r\n"
+                )
         writer.write(request.encode())
         await writer.drain()
 
         # Read and parse response line
         try:
             response_line = await asyncio.wait_for(reader.readline(), timeout=10)
-        except asyncio.TimeoutError as err:
+        except TimeoutError as err:
             raise AudioError("Timeout reading Shoutcast response") from err
 
         if not response_line.startswith(b"ICY"):
@@ -1031,7 +1036,7 @@ async def get_shoutcast_stream(
         while True:
             try:
                 line = await asyncio.wait_for(reader.readline(), timeout=5)
-            except asyncio.TimeoutError as err:
+            except TimeoutError as err:
                 raise AudioError("Timeout reading Shoutcast headers") from err
 
             if line in (b"\r\n", b"\n", b""):
@@ -1663,7 +1668,7 @@ async def analyze_loudness(
         audio_source = get_icy_radio_stream(mass, streamdetails.path, streamdetails)
     elif stream_type == StreamType.SHOUTCAST:
         assert isinstance(streamdetails.path, str)  # for type checking
-        audio_source = get_shoutcast_stream(mass, streamdetails.path, streamdetails)
+        audio_source = get_shoutcast_stream(streamdetails.path, streamdetails)
     elif stream_type == StreamType.HLS:
         assert isinstance(streamdetails.path, str)  # for type checking
         substream = await get_hls_substream(mass, streamdetails.path)
