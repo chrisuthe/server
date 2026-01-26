@@ -11,6 +11,7 @@ from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.media_items import Album, Artist, ItemMapping, MediaItemImage, Track
 
 from music_assistant.constants import MASS_LOGGER_NAME
+from music_assistant.helpers.compare import compare_strings
 
 if TYPE_CHECKING:
     from music_assistant import MusicAssistant
@@ -178,11 +179,29 @@ async def _search_providers_concurrent(
             continue
 
         if not require_external_id_match:
-            # No external IDs to match - accept first result
-            for t in tasks:
-                if not t.done():
-                    t.cancel()
-            return result
+            # No external IDs to match - verify name similarity before accepting
+            if compare_strings(item_mapping.name, result.name, strict=False):
+                LOGGER.debug(
+                    "Name match on %s: %s (searched: %s)",
+                    result.provider,
+                    result.name,
+                    item_mapping.name,
+                )
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                return result
+
+            # Name doesn't match well - save as fallback but keep searching
+            LOGGER.debug(
+                "Rejecting %s from %s: name mismatch (searched: %s)",
+                result.name,
+                result.provider,
+                item_mapping.name,
+            )
+            if not fallback_result:
+                fallback_result = result
+            continue
 
         # We have external IDs - try to match them
         if _has_matching_external_ids(item_mapping, result):

@@ -771,6 +771,14 @@ class LastFMRecommendationManager:
         """
         all_similar: list[dict[str, Any]] = []
 
+        # Build set of seed artist MBIDs and names to exclude from results
+        seed_mbids = {
+            seed_artist.get_external_id(ExternalID.MB_ARTIST)
+            for seed_artist in seed_artists
+            if seed_artist.get_external_id(ExternalID.MB_ARTIST)
+        }
+        seed_names = {seed_artist.name.lower() for seed_artist in seed_artists}
+
         # Get 3 similar artists for each seed
         for seed_artist in seed_artists:
             # Extract MBID if available using get_external_id helper
@@ -783,12 +791,19 @@ class LastFMRecommendationManager:
 
         # Deduplicate by both MBID and name to prevent duplicates when
         # Last.fm returns same artist with/without MBID
+        # Also exclude seed artists to prevent showing them in their own recommendations
         seen_mbids = set()
         seen_names = set()
         unique_similar: list[dict[str, Any]] = []
         for artist_data in all_similar:
             mbid = artist_data.get("mbid")
             name = artist_data.get("name", "").lower()
+
+            # Skip if this is a seed artist (prevent showing artist in its own recommendations)
+            if mbid and mbid in seed_mbids:
+                continue
+            if name and name in seed_names:
+                continue
 
             # Skip if we've already seen this MBID or name
             if mbid and mbid in seen_mbids:
@@ -839,6 +854,17 @@ class LastFMRecommendationManager:
         """
         all_similar: list[dict[str, Any]] = []
 
+        # Build set of seed track MBIDs and name keys to exclude from results
+        seed_mbids = {
+            seed_track.get_external_id(ExternalID.MB_RECORDING)
+            for seed_track in seed_tracks
+            if seed_track.get_external_id(ExternalID.MB_RECORDING)
+        }
+        seed_name_keys = {
+            f"{seed_track.artists[0].name if seed_track.artists else ''}_{seed_track.name}".lower()
+            for seed_track in seed_tracks
+        }
+
         # Get 3 similar tracks for each seed
         for seed_track in seed_tracks:
             # Extract MBID if available using get_external_id helper
@@ -857,6 +883,7 @@ class LastFMRecommendationManager:
 
         # Deduplicate by both MBID and name+artist to prevent duplicates when
         # Last.fm returns same track with/without MBID
+        # Also exclude seed tracks to prevent showing them in their own recommendations
         seen_mbids = set()
         seen_names = set()
         unique_similar: list[dict[str, Any]] = []
@@ -871,6 +898,12 @@ class LastFMRecommendationManager:
                 artist_name = artist_info.get("name", "")
             track_name = track_data.get("name", "")
             name_key = f"{artist_name}_{track_name}".lower() if artist_name and track_name else ""
+
+            # Skip if this is a seed track (prevent showing track in its own recommendations)
+            if mbid and mbid in seed_mbids:
+                continue
+            if name_key and name_key in seed_name_keys:
+                continue
 
             # Skip if we've already seen this MBID or name combination
             if mbid and mbid in seen_mbids:
