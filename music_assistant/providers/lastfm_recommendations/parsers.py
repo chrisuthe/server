@@ -12,6 +12,12 @@ from music_assistant_models.media_items import Album, Artist, ItemMapping, Media
 
 from music_assistant.constants import MASS_LOGGER_NAME
 from music_assistant.helpers.compare import compare_strings
+from music_assistant.providers.lastfm_recommendations.constants import (
+    IMAGE_PLACEHOLDER_SUFFIX,
+    IMAGE_SIZE_PRIORITY,
+    PROVIDER_SEARCH_LIMIT,
+    SEARCH_CONCURRENCY_LIMIT,
+)
 
 if TYPE_CHECKING:
     from music_assistant import MusicAssistant
@@ -22,8 +28,8 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(f"{MASS_LOGGER_NAME}.lastfm_recommendations")
 
-# Semaphore to limit concurrent provider searches (prevents overwhelming Spotify API)
-_SEARCH_SEMAPHORE = asyncio.Semaphore(5)
+# Semaphore to limit concurrent provider searches (prevents overwhelming provider APIs)
+_SEARCH_SEMAPHORE = asyncio.Semaphore(SEARCH_CONCURRENCY_LIMIT)
 
 
 def _has_matching_external_ids(
@@ -55,15 +61,12 @@ def _extract_image_url(image_array: list[dict[str, Any]]) -> str | None:
     if not image_array:
         return None
 
-    # Prefer larger sizes first
-    size_priority = ["mega", "extralarge", "large", "medium", "small"]
-
-    for size in size_priority:
+    for size in IMAGE_SIZE_PRIORITY:
         for img in image_array:
             if img.get("size") == size and img.get("#text"):
                 url = str(img["#text"]).strip()
                 # Filter out placeholder/empty images
-                if url and not url.endswith("/default.png"):
+                if url and not url.endswith(IMAGE_PLACEHOLDER_SUFFIX):
                     return url
 
     return None
@@ -123,21 +126,14 @@ async def _search_provider(
                 provider.name,
                 item_mapping.name,
             )
-            # Use limit=2 to work around Spotify API bug where limit=1 returns wrong results
-            # With limit=1, Spotify may return incorrect artists (e.g., Bruno Mars for The Weeknd)
-            search_results = await ctrl.search(item_mapping.name, provider.instance_id, limit=2)
+            # Use higher limit to work around provider API bugs (e.g., Spotify with limit=1)
+            search_results = await ctrl.search(
+                item_mapping.name, provider.instance_id, limit=PROVIDER_SEARCH_LIMIT
+            )
             if not search_results:
-                LOGGER.debug("No search results from %s", provider.name)
                 return None
 
-            result = search_results[0]
-            LOGGER.debug(
-                "Found %s on provider %s: %s",
-                item_mapping.media_type.value,
-                provider.name,
-                result.name,
-            )
-            return result
+            return search_results[0]
         except MusicAssistantError as err:
             # Expected errors from provider searches (e.g., provider unavailable, timeout, etc.)
             LOGGER.debug("Provider %s search failed: %s", provider.name, type(err).__name__)
@@ -216,7 +212,7 @@ async def _search_providers_concurrent(
 
         # We have external IDs - try to match them
         if _has_matching_external_ids(item_mapping, result):
-            # Perfect match! Return immediately
+            # Exact external ID match found, return immediately
             LOGGER.debug(
                 "External ID match on %s: %s",
                 result.provider,
@@ -311,24 +307,14 @@ async def _resolve_item(
         LOGGER.debug("No streaming providers available for resolution")
         return None
 
-    provider_names = [p.name for p in streaming_providers]
-    LOGGER.debug("Searching %d providers: %s", len(streaming_providers), ", ".join(provider_names))
-
     # Determine if we should try to match on external IDs
     # For tracks: only if we have ISRCs (streaming providers support ISRC matching)
     # For artists/albums: streaming providers don't expose MBIDs, so always use name matching
     require_external_id_match = False
     if item_mapping.media_type == MediaType.TRACK:
-        # For tracks, only match on external IDs if we have ISRCs
         has_isrc = any(ext_id[0] == ExternalID.ISRC for ext_id in item_mapping.external_ids)
         if has_isrc:
-            LOGGER.debug("Have ISRCs, will prioritize ISRC matches")
             require_external_id_match = True
-        else:
-            LOGGER.debug("No ISRCs available, accepting any name match")
-    else:
-        # Artists and albums: streaming providers don't expose MBIDs, use name matching
-        LOGGER.debug("Using name-based matching for %s", item_mapping.media_type.value)
 
     # Search all providers once with smart prioritization
     # This makes only ONE API call per provider (instead of two)

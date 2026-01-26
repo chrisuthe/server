@@ -16,6 +16,19 @@ from music_assistant_models.media_items import (
     UniqueList,
 )
 
+from music_assistant.providers.lastfm_recommendations.constants import (
+    CACHE_CATEGORY_RESOLVED_ITEMS,
+    CACHE_EXPIRATION_SECONDS,
+    RESOLUTION_BUFFER_LARGE,
+    RESOLUTION_BUFFER_SMALL,
+    SIMILAR_ITEMS_BUFFER,
+    SIMILAR_ITEMS_PER_SEED,
+    TARGET_ITEM_COUNT,
+    TOP_ARTISTS_LIMIT,
+    TOP_ITEMS_TO_TAKE,
+    TOP_TAGS_LIMIT,
+    TOP_TRACKS_LIMIT,
+)
 from music_assistant.providers.lastfm_recommendations.parsers import (
     parse_album,
     parse_artist,
@@ -24,9 +37,6 @@ from music_assistant.providers.lastfm_recommendations.parsers import (
 
 if TYPE_CHECKING:
     from music_assistant.providers.lastfm_recommendations import LastFMRecommendationsProvider
-
-# Cache category for resolved Artist/Track objects
-CACHE_CATEGORY_RESOLVED_ITEMS = 1
 
 
 class LastFMRecommendationManager:
@@ -135,28 +145,28 @@ class LastFMRecommendationManager:
         return False
 
     def _sample_items(
-        self, items: list[dict[str, Any]], seed_suffix: str, target_count: int = 10
+        self, items: list[dict[str, Any]], seed_suffix: str, target_count: int = TARGET_ITEM_COUNT
     ) -> list[dict[str, Any]]:
-        """Sample items using 'top 3 + random' strategy.
+        """Sample items using 'top N + random' strategy.
 
-        Takes the top 3 items and random items from the remainder to reach target_count.
+        Takes the top N items and random items from the remainder to reach target_count.
         Uses a daily-based random seed for consistency within the day.
 
         :param items: List of items to sample from (already filtered).
         :param seed_suffix: Unique suffix for random seed (to vary between recommendation types).
-        :param target_count: Target number of items to return (default: 10).
+        :param target_count: Target number of items to return.
         :return: List of sampled items (up to target_count).
         """
         if len(items) <= target_count:
             # Not enough items to sample, return all
             return items
 
-        # Take top 3
-        top_items = items[:3]
+        # Take top items
+        top_items = items[:TOP_ITEMS_TO_TAKE]
 
-        # Random sample (target_count - 3) from the rest
-        remaining = items[3:]
-        random_count = target_count - 3
+        # Random sample from the rest
+        remaining = items[TOP_ITEMS_TO_TAKE:]
+        random_count = target_count - TOP_ITEMS_TO_TAKE
 
         # Use daily seed for consistency (same results all day, changes daily)
         seed = f"{datetime.datetime.now(tz=datetime.UTC).date().isoformat()}_{seed_suffix}"
@@ -206,7 +216,7 @@ class LastFMRecommendationManager:
                 persistent_cache_key,
                 artist,
                 category=CACHE_CATEGORY_RESOLVED_ITEMS,
-                expiration=60 * 60 * 24 * 90,  # 90 days
+                expiration=CACHE_EXPIRATION_SECONDS,
             )
         return artist
 
@@ -261,7 +271,7 @@ class LastFMRecommendationManager:
                 persistent_cache_key,
                 track,
                 category=CACHE_CATEGORY_RESOLVED_ITEMS,
-                expiration=60 * 60 * 24 * 90,  # 90 days
+                expiration=CACHE_EXPIRATION_SECONDS,
             )
         return track
 
@@ -314,7 +324,7 @@ class LastFMRecommendationManager:
                 persistent_cache_key,
                 album,
                 category=CACHE_CATEGORY_RESOLVED_ITEMS,
-                expiration=60 * 60 * 24 * 90,  # 90 days
+                expiration=CACHE_EXPIRATION_SECONDS,
             )
         return album
 
@@ -378,9 +388,9 @@ class LastFMRecommendationManager:
 
         # Similar Artists (only if enabled)
         if self.provider.config.get_value("enable_similar_artists"):
-            # Get top 5 most played artists from library
+            # Get top most played artists from library
             top_artists = await self.mass.music.artists.library_items(
-                limit=5, order_by="play_count_desc"
+                limit=TOP_ARTISTS_LIMIT, order_by="play_count_desc"
             )
 
             if top_artists:
@@ -393,7 +403,7 @@ class LastFMRecommendationManager:
                             item_id=f"{self.provider.instance_id}_similar_artists",
                             name="Discover Similar Artists",
                             provider=self.provider.instance_id,
-                            items=UniqueList(similar_artists[:10]),
+                            items=UniqueList(similar_artists[:TARGET_ITEM_COUNT]),
                             subtitle=f"Based on your top {len(top_artists)} artists",
                             icon="mdi-account-music-outline",
                         )
@@ -401,9 +411,9 @@ class LastFMRecommendationManager:
 
         # Similar Tracks (only if enabled)
         if self.provider.config.get_value("enable_similar_tracks"):
-            # Get top 5 most played tracks from library
+            # Get top most played tracks from library
             top_tracks = await self.mass.music.tracks.library_items(
-                limit=5, order_by="play_count_desc"
+                limit=TOP_TRACKS_LIMIT, order_by="play_count_desc"
             )
 
             if top_tracks:
@@ -416,7 +426,7 @@ class LastFMRecommendationManager:
                             item_id=f"{self.provider.instance_id}_similar_tracks",
                             name="Discover Similar Tracks",
                             provider=self.provider.instance_id,
-                            items=UniqueList(similar_tracks[:10]),
+                            items=UniqueList(similar_tracks[:TARGET_ITEM_COUNT]),
                             subtitle=f"Based on your top {len(top_tracks)} tracks",
                             icon="mdi-music-note-outline",
                         )
@@ -436,22 +446,25 @@ class LastFMRecommendationManager:
 
         # Global Top Artists (only if enabled)
         if self.provider.config.get_value("enable_top_artists"):
-            # Request 15 items to account for resolution failures (target: 10 successful)
-            top_artists_raw = await self.api.get_chart_top_artists(limit=15)
+            # Request extra items to account for resolution failures
+            top_artists_raw = await self.api.get_chart_top_artists(limit=RESOLUTION_BUFFER_SMALL)
             if top_artists_raw:
                 # Parse and resolve artists (uses cache to avoid re-resolving)
-                # Use asyncio.gather to ensure proper concurrent execution without race conditions
                 resolved_artists = await asyncio.gather(
                     *[self._get_or_resolve_artist(artist_data) for artist_data in top_artists_raw]
                 )
-                # Filter out failed resolutions and take first 10
-                top_artists = [artist for artist in resolved_artists if artist is not None][:10]
+                # Filter out failed resolutions, deduplicate, then take target count
+                all_resolved = [artist for artist in resolved_artists if artist is not None]
+                deduplicated = list(UniqueList(all_resolved))[:TARGET_ITEM_COUNT]
+                top_artists = UniqueList(deduplicated)
 
-                if len(top_artists) < 10:
+                if len(top_artists) < TARGET_ITEM_COUNT:
                     self.logger.info(
-                        "Global Top Artists: only %d/10 items after resolution "
-                        "(requested 15, resolved %d)",
+                        "Global Top Artists: only %d/%d items after resolution "
+                        "(requested %d, resolved %d)",
                         len(top_artists),
+                        TARGET_ITEM_COUNT,
+                        RESOLUTION_BUFFER_SMALL,
                         len([a for a in resolved_artists if a is not None]),
                     )
 
@@ -469,23 +482,26 @@ class LastFMRecommendationManager:
 
         # Global Top Tracks (only if enabled)
         if self.provider.config.get_value("enable_top_tracks"):
-            # Request 15 items to account for resolution failures (target: 10 successful)
-            top_tracks_raw = await self.api.get_chart_top_tracks(limit=15)
+            # Request extra items to account for resolution failures
+            top_tracks_raw = await self.api.get_chart_top_tracks(limit=RESOLUTION_BUFFER_SMALL)
             if top_tracks_raw:
                 # Parse and resolve tracks (uses cache to avoid re-resolving)
-                # Use asyncio.gather to ensure proper concurrent execution without race conditions
                 resolved_tracks = await asyncio.gather(
                     *[self._get_or_resolve_track(track_data) for track_data in top_tracks_raw]
                 )
-                # Filter out failed resolutions and take first 10
-                top_tracks = [track for track in resolved_tracks if track is not None][:10]
+                # Filter out failed resolutions, deduplicate, then take target count
+                all_resolved_tracks = [track for track in resolved_tracks if track is not None]
+                deduplicated_tracks = list(UniqueList(all_resolved_tracks))[:TARGET_ITEM_COUNT]
+                top_tracks = UniqueList(deduplicated_tracks)
 
-                if len(top_tracks) < 10:
+                if len(top_tracks) < TARGET_ITEM_COUNT:
                     self.logger.info(
-                        "Global Top Tracks: only %d/10 items after resolution "
-                        "(requested 15, resolved %d)",
+                        "Global Top Tracks: only %d/%d items after resolution "
+                        "(requested %d, resolved %d)",
                         len(top_tracks),
-                        len([t for t in resolved_tracks if t is not None]),
+                        TARGET_ITEM_COUNT,
+                        RESOLUTION_BUFFER_SMALL,
+                        len(all_resolved_tracks),
                     )
 
                 if top_tracks:
@@ -521,7 +537,7 @@ class LastFMRecommendationManager:
             return folders
 
         # Get user's top tag (most played genre)
-        top_tags = await self.api.get_user_top_tags(username, limit=1)
+        top_tags = await self.api.get_user_top_tags(username, limit=TOP_TAGS_LIMIT)
         if not top_tags:
             return folders
 
@@ -531,8 +547,10 @@ class LastFMRecommendationManager:
 
         # Genre Artists (only if enabled)
         if self.provider.config.get_value("enable_genre_artists"):
-            # Request 30 items to have enough after filtering library items
-            genre_artists_raw = await self.api.get_tag_top_artists(tag_name, limit=30)
+            # Request many items to have enough after filtering library items
+            genre_artists_raw = await self.api.get_tag_top_artists(
+                tag_name, limit=RESOLUTION_BUFFER_LARGE
+            )
             if genre_artists_raw:
                 # Filter out library items using cheap database query (no expensive resolution yet)
                 non_library_artists_raw = [
@@ -541,28 +559,33 @@ class LastFMRecommendationManager:
                     if not await self._is_in_library(artist_data, MediaType.ARTIST)
                 ]
 
-                # Sample 15 items (top 3 + 12 random) to account for resolution failures
+                # Sample items to account for resolution failures
                 sampled_artists_raw = self._sample_items(
-                    non_library_artists_raw, seed_suffix="genre_artists", target_count=15
+                    non_library_artists_raw,
+                    seed_suffix="genre_artists",
+                    target_count=RESOLUTION_BUFFER_SMALL,
                 )
 
                 # Resolve items (expensive MusicBrainz + provider search)
-                # Use asyncio.gather to ensure proper concurrent execution without race conditions
                 resolved_artists = await asyncio.gather(
                     *[
                         self._get_or_resolve_artist(artist_data)
                         for artist_data in sampled_artists_raw
                     ]
                 )
-                # Filter out failed resolutions and take first 10
-                genre_artists = [artist for artist in resolved_artists if artist is not None][:10]
+                # Filter out failed resolutions, deduplicate, then take target count
+                all_resolved = [artist for artist in resolved_artists if artist is not None]
+                deduplicated = list(UniqueList(all_resolved))[:TARGET_ITEM_COUNT]
+                genre_artists = UniqueList(deduplicated)
 
-                if len(genre_artists) < 10:
+                if len(genre_artists) < TARGET_ITEM_COUNT:
                     self.logger.info(
-                        "Genre Artists (%s): only %d/10 items after resolution "
-                        "(requested 15, resolved %d)",
+                        "Genre Artists (%s): only %d/%d items after resolution "
+                        "(requested %d, resolved %d)",
                         tag_name,
                         len(genre_artists),
+                        TARGET_ITEM_COUNT,
+                        RESOLUTION_BUFFER_SMALL,
                         len([a for a in resolved_artists if a is not None]),
                     )
 
@@ -580,8 +603,10 @@ class LastFMRecommendationManager:
 
         # Genre Albums (only if enabled)
         if self.provider.config.get_value("enable_genre_albums"):
-            # Request 30 items to have enough after filtering library items
-            genre_albums_raw = await self.api.get_tag_top_albums(tag_name, limit=30)
+            # Request many items to have enough after filtering library items
+            genre_albums_raw = await self.api.get_tag_top_albums(
+                tag_name, limit=RESOLUTION_BUFFER_LARGE
+            )
             if genre_albums_raw:
                 # Filter out library items using cheap database query (no expensive resolution yet)
                 non_library_albums_raw = [
@@ -590,26 +615,30 @@ class LastFMRecommendationManager:
                     if not await self._is_in_library(album_data, MediaType.ALBUM)
                 ]
 
-                # Sample 15 items (top 3 + 12 random) to account for resolution failures
+                # Sample items to account for resolution failures
                 sampled_albums_raw = self._sample_items(
-                    non_library_albums_raw, seed_suffix="genre_albums", target_count=15
+                    non_library_albums_raw,
+                    seed_suffix="genre_albums",
+                    target_count=RESOLUTION_BUFFER_SMALL,
                 )
 
                 # Resolve items (expensive MusicBrainz + provider search)
-                # Use asyncio.gather to ensure proper concurrent execution without race conditions
                 resolved_albums = await asyncio.gather(
                     *[self._get_or_resolve_album(album_data) for album_data in sampled_albums_raw]
                 )
-                # Filter out failed resolutions and take first 10
-                genre_albums = [album for album in resolved_albums if album is not None][:10]
+                # Filter out failed resolutions, deduplicate, then take target count
+                all_resolved_albums = [album for album in resolved_albums if album is not None]
+                genre_albums = list(UniqueList(all_resolved_albums))[:TARGET_ITEM_COUNT]
 
-                if len(genre_albums) < 10:
+                if len(genre_albums) < TARGET_ITEM_COUNT:
                     self.logger.info(
-                        "Genre Albums (%s): only %d/10 items after resolution "
-                        "(requested 15, resolved %d)",
+                        "Genre Albums (%s): only %d/%d items after resolution "
+                        "(requested %d, resolved %d)",
                         tag_name,
                         len(genre_albums),
-                        len([a for a in resolved_albums if a is not None]),
+                        TARGET_ITEM_COUNT,
+                        RESOLUTION_BUFFER_SMALL,
+                        len(all_resolved_albums),
                     )
 
                 if genre_albums:
@@ -626,8 +655,10 @@ class LastFMRecommendationManager:
 
         # Genre Tracks (only if enabled)
         if self.provider.config.get_value("enable_genre_tracks"):
-            # Request 30 items to have enough after filtering library items
-            genre_tracks_raw = await self.api.get_tag_top_tracks(tag_name, limit=30)
+            # Request many items to have enough after filtering library items
+            genre_tracks_raw = await self.api.get_tag_top_tracks(
+                tag_name, limit=RESOLUTION_BUFFER_LARGE
+            )
             if genre_tracks_raw:
                 # Filter out library items using cheap database query (no expensive resolution yet)
                 non_library_tracks_raw = [
@@ -636,26 +667,32 @@ class LastFMRecommendationManager:
                     if not await self._is_in_library(track_data, MediaType.TRACK)
                 ]
 
-                # Sample 15 items (top 3 + 12 random) to account for resolution failures
+                # Sample items to account for resolution failures
                 sampled_tracks_raw = self._sample_items(
-                    non_library_tracks_raw, seed_suffix="genre_tracks", target_count=15
+                    non_library_tracks_raw,
+                    seed_suffix="genre_tracks",
+                    target_count=RESOLUTION_BUFFER_SMALL,
                 )
 
                 # Resolve items (expensive MusicBrainz + provider search)
-                # Use asyncio.gather to ensure proper concurrent execution without race conditions
                 resolved_tracks = await asyncio.gather(
                     *[self._get_or_resolve_track(track_data) for track_data in sampled_tracks_raw]
                 )
-                # Filter out failed resolutions and take first 10
-                genre_tracks = [track for track in resolved_tracks if track is not None][:10]
+                # Filter out failed resolutions, deduplicate, then take target count
+                all_resolved_genre_tracks = [
+                    track for track in resolved_tracks if track is not None
+                ]
+                genre_tracks = list(UniqueList(all_resolved_genre_tracks))[:TARGET_ITEM_COUNT]
 
-                if len(genre_tracks) < 10:
+                if len(genre_tracks) < TARGET_ITEM_COUNT:
                     self.logger.info(
-                        "Genre Tracks (%s): only %d/10 items after resolution "
-                        "(requested 15, resolved %d)",
+                        "Genre Tracks (%s): only %d/%d items after resolution "
+                        "(requested %d, resolved %d)",
                         tag_name,
                         len(genre_tracks),
-                        len([t for t in resolved_tracks if t is not None]),
+                        TARGET_ITEM_COUNT,
+                        RESOLUTION_BUFFER_SMALL,
+                        len(all_resolved_genre_tracks),
                     )
 
                 if genre_tracks:
@@ -692,23 +729,27 @@ class LastFMRecommendationManager:
 
         # Geo Top Artists (only if enabled)
         if self.provider.config.get_value("enable_geo_artists"):
-            # Request 15 items to account for resolution failures (target: 10 successful)
-            geo_artists_raw = await self.api.get_geo_top_artists(country, limit=15)
+            # Request extra items to account for resolution failures
+            geo_artists_raw = await self.api.get_geo_top_artists(
+                country, limit=RESOLUTION_BUFFER_SMALL
+            )
             if geo_artists_raw:
                 # Resolve all artists (no library filtering for geographic charts)
-                # Use asyncio.gather to ensure proper concurrent execution without race conditions
                 resolved_artists = await asyncio.gather(
                     *[self._get_or_resolve_artist(artist_data) for artist_data in geo_artists_raw]
                 )
-                # Filter out failed resolutions and take first 10
-                geo_artists = [artist for artist in resolved_artists if artist is not None][:10]
+                # Filter out failed resolutions, deduplicate, then take target count
+                all_resolved = [artist for artist in resolved_artists if artist is not None]
+                geo_artists = list(UniqueList(all_resolved))[:TARGET_ITEM_COUNT]
 
-                if len(geo_artists) < 10:
+                if len(geo_artists) < TARGET_ITEM_COUNT:
                     self.logger.info(
-                        "Geo Top Artists (%s): only %d/10 items after resolution "
-                        "(requested 15, resolved %d)",
+                        "Geo Top Artists (%s): only %d/%d items after resolution "
+                        "(requested %d, resolved %d)",
                         country,
                         len(geo_artists),
+                        TARGET_ITEM_COUNT,
+                        RESOLUTION_BUFFER_SMALL,
                         len([a for a in resolved_artists if a is not None]),
                     )
 
@@ -726,24 +767,28 @@ class LastFMRecommendationManager:
 
         # Geo Top Tracks (only if enabled)
         if self.provider.config.get_value("enable_geo_tracks"):
-            # Request 15 items to account for resolution failures (target: 10 successful)
-            geo_tracks_raw = await self.api.get_geo_top_tracks(country, limit=15)
+            # Request extra items to account for resolution failures
+            geo_tracks_raw = await self.api.get_geo_top_tracks(
+                country, limit=RESOLUTION_BUFFER_SMALL
+            )
             if geo_tracks_raw:
                 # Resolve all tracks (no library filtering for geographic charts)
-                # Use asyncio.gather to ensure proper concurrent execution without race conditions
                 resolved_tracks = await asyncio.gather(
                     *[self._get_or_resolve_track(track_data) for track_data in geo_tracks_raw]
                 )
-                # Filter out failed resolutions and take first 10
-                geo_tracks = [track for track in resolved_tracks if track is not None][:10]
+                # Filter out failed resolutions, deduplicate, then take target count
+                all_resolved_geo_tracks = [track for track in resolved_tracks if track is not None]
+                geo_tracks = list(UniqueList(all_resolved_geo_tracks))[:TARGET_ITEM_COUNT]
 
-                if len(geo_tracks) < 10:
+                if len(geo_tracks) < TARGET_ITEM_COUNT:
                     self.logger.info(
-                        "Geo Top Tracks (%s): only %d/10 items after resolution "
-                        "(requested 15, resolved %d)",
+                        "Geo Top Tracks (%s): only %d/%d items after resolution "
+                        "(requested %d, resolved %d)",
                         country,
                         len(geo_tracks),
-                        len([t for t in resolved_tracks if t is not None]),
+                        TARGET_ITEM_COUNT,
+                        RESOLUTION_BUFFER_SMALL,
+                        len(all_resolved_geo_tracks),
                     )
 
                 if geo_tracks:
@@ -763,11 +808,11 @@ class LastFMRecommendationManager:
     async def _get_similar_artists_from_seeds(self, seed_artists: list[Artist]) -> list[Artist]:
         """Get similar artists based on seed artists.
 
-        For each seed artist, fetches 3 similar artists from Last.fm,
-        deduplicates, resolves to actual provider items, and returns top 12.
+        For each seed artist, fetches similar artists from Last.fm,
+        deduplicates, resolves to actual provider items, and returns results.
 
         :param seed_artists: List of seed artists from user's library.
-        :return: List of up to 12 resolved media items or ItemMappings.
+        :return: List of resolved media items or ItemMappings.
         """
         all_similar: list[dict[str, Any]] = []
 
@@ -779,13 +824,13 @@ class LastFMRecommendationManager:
         }
         seed_names = {seed_artist.name.lower() for seed_artist in seed_artists}
 
-        # Get 3 similar artists for each seed
+        # Get similar artists for each seed
         for seed_artist in seed_artists:
             # Extract MBID if available using get_external_id helper
             mbid = seed_artist.get_external_id(ExternalID.MB_ARTIST)
 
             similar = await self.api.get_similar_artists(
-                artist_name=seed_artist.name, artist_mbid=mbid, limit=3
+                artist_name=seed_artist.name, artist_mbid=mbid, limit=SIMILAR_ITEMS_PER_SEED
             )
             all_similar.extend(similar)
 
@@ -826,9 +871,7 @@ class LastFMRecommendationManager:
         resolved_artists = await asyncio.gather(
             *[
                 self._get_or_resolve_artist(artist_data)
-                for artist_data in unique_similar[
-                    :12
-                ]  # Get 12 to ensure we have 10 after filtering
+                for artist_data in unique_similar[:SIMILAR_ITEMS_BUFFER]
             ]
         )
         result = [artist for artist in resolved_artists if artist is not None]
@@ -846,11 +889,11 @@ class LastFMRecommendationManager:
     async def _get_similar_tracks_from_seeds(self, seed_tracks: list[Track]) -> list[Track]:
         """Get similar tracks based on seed tracks.
 
-        For each seed track, fetches 3 similar tracks from Last.fm,
-        deduplicates, resolves ISRCs via MusicBrainz, and returns top 10.
+        For each seed track, fetches similar tracks from Last.fm,
+        deduplicates, resolves ISRCs via MusicBrainz, and returns results.
 
         :param seed_tracks: List of seed tracks from user's library.
-        :return: List of up to 10 resolved media items or ItemMappings.
+        :return: List of resolved media items or ItemMappings.
         """
         all_similar: list[dict[str, Any]] = []
 
@@ -865,7 +908,7 @@ class LastFMRecommendationManager:
             for seed_track in seed_tracks
         }
 
-        # Get 3 similar tracks for each seed
+        # Get similar tracks for each seed
         for seed_track in seed_tracks:
             # Extract MBID if available using get_external_id helper
             mbid = seed_track.get_external_id(ExternalID.MB_RECORDING)
@@ -877,7 +920,7 @@ class LastFMRecommendationManager:
                 artist_name=artist_name,
                 track_name=seed_track.name,
                 track_mbid=mbid,
-                limit=3,
+                limit=SIMILAR_ITEMS_PER_SEED,
             )
             all_similar.extend(similar)
 
@@ -921,8 +964,8 @@ class LastFMRecommendationManager:
         # Sort by match score (similarity) and take top results
         unique_similar.sort(key=lambda x: float(x.get("match", 0)), reverse=True)
 
-        # Only resolve ISRCs for top 10 tracks (optimization)
-        top_tracks_data = unique_similar[:10]
+        # Only resolve ISRCs for top tracks (optimization)
+        top_tracks_data = unique_similar[:TARGET_ITEM_COUNT]
 
         # Parse and resolve tracks (uses cache to avoid re-resolving)
         # Use asyncio.gather to ensure proper concurrent execution without race conditions
