@@ -126,30 +126,34 @@ class LastFMRecommendationManager:
 
         return False
 
-    def _sample_items(self, items: list[dict[str, Any]], seed_suffix: str) -> list[dict[str, Any]]:
-        """Sample items using 'top 3 + 7 random' strategy.
+    def _sample_items(
+        self, items: list[dict[str, Any]], seed_suffix: str, target_count: int = 10
+    ) -> list[dict[str, Any]]:
+        """Sample items using 'top 3 + random' strategy.
 
-        Takes the top 3 items and 7 random items from the remainder.
+        Takes the top 3 items and random items from the remainder to reach target_count.
         Uses a daily-based random seed for consistency within the day.
 
         :param items: List of items to sample from (already filtered).
         :param seed_suffix: Unique suffix for random seed (to vary between recommendation types).
-        :return: List of sampled items (up to 10).
+        :param target_count: Target number of items to return (default: 10).
+        :return: List of sampled items (up to target_count).
         """
-        if len(items) <= 10:
+        if len(items) <= target_count:
             # Not enough items to sample, return all
             return items
 
         # Take top 3
         top_items = items[:3]
 
-        # Random sample 7 from the rest
+        # Random sample (target_count - 3) from the rest
         remaining = items[3:]
+        random_count = target_count - 3
 
         # Use daily seed for consistency (same results all day, changes daily)
         seed = f"{datetime.datetime.now(tz=datetime.UTC).date().isoformat()}_{seed_suffix}"
         random.seed(seed)
-        random_items = random.sample(remaining, min(7, len(remaining)))
+        random_items = random.sample(remaining, min(random_count, len(remaining)))
 
         return top_items + random_items
 
@@ -424,20 +428,23 @@ class LastFMRecommendationManager:
 
         # Global Top Artists (only if enabled)
         if self.provider.config.get_value("enable_top_artists"):
-            top_artists_raw = await self.api.get_chart_top_artists(limit=10)
+            # Request 15 items to account for resolution failures (target: 10 successful)
+            top_artists_raw = await self.api.get_chart_top_artists(limit=15)
             if top_artists_raw:
                 # Parse and resolve artists (uses cache to avoid re-resolving)
                 # Use asyncio.gather to ensure proper concurrent execution without race conditions
                 resolved_artists = await asyncio.gather(
                     *[self._get_or_resolve_artist(artist_data) for artist_data in top_artists_raw]
                 )
-                top_artists = [artist for artist in resolved_artists if artist is not None]
+                # Filter out failed resolutions and take first 10
+                top_artists = [artist for artist in resolved_artists if artist is not None][:10]
 
-                if len(top_artists) < len(top_artists_raw):
+                if len(top_artists) < 10:
                     self.logger.warning(
-                        "Global Top Artists: only %d/%d resolved successfully",
+                        "Global Top Artists: only %d/10 items after resolution "
+                        "(requested 15, resolved %d)",
                         len(top_artists),
-                        len(top_artists_raw),
+                        len([a for a in resolved_artists if a is not None]),
                     )
 
                 if top_artists:
@@ -454,14 +461,24 @@ class LastFMRecommendationManager:
 
         # Global Top Tracks (only if enabled)
         if self.provider.config.get_value("enable_top_tracks"):
-            top_tracks_raw = await self.api.get_chart_top_tracks(limit=10)
+            # Request 15 items to account for resolution failures (target: 10 successful)
+            top_tracks_raw = await self.api.get_chart_top_tracks(limit=15)
             if top_tracks_raw:
                 # Parse and resolve tracks (uses cache to avoid re-resolving)
                 # Use asyncio.gather to ensure proper concurrent execution without race conditions
                 resolved_tracks = await asyncio.gather(
                     *[self._get_or_resolve_track(track_data) for track_data in top_tracks_raw]
                 )
-                top_tracks = [track for track in resolved_tracks if track is not None]
+                # Filter out failed resolutions and take first 10
+                top_tracks = [track for track in resolved_tracks if track is not None][:10]
+
+                if len(top_tracks) < 10:
+                    self.logger.warning(
+                        "Global Top Tracks: only %d/10 items after resolution "
+                        "(requested 15, resolved %d)",
+                        len(top_tracks),
+                        len([t for t in resolved_tracks if t is not None]),
+                    )
 
                 if top_tracks:
                     folders.append(
@@ -506,7 +523,8 @@ class LastFMRecommendationManager:
 
         # Genre Artists (only if enabled)
         if self.provider.config.get_value("enable_genre_artists"):
-            genre_artists_raw = await self.api.get_tag_top_artists(tag_name, limit=25)
+            # Request 30 items to have enough after filtering library items
+            genre_artists_raw = await self.api.get_tag_top_artists(tag_name, limit=30)
             if genre_artists_raw:
                 # Filter out library items using cheap database query (no expensive resolution yet)
                 non_library_artists_raw = [
@@ -515,12 +533,12 @@ class LastFMRecommendationManager:
                     if not await self._is_in_library(artist_data, MediaType.ARTIST)
                 ]
 
-                # Sample items (top 3 + 7 random)
+                # Sample 15 items (top 3 + 12 random) to account for resolution failures
                 sampled_artists_raw = self._sample_items(
-                    non_library_artists_raw, seed_suffix="genre_artists"
+                    non_library_artists_raw, seed_suffix="genre_artists", target_count=15
                 )
 
-                # Only now resolve the final 10 items (expensive MusicBrainz + provider search)
+                # Resolve items (expensive MusicBrainz + provider search)
                 # Use asyncio.gather to ensure proper concurrent execution without race conditions
                 resolved_artists = await asyncio.gather(
                     *[
@@ -528,7 +546,17 @@ class LastFMRecommendationManager:
                         for artist_data in sampled_artists_raw
                     ]
                 )
-                genre_artists = [artist for artist in resolved_artists if artist is not None]
+                # Filter out failed resolutions and take first 10
+                genre_artists = [artist for artist in resolved_artists if artist is not None][:10]
+
+                if len(genre_artists) < 10:
+                    self.logger.warning(
+                        "Genre Artists (%s): only %d/10 items after resolution "
+                        "(requested 15, resolved %d)",
+                        tag_name,
+                        len(genre_artists),
+                        len([a for a in resolved_artists if a is not None]),
+                    )
 
                 if genre_artists:
                     folders.append(
@@ -544,7 +572,8 @@ class LastFMRecommendationManager:
 
         # Genre Albums (only if enabled)
         if self.provider.config.get_value("enable_genre_albums"):
-            genre_albums_raw = await self.api.get_tag_top_albums(tag_name, limit=25)
+            # Request 30 items to have enough after filtering library items
+            genre_albums_raw = await self.api.get_tag_top_albums(tag_name, limit=30)
             if genre_albums_raw:
                 # Filter out library items using cheap database query (no expensive resolution yet)
                 non_library_albums_raw = [
@@ -553,17 +582,27 @@ class LastFMRecommendationManager:
                     if not await self._is_in_library(album_data, MediaType.ALBUM)
                 ]
 
-                # Sample items (top 3 + 7 random)
+                # Sample 15 items (top 3 + 12 random) to account for resolution failures
                 sampled_albums_raw = self._sample_items(
-                    non_library_albums_raw, seed_suffix="genre_albums"
+                    non_library_albums_raw, seed_suffix="genre_albums", target_count=15
                 )
 
-                # Only now resolve the final 10 items (expensive MusicBrainz + provider search)
+                # Resolve items (expensive MusicBrainz + provider search)
                 # Use asyncio.gather to ensure proper concurrent execution without race conditions
                 resolved_albums = await asyncio.gather(
                     *[self._get_or_resolve_album(album_data) for album_data in sampled_albums_raw]
                 )
-                genre_albums = [album for album in resolved_albums if album is not None]
+                # Filter out failed resolutions and take first 10
+                genre_albums = [album for album in resolved_albums if album is not None][:10]
+
+                if len(genre_albums) < 10:
+                    self.logger.warning(
+                        "Genre Albums (%s): only %d/10 items after resolution "
+                        "(requested 15, resolved %d)",
+                        tag_name,
+                        len(genre_albums),
+                        len([a for a in resolved_albums if a is not None]),
+                    )
 
                 if genre_albums:
                     folders.append(
@@ -579,7 +618,8 @@ class LastFMRecommendationManager:
 
         # Genre Tracks (only if enabled)
         if self.provider.config.get_value("enable_genre_tracks"):
-            genre_tracks_raw = await self.api.get_tag_top_tracks(tag_name, limit=25)
+            # Request 30 items to have enough after filtering library items
+            genre_tracks_raw = await self.api.get_tag_top_tracks(tag_name, limit=30)
             if genre_tracks_raw:
                 # Filter out library items using cheap database query (no expensive resolution yet)
                 non_library_tracks_raw = [
@@ -588,17 +628,27 @@ class LastFMRecommendationManager:
                     if not await self._is_in_library(track_data, MediaType.TRACK)
                 ]
 
-                # Sample items (top 3 + 7 random)
+                # Sample 15 items (top 3 + 12 random) to account for resolution failures
                 sampled_tracks_raw = self._sample_items(
-                    non_library_tracks_raw, seed_suffix="genre_tracks"
+                    non_library_tracks_raw, seed_suffix="genre_tracks", target_count=15
                 )
 
-                # Only now resolve the final 10 items (expensive MusicBrainz + provider search)
+                # Resolve items (expensive MusicBrainz + provider search)
                 # Use asyncio.gather to ensure proper concurrent execution without race conditions
                 resolved_tracks = await asyncio.gather(
                     *[self._get_or_resolve_track(track_data) for track_data in sampled_tracks_raw]
                 )
-                genre_tracks = [track for track in resolved_tracks if track is not None]
+                # Filter out failed resolutions and take first 10
+                genre_tracks = [track for track in resolved_tracks if track is not None][:10]
+
+                if len(genre_tracks) < 10:
+                    self.logger.warning(
+                        "Genre Tracks (%s): only %d/10 items after resolution "
+                        "(requested 15, resolved %d)",
+                        tag_name,
+                        len(genre_tracks),
+                        len([t for t in resolved_tracks if t is not None]),
+                    )
 
                 if genre_tracks:
                     folders.append(
@@ -634,14 +684,25 @@ class LastFMRecommendationManager:
 
         # Geo Top Artists (only if enabled)
         if self.provider.config.get_value("enable_geo_artists"):
-            geo_artists_raw = await self.api.get_geo_top_artists(country, limit=10)
+            # Request 15 items to account for resolution failures (target: 10 successful)
+            geo_artists_raw = await self.api.get_geo_top_artists(country, limit=15)
             if geo_artists_raw:
                 # Resolve all artists (no library filtering for geographic charts)
                 # Use asyncio.gather to ensure proper concurrent execution without race conditions
                 resolved_artists = await asyncio.gather(
                     *[self._get_or_resolve_artist(artist_data) for artist_data in geo_artists_raw]
                 )
-                geo_artists = [artist for artist in resolved_artists if artist is not None]
+                # Filter out failed resolutions and take first 10
+                geo_artists = [artist for artist in resolved_artists if artist is not None][:10]
+
+                if len(geo_artists) < 10:
+                    self.logger.warning(
+                        "Geo Top Artists (%s): only %d/10 items after resolution "
+                        "(requested 15, resolved %d)",
+                        country,
+                        len(geo_artists),
+                        len([a for a in resolved_artists if a is not None]),
+                    )
 
                 if geo_artists:
                     folders.append(
@@ -657,14 +718,25 @@ class LastFMRecommendationManager:
 
         # Geo Top Tracks (only if enabled)
         if self.provider.config.get_value("enable_geo_tracks"):
-            geo_tracks_raw = await self.api.get_geo_top_tracks(country, limit=10)
+            # Request 15 items to account for resolution failures (target: 10 successful)
+            geo_tracks_raw = await self.api.get_geo_top_tracks(country, limit=15)
             if geo_tracks_raw:
                 # Resolve all tracks (no library filtering for geographic charts)
                 # Use asyncio.gather to ensure proper concurrent execution without race conditions
                 resolved_tracks = await asyncio.gather(
                     *[self._get_or_resolve_track(track_data) for track_data in geo_tracks_raw]
                 )
-                geo_tracks = [track for track in resolved_tracks if track is not None]
+                # Filter out failed resolutions and take first 10
+                geo_tracks = [track for track in resolved_tracks if track is not None][:10]
+
+                if len(geo_tracks) < 10:
+                    self.logger.warning(
+                        "Geo Top Tracks (%s): only %d/10 items after resolution "
+                        "(requested 15, resolved %d)",
+                        country,
+                        len(geo_tracks),
+                        len([t for t in resolved_tracks if t is not None]),
+                    )
 
                 if geo_tracks:
                     folders.append(
@@ -701,15 +773,27 @@ class LastFMRecommendationManager:
             )
             all_similar.extend(similar)
 
-        # Deduplicate by MBID or name
-        seen = set()
+        # Deduplicate by both MBID and name to prevent duplicates when
+        # Last.fm returns same artist with/without MBID
+        seen_mbids = set()
+        seen_names = set()
         unique_similar: list[dict[str, Any]] = []
         for artist_data in all_similar:
-            # Use MBID for deduplication if available, otherwise use name
-            unique_key = artist_data.get("mbid") or artist_data.get("name", "").lower()
-            if unique_key and unique_key not in seen:
-                seen.add(unique_key)
-                unique_similar.append(artist_data)
+            mbid = artist_data.get("mbid")
+            name = artist_data.get("name", "").lower()
+
+            # Skip if we've already seen this MBID or name
+            if mbid and mbid in seen_mbids:
+                continue
+            if name and name in seen_names:
+                continue
+
+            # Add to unique list and mark as seen
+            unique_similar.append(artist_data)
+            if mbid:
+                seen_mbids.add(mbid)
+            if name:
+                seen_names.add(name)
 
         # Sort by match score (similarity) and take top results
         unique_similar.sort(key=lambda x: float(x.get("match", 0)), reverse=True)
@@ -763,26 +847,35 @@ class LastFMRecommendationManager:
             )
             all_similar.extend(similar)
 
-        # Deduplicate by MBID or name+artist combination
-        seen = set()
+        # Deduplicate by both MBID and name+artist to prevent duplicates when
+        # Last.fm returns same track with/without MBID
+        seen_mbids = set()
+        seen_names = set()
         unique_similar: list[dict[str, Any]] = []
         for track_data in all_similar:
-            # Use MBID for deduplication if available
-            if mbid := track_data.get("mbid"):
-                unique_key = mbid
-            else:
-                # Fallback to name+artist
-                artist_info = track_data.get("artist", {})
-                if isinstance(artist_info, str):
-                    artist_name = artist_info
-                else:
-                    artist_name = artist_info.get("name", "")
-                track_name = track_data.get("name", "")
-                unique_key = f"{artist_name}_{track_name}".lower()
+            mbid = track_data.get("mbid")
 
-            if unique_key and unique_key not in seen:
-                seen.add(unique_key)
-                unique_similar.append(track_data)
+            # Build name-based key for deduplication
+            artist_info = track_data.get("artist", {})
+            if isinstance(artist_info, str):
+                artist_name = artist_info
+            else:
+                artist_name = artist_info.get("name", "")
+            track_name = track_data.get("name", "")
+            name_key = f"{artist_name}_{track_name}".lower() if artist_name and track_name else ""
+
+            # Skip if we've already seen this MBID or name combination
+            if mbid and mbid in seen_mbids:
+                continue
+            if name_key and name_key in seen_names:
+                continue
+
+            # Add to unique list and mark as seen
+            unique_similar.append(track_data)
+            if mbid:
+                seen_mbids.add(mbid)
+            if name_key:
+                seen_names.add(name_key)
 
         # Sort by match score (similarity) and take top results
         unique_similar.sort(key=lambda x: float(x.get("match", 0)), reverse=True)
