@@ -262,26 +262,12 @@ class LastFMRecommendationsProvider(MusicProvider):
         are populated, so each homepage visit shows more items.
         """
         try:
-            # Wait for streaming providers to become available (up to 30 seconds)
-            for attempt in range(30):
-                streaming_providers = [
-                    p for p in self.mass.music.providers if p.is_streaming_provider
-                ]
-                if streaming_providers:
-                    self.logger.info(
-                        "Found %d streaming provider(s), starting recommendation population",
-                        len(streaming_providers),
-                    )
-                    break
-                if attempt == 0:
-                    self.logger.info(
-                        "Waiting for streaming providers to load before building recommendations..."
-                    )
-                await asyncio.sleep(1)
-            else:
-                self.logger.warning(
-                    "No streaming providers available after 30s, recommendations may be incomplete"
-                )
+            # Wait 20 seconds for other providers (e.g., Spotify) to finish loading
+            # This prevents resolution failures due to no streaming providers being available yet
+            self.logger.info(
+                "Waiting 20 seconds for other providers to load before building recommendations..."
+            )
+            await asyncio.sleep(20)
 
             self.logger.info("Starting background population of recommendations")
             # Fetch and store recommendation folders
