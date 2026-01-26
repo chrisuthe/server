@@ -265,8 +265,8 @@ async def _resolve_item(
     LOGGER.debug("Searching %d providers: %s", len(streaming_providers), ", ".join(provider_names))
 
     # Determine if we should try to match on external IDs
-    # For tracks: only if we have ISRCs (streaming providers don't use MBIDs)
-    # For artists/albums: any external IDs (MBIDs) are fine
+    # For tracks: only if we have ISRCs (streaming providers support ISRC matching)
+    # For artists/albums: streaming providers don't expose MBIDs, so always use name matching
     require_external_id_match = False
     if item_mapping.media_type == MediaType.TRACK:
         # For tracks, only match on external IDs if we have ISRCs
@@ -276,12 +276,9 @@ async def _resolve_item(
             require_external_id_match = True
         else:
             LOGGER.debug("No ISRCs available, accepting any name match")
-    elif item_mapping.external_ids:
-        # For artists/albums, any external IDs (like MBIDs) are good
-        LOGGER.debug("Have external IDs, will prioritize external ID matches")
-        require_external_id_match = True
     else:
-        LOGGER.debug("No external IDs available, accepting any name match")
+        # Artists and albums: streaming providers don't expose MBIDs, use name matching
+        LOGGER.debug("Using name-based matching for %s", item_mapping.media_type.value)
 
     # Search all providers once with smart prioritization
     # This makes only ONE API call per provider (instead of two)
