@@ -123,7 +123,9 @@ async def _search_provider(
                 provider.name,
                 item_mapping.name,
             )
-            search_results = await ctrl.search(item_mapping.name, provider.instance_id, limit=1)
+            # Use limit=2 to work around Spotify API bug where limit=1 returns wrong results
+            # With limit=1, Spotify may return incorrect artists (e.g., Bruno Mars for The Weeknd)
+            search_results = await ctrl.search(item_mapping.name, provider.instance_id, limit=2)
             if not search_results:
                 LOGGER.debug("No search results from %s", provider.name)
                 return None
