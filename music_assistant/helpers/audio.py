@@ -9,7 +9,6 @@ import re
 import struct
 import time
 from collections.abc import AsyncGenerator
-from functools import partial
 from io import BytesIO
 from typing import TYPE_CHECKING, Final, cast
 from urllib.parse import urlparse
@@ -807,9 +806,7 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
     except aiohttp.ClientError:
         # This catches connection errors, parse errors, AND ClientResponseError
         # Try to determine if it's a Shoutcast stream
-        LOGGER.debug(
-            "aiohttp error for %s, checking if legacy Shoutcast stream", url
-        )
+        LOGGER.debug("aiohttp error for %s, checking if legacy Shoutcast stream", url)
         if await _validate_shoutcast_stream(url):
             # Shoutcast stream confirmed - cache and return immediately
             result = (url, StreamType.SHOUTCAST)
@@ -854,9 +851,7 @@ async def _validate_shoutcast_stream(url: str) -> bool:
             path = f"{path}?{parsed.query}"
 
         # Open raw socket connection with timeout
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=10
-        )
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=10)
 
         # Send minimal HTTP request with ICY metadata header
         request = f"GET {path} HTTP/1.1\r\nHost: {host}\r\nIcy-MetaData: 1\r\n\r\n"
@@ -1002,9 +997,7 @@ async def get_shoutcast_stream(
 
     try:
         # Open raw socket connection
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=30
-        )
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=30)
     except TimeoutError as err:
         raise AudioError(f"Timeout connecting to Shoutcast stream {url}") from err
     except (OSError, ConnectionError) as err:
@@ -1013,11 +1006,11 @@ async def get_shoutcast_stream(
     try:
         # Send HTTP request with ICY metadata header
         request = (
-                    f"GET {path} HTTP/1.1\r\n"
-                    f"Host: {host}\r\n"
-                    f"User-Agent: {HTTP_HEADERS['User-Agent']}\r\n"
-                    f"Icy-MetaData: 1\r\n\r\n"
-                )
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"User-Agent: {HTTP_HEADERS['User-Agent']}\r\n"
+            f"Icy-MetaData: 1\r\n\r\n"
+        )
         writer.write(request.encode())
         await writer.drain()
 
