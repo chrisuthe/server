@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import random
 from typing import TYPE_CHECKING, Any, cast
@@ -426,14 +427,11 @@ class LastFMRecommendationManager:
             top_artists_raw = await self.api.get_chart_top_artists(limit=10)
             if top_artists_raw:
                 # Parse and resolve artists (uses cache to avoid re-resolving)
-                top_artists = [
-                    artist
-                    for artist in [
-                        await self._get_or_resolve_artist(artist_data)
-                        for artist_data in top_artists_raw
-                    ]
-                    if artist is not None
-                ]
+                # Use asyncio.gather to ensure proper concurrent execution without race conditions
+                resolved_artists = await asyncio.gather(
+                    *[self._get_or_resolve_artist(artist_data) for artist_data in top_artists_raw]
+                )
+                top_artists = [artist for artist in resolved_artists if artist is not None]
 
                 if top_artists:
                     folders.append(
@@ -452,14 +450,11 @@ class LastFMRecommendationManager:
             top_tracks_raw = await self.api.get_chart_top_tracks(limit=10)
             if top_tracks_raw:
                 # Parse and resolve tracks (uses cache to avoid re-resolving)
-                top_tracks = [
-                    track
-                    for track in [
-                        await self._get_or_resolve_track(track_data)
-                        for track_data in top_tracks_raw
-                    ]
-                    if track is not None
-                ]
+                # Use asyncio.gather to ensure proper concurrent execution without race conditions
+                resolved_tracks = await asyncio.gather(
+                    *[self._get_or_resolve_track(track_data) for track_data in top_tracks_raw]
+                )
+                top_tracks = [track for track in resolved_tracks if track is not None]
 
                 if top_tracks:
                     folders.append(
@@ -519,14 +514,14 @@ class LastFMRecommendationManager:
                 )
 
                 # Only now resolve the final 10 items (expensive MusicBrainz + provider search)
-                genre_artists = [
-                    artist
-                    for artist in [
-                        await self._get_or_resolve_artist(artist_data)
+                # Use asyncio.gather to ensure proper concurrent execution without race conditions
+                resolved_artists = await asyncio.gather(
+                    *[
+                        self._get_or_resolve_artist(artist_data)
                         for artist_data in sampled_artists_raw
                     ]
-                    if artist is not None
-                ]
+                )
+                genre_artists = [artist for artist in resolved_artists if artist is not None]
 
                 if genre_artists:
                     folders.append(
@@ -557,14 +552,11 @@ class LastFMRecommendationManager:
                 )
 
                 # Only now resolve the final 10 items (expensive MusicBrainz + provider search)
-                genre_albums = [
-                    album
-                    for album in [
-                        await self._get_or_resolve_album(album_data)
-                        for album_data in sampled_albums_raw
-                    ]
-                    if album is not None
-                ]
+                # Use asyncio.gather to ensure proper concurrent execution without race conditions
+                resolved_albums = await asyncio.gather(
+                    *[self._get_or_resolve_album(album_data) for album_data in sampled_albums_raw]
+                )
+                genre_albums = [album for album in resolved_albums if album is not None]
 
                 if genre_albums:
                     folders.append(
@@ -595,14 +587,11 @@ class LastFMRecommendationManager:
                 )
 
                 # Only now resolve the final 10 items (expensive MusicBrainz + provider search)
-                genre_tracks = [
-                    track
-                    for track in [
-                        await self._get_or_resolve_track(track_data)
-                        for track_data in sampled_tracks_raw
-                    ]
-                    if track is not None
-                ]
+                # Use asyncio.gather to ensure proper concurrent execution without race conditions
+                resolved_tracks = await asyncio.gather(
+                    *[self._get_or_resolve_track(track_data) for track_data in sampled_tracks_raw]
+                )
+                genre_tracks = [track for track in resolved_tracks if track is not None]
 
                 if genre_tracks:
                     folders.append(
@@ -641,14 +630,11 @@ class LastFMRecommendationManager:
             geo_artists_raw = await self.api.get_geo_top_artists(country, limit=10)
             if geo_artists_raw:
                 # Resolve all artists (no library filtering for geographic charts)
-                geo_artists = [
-                    artist
-                    for artist in [
-                        await self._get_or_resolve_artist(artist_data)
-                        for artist_data in geo_artists_raw
-                    ]
-                    if artist is not None
-                ]
+                # Use asyncio.gather to ensure proper concurrent execution without race conditions
+                resolved_artists = await asyncio.gather(
+                    *[self._get_or_resolve_artist(artist_data) for artist_data in geo_artists_raw]
+                )
+                geo_artists = [artist for artist in resolved_artists if artist is not None]
 
                 if geo_artists:
                     folders.append(
@@ -667,14 +653,11 @@ class LastFMRecommendationManager:
             geo_tracks_raw = await self.api.get_geo_top_tracks(country, limit=10)
             if geo_tracks_raw:
                 # Resolve all tracks (no library filtering for geographic charts)
-                geo_tracks = [
-                    track
-                    for track in [
-                        await self._get_or_resolve_track(track_data)
-                        for track_data in geo_tracks_raw
-                    ]
-                    if track is not None
-                ]
+                # Use asyncio.gather to ensure proper concurrent execution without race conditions
+                resolved_tracks = await asyncio.gather(
+                    *[self._get_or_resolve_track(track_data) for track_data in geo_tracks_raw]
+                )
+                geo_tracks = [track for track in resolved_tracks if track is not None]
 
                 if geo_tracks:
                     folders.append(
@@ -725,16 +708,16 @@ class LastFMRecommendationManager:
         unique_similar.sort(key=lambda x: float(x.get("match", 0)), reverse=True)
 
         # Parse and resolve artists (uses cache to avoid re-resolving)
-        return [
-            artist
-            for artist in [
-                await self._get_or_resolve_artist(artist_data)
+        # Use asyncio.gather to ensure proper concurrent execution without race conditions
+        resolved_artists = await asyncio.gather(
+            *[
+                self._get_or_resolve_artist(artist_data)
                 for artist_data in unique_similar[
                     :12
                 ]  # Get 12 to ensure we have 10 after filtering
             ]
-            if artist is not None
-        ]
+        )
+        return [artist for artist in resolved_artists if artist is not None]
 
     async def _get_similar_tracks_from_seeds(self, seed_tracks: list[Track]) -> list[Track]:
         """Get similar tracks based on seed tracks.
@@ -791,10 +774,8 @@ class LastFMRecommendationManager:
         top_tracks_data = unique_similar[:10]
 
         # Parse and resolve tracks (uses cache to avoid re-resolving)
-        return [
-            track
-            for track in [
-                await self._get_or_resolve_track(track_data) for track_data in top_tracks_data
-            ]
-            if track is not None
-        ]
+        # Use asyncio.gather to ensure proper concurrent execution without race conditions
+        resolved_tracks = await asyncio.gather(
+            *[self._get_or_resolve_track(track_data) for track_data in top_tracks_data]
+        )
+        return [track for track in resolved_tracks if track is not None]
