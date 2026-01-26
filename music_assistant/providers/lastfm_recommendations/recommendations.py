@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import datetime
+import random
 from typing import TYPE_CHECKING, Any, cast
 
-from music_assistant_models.enums import ExternalID
+from music_assistant_models.enums import ExternalID, MediaType
 from music_assistant_models.media_items import (
     Album,
     Artist,
@@ -63,6 +65,92 @@ class LastFMRecommendationManager:
         await self.mass.cache.clear(category_filter=CACHE_CATEGORY_RESOLVED_ITEMS)
 
         self.logger.info("Cleared all recommendation caches (in-memory and persistent)")
+
+    async def _is_in_library(self, item_data: dict[str, Any], media_type: MediaType) -> bool:
+        """Check if an item is already in the library using a cheap database query.
+
+        This avoids expensive MusicBrainz lookups and provider searches for items
+        the user already has.
+
+        :param item_data: Raw Last.fm item data (artist, album, or track dict).
+        :param media_type: Type of media item to check.
+        :return: True if item is in library, False otherwise.
+        """
+        # Try MBID lookup first (most reliable)
+        mbid = item_data.get("mbid")
+        if mbid:
+            # Check if library has this external ID using the appropriate controller
+            if media_type == MediaType.ARTIST:
+                if await self.mass.music.artists.get_library_item_by_external_id(
+                    mbid, ExternalID.MB_ARTIST
+                ):
+                    return True
+            elif media_type == MediaType.ALBUM:
+                if await self.mass.music.albums.get_library_item_by_external_id(
+                    mbid, ExternalID.MB_ALBUM
+                ):
+                    return True
+            elif media_type == MediaType.TRACK:
+                if await self.mass.music.tracks.get_library_item_by_external_id(
+                    mbid, ExternalID.MB_RECORDING
+                ):
+                    return True
+
+        # Fallback to name search (less reliable but catches items without MBID)
+        if media_type == MediaType.ARTIST:
+            name = item_data.get("name", "")
+            if name:
+                artist_results = await self.mass.music.artists.library_items(search=name, limit=1)
+                return len(artist_results) > 0
+
+        elif media_type == MediaType.ALBUM:
+            name = item_data.get("name", "")
+            if name:
+                album_results = await self.mass.music.albums.library_items(search=name, limit=1)
+                return len(album_results) > 0
+
+        elif media_type == MediaType.TRACK:
+            # For tracks, need both track name and artist name
+            artist_info = item_data.get("artist", {})
+            artist_name = (
+                artist_info if isinstance(artist_info, str) else artist_info.get("name", "")
+            )
+            track_name = item_data.get("name", "")
+            if track_name and artist_name:
+                search_query = f"{artist_name} {track_name}"
+                track_results = await self.mass.music.tracks.library_items(
+                    search=search_query, limit=1
+                )
+                return len(track_results) > 0
+
+        return False
+
+    def _sample_items(self, items: list[dict[str, Any]], seed_suffix: str) -> list[dict[str, Any]]:
+        """Sample items using 'top 3 + 7 random' strategy.
+
+        Takes the top 3 items and 7 random items from the remainder.
+        Uses a daily-based random seed for consistency within the day.
+
+        :param items: List of items to sample from (already filtered).
+        :param seed_suffix: Unique suffix for random seed (to vary between recommendation types).
+        :return: List of sampled items (up to 10).
+        """
+        if len(items) <= 10:
+            # Not enough items to sample, return all
+            return items
+
+        # Take top 3
+        top_items = items[:3]
+
+        # Random sample 7 from the rest
+        remaining = items[3:]
+
+        # Use daily seed for consistency (same results all day, changes daily)
+        seed = f"{datetime.datetime.now(tz=datetime.UTC).date().isoformat()}_{seed_suffix}"
+        random.seed(seed)
+        random_items = random.sample(remaining, min(7, len(remaining)))
+
+        return top_items + random_items
 
     async def _get_or_resolve_artist(self, lastfm_artist: dict[str, Any]) -> Artist | None:
         """Get artist from cache or resolve it.
@@ -416,22 +504,29 @@ class LastFMRecommendationManager:
 
         # Genre Artists (only if enabled)
         if self.provider.config.get_value("enable_genre_artists"):
-            genre_artists_raw = await self.api.get_tag_top_artists(tag_name, limit=50)
+            genre_artists_raw = await self.api.get_tag_top_artists(tag_name, limit=25)
             if genre_artists_raw:
-                # Resolve all artists
-                resolved_artists = [
+                # Filter out library items using cheap database query (no expensive resolution yet)
+                non_library_artists_raw = [
+                    artist_data
+                    for artist_data in genre_artists_raw
+                    if not await self._is_in_library(artist_data, MediaType.ARTIST)
+                ]
+
+                # Sample items (top 3 + 7 random)
+                sampled_artists_raw = self._sample_items(
+                    non_library_artists_raw, seed_suffix="genre_artists"
+                )
+
+                # Only now resolve the final 10 items (expensive MusicBrainz + provider search)
+                genre_artists = [
                     artist
                     for artist in [
                         await self._get_or_resolve_artist(artist_data)
-                        for artist_data in genre_artists_raw
+                        for artist_data in sampled_artists_raw
                     ]
                     if artist is not None
                 ]
-
-                # Filter out items already in library
-                genre_artists = [
-                    artist for artist in resolved_artists if artist.provider != "library"
-                ][:10]  # Take first 10 after filtering
 
                 if genre_artists:
                     folders.append(
@@ -447,22 +542,29 @@ class LastFMRecommendationManager:
 
         # Genre Albums (only if enabled)
         if self.provider.config.get_value("enable_genre_albums"):
-            genre_albums_raw = await self.api.get_tag_top_albums(tag_name, limit=50)
+            genre_albums_raw = await self.api.get_tag_top_albums(tag_name, limit=25)
             if genre_albums_raw:
-                # Resolve all albums
-                resolved_albums = [
+                # Filter out library items using cheap database query (no expensive resolution yet)
+                non_library_albums_raw = [
+                    album_data
+                    for album_data in genre_albums_raw
+                    if not await self._is_in_library(album_data, MediaType.ALBUM)
+                ]
+
+                # Sample items (top 3 + 7 random)
+                sampled_albums_raw = self._sample_items(
+                    non_library_albums_raw, seed_suffix="genre_albums"
+                )
+
+                # Only now resolve the final 10 items (expensive MusicBrainz + provider search)
+                genre_albums = [
                     album
                     for album in [
                         await self._get_or_resolve_album(album_data)
-                        for album_data in genre_albums_raw
+                        for album_data in sampled_albums_raw
                     ]
                     if album is not None
                 ]
-
-                # Filter out items already in library
-                genre_albums = [album for album in resolved_albums if album.provider != "library"][
-                    :10
-                ]  # Take first 10 after filtering
 
                 if genre_albums:
                     folders.append(
@@ -478,22 +580,29 @@ class LastFMRecommendationManager:
 
         # Genre Tracks (only if enabled)
         if self.provider.config.get_value("enable_genre_tracks"):
-            genre_tracks_raw = await self.api.get_tag_top_tracks(tag_name, limit=50)
+            genre_tracks_raw = await self.api.get_tag_top_tracks(tag_name, limit=25)
             if genre_tracks_raw:
-                # Resolve all tracks
-                resolved_tracks = [
+                # Filter out library items using cheap database query (no expensive resolution yet)
+                non_library_tracks_raw = [
+                    track_data
+                    for track_data in genre_tracks_raw
+                    if not await self._is_in_library(track_data, MediaType.TRACK)
+                ]
+
+                # Sample items (top 3 + 7 random)
+                sampled_tracks_raw = self._sample_items(
+                    non_library_tracks_raw, seed_suffix="genre_tracks"
+                )
+
+                # Only now resolve the final 10 items (expensive MusicBrainz + provider search)
+                genre_tracks = [
                     track
                     for track in [
                         await self._get_or_resolve_track(track_data)
-                        for track_data in genre_tracks_raw
+                        for track_data in sampled_tracks_raw
                     ]
                     if track is not None
                 ]
-
-                # Filter out items already in library
-                genre_tracks = [track for track in resolved_tracks if track.provider != "library"][
-                    :10
-                ]  # Take first 10 after filtering
 
                 if genre_tracks:
                     folders.append(
@@ -529,10 +638,10 @@ class LastFMRecommendationManager:
 
         # Geo Top Artists (only if enabled)
         if self.provider.config.get_value("enable_geo_artists"):
-            geo_artists_raw = await self.api.get_geo_top_artists(country, limit=50)
+            geo_artists_raw = await self.api.get_geo_top_artists(country, limit=10)
             if geo_artists_raw:
-                # Resolve all artists
-                resolved_artists = [
+                # Resolve all artists (no library filtering for geographic charts)
+                geo_artists = [
                     artist
                     for artist in [
                         await self._get_or_resolve_artist(artist_data)
@@ -540,11 +649,6 @@ class LastFMRecommendationManager:
                     ]
                     if artist is not None
                 ]
-
-                # Filter out items already in library
-                geo_artists = [
-                    artist for artist in resolved_artists if artist.provider != "library"
-                ][:10]  # Take first 10 after filtering
 
                 if geo_artists:
                     folders.append(
@@ -560,10 +664,10 @@ class LastFMRecommendationManager:
 
         # Geo Top Tracks (only if enabled)
         if self.provider.config.get_value("enable_geo_tracks"):
-            geo_tracks_raw = await self.api.get_geo_top_tracks(country, limit=50)
+            geo_tracks_raw = await self.api.get_geo_top_tracks(country, limit=10)
             if geo_tracks_raw:
-                # Resolve all tracks
-                resolved_tracks = [
+                # Resolve all tracks (no library filtering for geographic charts)
+                geo_tracks = [
                     track
                     for track in [
                         await self._get_or_resolve_track(track_data)
@@ -571,11 +675,6 @@ class LastFMRecommendationManager:
                     ]
                     if track is not None
                 ]
-
-                # Filter out items already in library
-                geo_tracks = [track for track in resolved_tracks if track.provider != "library"][
-                    :10
-                ]  # Take first 10 after filtering
 
                 if geo_tracks:
                     folders.append(
