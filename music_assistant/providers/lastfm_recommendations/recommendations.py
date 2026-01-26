@@ -433,6 +433,13 @@ class LastFMRecommendationManager:
                 )
                 top_artists = [artist for artist in resolved_artists if artist is not None]
 
+                if len(top_artists) < len(top_artists_raw):
+                    self.logger.warning(
+                        "Global Top Artists: only %d/%d resolved successfully",
+                        len(top_artists),
+                        len(top_artists_raw),
+                    )
+
                 if top_artists:
                     folders.append(
                         RecommendationFolder(
@@ -717,7 +724,17 @@ class LastFMRecommendationManager:
                 ]  # Get 12 to ensure we have 10 after filtering
             ]
         )
-        return [artist for artist in resolved_artists if artist is not None]
+        result = [artist for artist in resolved_artists if artist is not None]
+
+        if len(result) < len(resolved_artists):
+            self.logger.info(
+                "Similar artists: %d/%d resolved successfully (%d failed)",
+                len(result),
+                len(resolved_artists),
+                len(resolved_artists) - len(result),
+            )
+
+        return result
 
     async def _get_similar_tracks_from_seeds(self, seed_tracks: list[Track]) -> list[Track]:
         """Get similar tracks based on seed tracks.

@@ -21,6 +21,9 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(f"{MASS_LOGGER_NAME}.lastfm_recommendations")
 
+# Semaphore to limit concurrent provider searches (prevents overwhelming Spotify API)
+_SEARCH_SEMAPHORE = asyncio.Semaphore(5)
+
 
 def _has_matching_external_ids(
     item_mapping: ItemMapping, media_item: Artist | Album | Track
@@ -104,35 +107,38 @@ async def _search_provider(
 ) -> Artist | Album | Track | None:
     """Search a single provider for a matching item.
 
+    Uses semaphore to limit concurrent searches and prevent overwhelming provider APIs.
+
     :param ctrl: Controller for the media type.
     :param item_mapping: ItemMapping to search for.
     :param provider: Provider instance to search.
     :return: Matched item or None.
     """
-    try:
-        LOGGER.debug(
-            "Searching %s on %s for: %s",
-            item_mapping.media_type.value,
-            provider.name,
-            item_mapping.name,
-        )
-        search_results = await ctrl.search(item_mapping.name, provider.instance_id, limit=1)
-        if not search_results:
-            LOGGER.debug("No search results from %s", provider.name)
-            return None
+    async with _SEARCH_SEMAPHORE:
+        try:
+            LOGGER.debug(
+                "Searching %s on %s for: %s",
+                item_mapping.media_type.value,
+                provider.name,
+                item_mapping.name,
+            )
+            search_results = await ctrl.search(item_mapping.name, provider.instance_id, limit=1)
+            if not search_results:
+                LOGGER.debug("No search results from %s", provider.name)
+                return None
 
-        result = search_results[0]
-        LOGGER.debug(
-            "Found %s on provider %s: %s",
-            item_mapping.media_type.value,
-            provider.name,
-            result.name,
-        )
-        return result
-    except MusicAssistantError as err:
-        # Expected errors from provider searches (e.g., provider unavailable, timeout, etc.)
-        LOGGER.debug("Provider %s search failed: %s", provider.name, type(err).__name__)
-        return None
+            result = search_results[0]
+            LOGGER.debug(
+                "Found %s on provider %s: %s",
+                item_mapping.media_type.value,
+                provider.name,
+                result.name,
+            )
+            return result
+        except MusicAssistantError as err:
+            # Expected errors from provider searches (e.g., provider unavailable, timeout, etc.)
+            LOGGER.debug("Provider %s search failed: %s", provider.name, type(err).__name__)
+            return None
 
 
 async def _search_providers_concurrent(
@@ -302,8 +308,6 @@ async def parse_artist(
     :param provider_instance: Provider instance ID to skip when searching.
     :return: Resolved Artist object or None if not found.
     """
-    LOGGER.debug("Last.fm artist data: %s", lastfm_artist)
-
     name = lastfm_artist.get("name", "Unknown Artist")
     mbid = lastfm_artist.get("mbid")
 
@@ -352,8 +356,6 @@ async def parse_track(
     :param provider_instance: Provider instance ID to skip when searching.
     :return: Resolved Track object or None if not found.
     """
-    LOGGER.debug("Last.fm track data: %s", lastfm_track)
-
     name = lastfm_track.get("name", "Unknown Track")
     mbid = lastfm_track.get("mbid")
 
@@ -419,8 +421,6 @@ async def parse_album(
     :param provider_instance: Provider instance ID to skip when searching.
     :return: Resolved Album object or None if not found.
     """
-    LOGGER.debug("Last.fm album data: %s", lastfm_album)
-
     name = lastfm_album.get("name", "Unknown Album")
     mbid = lastfm_album.get("mbid")
 
