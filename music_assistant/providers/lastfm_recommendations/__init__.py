@@ -104,6 +104,8 @@ async def get_config_entries(
         provider = mass.get_provider(instance_id)
         if isinstance(provider, LastFMRecommendationsProvider):
             await provider.recommendations_manager.clear_cache()
+            # Trigger re-population after clearing
+            mass.create_task(provider._populate_recommendations())
 
     return (
         ConfigEntry(
@@ -243,13 +245,23 @@ class LastFMRecommendationsProvider(MusicProvider):
         self.mbid_resolver = MBIDResolver(self)
         self.recommendations_manager = LastFMRecommendationManager(self)
 
-        # Initialize empty recommendation folders (will be populated progressively)
-        self._recommendation_folders: list[RecommendationFolder] = []
-        self._recommendations_populated = False
+        # Try to load cached recommendation folders from persistent storage
+        # This prevents losing recommendations on provider reload
+        cache_key = f"recommendation_folders_{self.instance_id}"
+        cached_folders = await self.mass.cache.get(cache_key)
 
-        # Start background task to populate recommendations immediately
-        # API key validation happens during first populate attempt
-        self.mass.create_task(self._populate_recommendations())
+        if cached_folders and isinstance(cached_folders, list):
+            self._recommendation_folders: list[RecommendationFolder] = cached_folders
+            self._recommendations_populated = True
+            self.logger.info("Loaded %d recommendation folders from cache", len(cached_folders))
+        else:
+            # Initialize empty recommendation folders (will be populated progressively)
+            self._recommendation_folders = []
+            self._recommendations_populated = False
+
+            # Start background task to populate recommendations immediately
+            # API key validation happens during first populate attempt
+            self.mass.create_task(self._populate_recommendations())
 
         # Schedule periodic refresh using MA's scheduler
         self._schedule_refresh()
@@ -308,6 +320,14 @@ class LastFMRecommendationsProvider(MusicProvider):
             self.logger.info(
                 "Recommendations fully populated with %d total folders",
                 len(self._recommendation_folders),
+            )
+
+            # Save to persistent cache so recommendations survive provider reloads
+            cache_key = f"recommendation_folders_{self.instance_id}"
+            await self.mass.cache.set(
+                cache_key,
+                self._recommendation_folders,
+                expiration=60 * 60 * 24,  # 24 hours
             )
         except MusicAssistantError as err:
             # Expected MA errors (provider unavailable, database errors, etc.)

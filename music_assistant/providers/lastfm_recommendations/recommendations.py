@@ -62,8 +62,16 @@ class LastFMRecommendationManager:
         # Clear in-memory cache
         self._resolved_cache.clear()
 
-        # Clear persistent cache for this category
+        # Clear persistent cache for resolved items
         await self.mass.cache.clear(category_filter=CACHE_CATEGORY_RESOLVED_ITEMS)
+
+        # Clear cached recommendation folders
+        cache_key = f"recommendation_folders_{self.provider.instance_id}"
+        await self.mass.cache.delete(cache_key)
+
+        # Clear the provider's in-memory folders too
+        self.provider._recommendation_folders.clear()
+        self.provider._recommendations_populated = False
 
         self.logger.info("Cleared all recommendation caches (in-memory and persistent)")
 
