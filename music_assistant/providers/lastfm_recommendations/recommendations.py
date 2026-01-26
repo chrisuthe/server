@@ -440,7 +440,7 @@ class LastFMRecommendationManager:
                 top_artists = [artist for artist in resolved_artists if artist is not None][:10]
 
                 if len(top_artists) < 10:
-                    self.logger.warning(
+                    self.logger.info(
                         "Global Top Artists: only %d/10 items after resolution "
                         "(requested 15, resolved %d)",
                         len(top_artists),
@@ -473,7 +473,7 @@ class LastFMRecommendationManager:
                 top_tracks = [track for track in resolved_tracks if track is not None][:10]
 
                 if len(top_tracks) < 10:
-                    self.logger.warning(
+                    self.logger.info(
                         "Global Top Tracks: only %d/10 items after resolution "
                         "(requested 15, resolved %d)",
                         len(top_tracks),
@@ -550,7 +550,7 @@ class LastFMRecommendationManager:
                 genre_artists = [artist for artist in resolved_artists if artist is not None][:10]
 
                 if len(genre_artists) < 10:
-                    self.logger.warning(
+                    self.logger.info(
                         "Genre Artists (%s): only %d/10 items after resolution "
                         "(requested 15, resolved %d)",
                         tag_name,
@@ -596,7 +596,7 @@ class LastFMRecommendationManager:
                 genre_albums = [album for album in resolved_albums if album is not None][:10]
 
                 if len(genre_albums) < 10:
-                    self.logger.warning(
+                    self.logger.info(
                         "Genre Albums (%s): only %d/10 items after resolution "
                         "(requested 15, resolved %d)",
                         tag_name,
@@ -642,7 +642,7 @@ class LastFMRecommendationManager:
                 genre_tracks = [track for track in resolved_tracks if track is not None][:10]
 
                 if len(genre_tracks) < 10:
-                    self.logger.warning(
+                    self.logger.info(
                         "Genre Tracks (%s): only %d/10 items after resolution "
                         "(requested 15, resolved %d)",
                         tag_name,
@@ -696,7 +696,7 @@ class LastFMRecommendationManager:
                 geo_artists = [artist for artist in resolved_artists if artist is not None][:10]
 
                 if len(geo_artists) < 10:
-                    self.logger.warning(
+                    self.logger.info(
                         "Geo Top Artists (%s): only %d/10 items after resolution "
                         "(requested 15, resolved %d)",
                         country,
@@ -730,7 +730,7 @@ class LastFMRecommendationManager:
                 geo_tracks = [track for track in resolved_tracks if track is not None][:10]
 
                 if len(geo_tracks) < 10:
-                    self.logger.warning(
+                    self.logger.info(
                         "Geo Top Tracks (%s): only %d/10 items after resolution "
                         "(requested 15, resolved %d)",
                         country,
