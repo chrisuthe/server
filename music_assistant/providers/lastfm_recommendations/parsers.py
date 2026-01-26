@@ -180,7 +180,16 @@ async def _search_providers_concurrent(
 
         if not require_external_id_match:
             # No external IDs to match - verify name similarity before accepting
-            if compare_strings(item_mapping.name, result.name, strict=False):
+            names_match = compare_strings(item_mapping.name, result.name, strict=False)
+
+            # For albums/tracks, search name may be "Artist - Title" but result may be "Title"
+            # Try matching without the artist prefix if full name doesn't match
+            if not names_match and " - " in item_mapping.name:
+                # Extract just the title part (everything after the first " - ")
+                title_part = item_mapping.name.split(" - ", 1)[1]
+                names_match = compare_strings(title_part, result.name, strict=False)
+
+            if names_match:
                 LOGGER.debug(
                     "Name match on %s: %s (searched: %s)",
                     result.provider,
@@ -230,13 +239,27 @@ async def _search_providers_concurrent(
                 result.provider,
             )
         elif not fallback_result:
-            # No external IDs to compare - save as fallback
-            LOGGER.debug(
-                "Saving %s from %s as fallback (no external IDs to verify)",
-                result.name,
-                result.provider,
-            )
-            fallback_result = result
+            # No external IDs to compare - save as fallback if name matches
+            names_match = compare_strings(item_mapping.name, result.name, strict=False)
+
+            # For albums/tracks, search name may be "Artist - Title" but result may be "Title"
+            if not names_match and " - " in item_mapping.name:
+                title_part = item_mapping.name.split(" - ", 1)[1]
+                names_match = compare_strings(title_part, result.name, strict=False)
+
+            if names_match:
+                LOGGER.debug(
+                    "Saving %s from %s as fallback (no external IDs to verify)",
+                    result.name,
+                    result.provider,
+                )
+                fallback_result = result
+            else:
+                LOGGER.debug(
+                    "Not saving %s from %s as fallback: name mismatch",
+                    result.name,
+                    result.provider,
+                )
 
     # All providers returned - use fallback if we have one
     if fallback_result:
