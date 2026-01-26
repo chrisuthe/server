@@ -222,7 +222,7 @@ async def get_config_entries(
             ),
             action=CONF_ACTION_CLEAR_CACHE,
             action_label="Clear Cache",
-            category="cache",
+            category="advanced",
             required=False,
         ),
     )
@@ -258,8 +258,8 @@ class LastFMRecommendationsProvider(MusicProvider):
         """Populate recommendation folders in the background.
 
         This runs immediately after initialization, building recommendation
-        folders progressively. The instance variable is updated as folders
-        are populated, so each homepage visit shows more items.
+        folders progressively. Each folder appears as soon as it's populated,
+        allowing the frontend to display results incrementally.
         """
         try:
             # Wait 20 seconds for other providers (e.g., Spotify) to finish loading
@@ -270,11 +270,45 @@ class LastFMRecommendationsProvider(MusicProvider):
             await asyncio.sleep(20)
 
             self.logger.info("Starting background population of recommendations")
-            # Fetch and store recommendation folders
-            folders = await self.recommendations_manager.get_recommendations()
-            self._recommendation_folders = folders
+
+            # Build folders incrementally - each category appears as soon as it's ready
+            # Get personalized recommendations based on user's library
+            personalized_folders = (
+                await self.recommendations_manager._get_personalized_recommendations()
+            )
+            if personalized_folders:
+                self._recommendation_folders.extend(personalized_folders)
+                self.logger.info(
+                    "Added %d personalized recommendation folder(s)", len(personalized_folders)
+                )
+
+            # Get global discovery recommendations
+            global_folders = await self.recommendations_manager._get_global_recommendations()
+            if global_folders:
+                self._recommendation_folders.extend(global_folders)
+                self.logger.info("Added %d global recommendation folder(s)", len(global_folders))
+
+            # Get genre-based recommendations (requires username)
+            genre_folders = await self.recommendations_manager._get_genre_based_recommendations()
+            if genre_folders:
+                self._recommendation_folders.extend(genre_folders)
+                self.logger.info(
+                    "Added %d genre-based recommendation folder(s)", len(genre_folders)
+                )
+
+            # Get geography-based recommendations
+            geo_folders = await self.recommendations_manager._get_geo_based_recommendations()
+            if geo_folders:
+                self._recommendation_folders.extend(geo_folders)
+                self.logger.info(
+                    "Added %d geography-based recommendation folder(s)", len(geo_folders)
+                )
+
             self._recommendations_populated = True
-            self.logger.info("Recommendations populated with %d folders", len(folders))
+            self.logger.info(
+                "Recommendations fully populated with %d total folders",
+                len(self._recommendation_folders),
+            )
         except MusicAssistantError as err:
             # Expected MA errors (provider unavailable, database errors, etc.)
             self.logger.warning("Failed to populate recommendations: %s", err)
