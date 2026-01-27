@@ -559,31 +559,33 @@ Auto-Refill when <5 tracks remain
 
 ## Migration & Rollout Plan
 
-### Phase 1: Foundation
+### Phase 1: Core Local Radio (MVP)
+**Outcome**: Working local radio mode that users can test with their local tracks
+
 - [ ] Implement `LocalRadioService` class
 - [ ] Extract matching logic from `lastfm_recommendations`
 - [ ] Add play history filtering utilities
-- [ ] Unit tests for core components
-
-### Phase 2: Integration
 - [ ] Modify `PlayerQueuesController._get_radio_tracks()`
 - [ ] Implement local radio detection
 - [ ] Add configuration options
-- [ ] Integration tests
-
-### Phase 3: Fallback Strategies
-- [ ] Implement artist-based similarity
-- [ ] Implement album-based similarity
+- [ ] Implement artist-based similarity fallback
+- [ ] Implement album-based similarity fallback
 - [ ] Add weighted fallback chain
+- [ ] Unit tests for core components
+- [ ] Integration tests
 - [ ] Test with various library sizes
 
-### Phase 4: Optimization
+### Phase 2: Optimization
+**Outcome**: Faster radio mode, especially for large libraries
+
 - [ ] Implement similarity cache
 - [ ] Add background cache builder
 - [ ] Optimize database queries
 - [ ] Performance testing & tuning
 
-### Phase 5: Genre Enhancement (Future)
+### Phase 3: Genre Enhancement (Future)
+**Outcome**: Better recommendations using genre intelligence when genre data is available
+
 - [ ] Wait for genre controller implementation
 - [ ] Add genre-based similarity
 - [ ] Implement multi-factor scoring
@@ -686,6 +688,9 @@ This plan provides a comprehensive roadmap for implementing local-only radio mod
 4. **Extensible**: Designed to incorporate genre data when available
 5. **Performant**: Caching and pre-computation minimize latency
 
-The phased approach allows incremental delivery of value while building toward a sophisticated, multi-factor recommendation system. Phase 5 is dependent on genre controller implementation.
+The phased approach delivers working functionality at each stage:
+- **Phase 1** delivers a complete, testable local radio feature
+- **Phase 2** enhances performance for large libraries
+- **Phase 3** adds genre-based intelligence when available
 
 **Key Success Factor**: Quality of Last.fm matching to local library determines recommendation quality. The existing `lastfm_recommendations` provider demonstrates this is achievable.
