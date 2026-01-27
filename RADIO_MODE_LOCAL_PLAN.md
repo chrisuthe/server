@@ -559,25 +559,25 @@ Auto-Refill when <5 tracks remain
 
 ## Migration & Rollout Plan
 
-### Phase 1: Foundation (Week 1-2)
+### Phase 1: Foundation
 - [ ] Implement `LocalRadioService` class
 - [ ] Extract matching logic from `lastfm_recommendations`
 - [ ] Add play history filtering utilities
 - [ ] Unit tests for core components
 
-### Phase 2: Integration (Week 3-4)
+### Phase 2: Integration
 - [ ] Modify `PlayerQueuesController._get_radio_tracks()`
 - [ ] Implement local radio detection
 - [ ] Add configuration options
 - [ ] Integration tests
 
-### Phase 3: Fallback Strategies (Week 5-6)
+### Phase 3: Fallback Strategies
 - [ ] Implement artist-based similarity
 - [ ] Implement album-based similarity
 - [ ] Add weighted fallback chain
 - [ ] Test with various library sizes
 
-### Phase 4: Optimization (Week 7-8)
+### Phase 4: Optimization
 - [ ] Implement similarity cache
 - [ ] Add background cache builder
 - [ ] Optimize database queries
@@ -686,8 +686,6 @@ This plan provides a comprehensive roadmap for implementing local-only radio mod
 4. **Extensible**: Designed to incorporate genre data when available
 5. **Performant**: Caching and pre-computation minimize latency
 
-The phased approach allows incremental delivery of value while building toward a sophisticated, multi-factor recommendation system.
-
-**Estimated Development Time**: 6-8 weeks for Phases 1-4, with Phase 5 dependent on genre controller implementation.
+The phased approach allows incremental delivery of value while building toward a sophisticated, multi-factor recommendation system. Phase 5 is dependent on genre controller implementation.
 
 **Key Success Factor**: Quality of Last.fm matching to local library determines recommendation quality. The existing `lastfm_recommendations` provider demonstrates this is achievable.
