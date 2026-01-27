@@ -500,9 +500,11 @@ async def _resolve_tracks(
 
 ### Phase 3: Enable Consumption of Similarity Data
 
-**Objective**: Make similarity data available to other parts of Music Assistant
+**Objective**: Make similarity data available to other parts of Music Assistant through controller methods
 
-#### 3.1 Add Metadata Controller Methods
+**IMPORTANT**: Controller methods are REQUIRED (moved to Phase 1). All consumers must access similarity data through the metadata controller, never by querying providers directly.
+
+#### 3.1 Add Metadata Controller Methods (REQUIRED)
 
 **File**: `music_assistant/controllers/metadata.py`
 
@@ -526,7 +528,9 @@ async def get_similar_artists(
     """
     all_similar = []
 
-    # Get all providers supporting SIMILAR_ARTISTS
+    # Get all metadata providers supporting SIMILAR_ARTISTS
+    # Note: self.mass.music.providers contains all provider types (music, metadata, player, plugin)
+    # The music controller is the central provider registry in Music Assistant
     providers = [
         prov for prov in self.mass.music.providers
         if isinstance(prov, MetadataProvider)
@@ -582,7 +586,7 @@ async def get_similar_tracks(
 
 **File**: `music_assistant/controllers/player_queues.py`
 
-**Potential usage:**
+**Potential usage (showing correct pattern - always use controller):**
 ```python
 async def _get_radio_tracks(
     self,
@@ -594,7 +598,8 @@ async def _get_radio_tracks(
     # Get base tracks
     base_tracks = await self._get_base_tracks(queue, is_initial_radio_mode)
 
-    # Try to get similar tracks from metadata providers
+    # Get similar tracks from metadata providers via controller (REQUIRED pattern)
+    # NEVER query providers directly - always go through self.mass.metadata
     similar_tracks = []
     for base_track in base_tracks[:5]:  # Use first 5 base tracks
         # Query metadata controller for similar tracks
@@ -868,29 +873,31 @@ async def test_backward_compatibility():
 
 ### 3. Metadata Controller Integration?
 
-**Option A: Add aggregation methods to metadata controller**
+**Option A: Add aggregation methods to metadata controller (REQUIRED)**
 - ✅ Convenient central API
 - ✅ Handles multi-provider scenarios
-- ❌ Adds complexity
-- ❌ May not be needed initially
+- ✅ Follows MA architecture (all provider access through controllers)
+- ✅ Prevents providers from communicating directly
+- ❌ Adds some complexity
 
-**Option B: Let consumers query providers directly**
-- ✅ Simpler implementation
-- ✅ More flexible for consumers
-- ❌ Consumers must handle aggregation
-- ❌ More boilerplate for common use case
+**Option B: Let consumers query providers directly (ARCHITECTURALLY INCORRECT)**
+- ❌ Violates MA architecture - providers must not be accessed directly
+- ❌ Providers should never communicate with each other
+- ❌ All provider access must go through controllers/core
+- ❌ Not allowed in Music Assistant
 
-**Recommendation**: Start with Option B (no controller methods), add Option A if common pattern emerges
+**Recommendation**: **Option A is required**. Music Assistant architecture mandates that all provider access goes through controllers, not directly. Consumers (like radio mode, UI features, etc.) must always call controller methods, which in turn coordinate with providers.
 
 ---
 
 ## Rollout Plan
 
 ### Phase 1: Foundation (No Breaking Changes)
-**Outcome**: New interface exists, Last.fm implements it, everything backward compatible
+**Outcome**: New interface exists, Last.fm implements it, controller methods provide access, everything backward compatible
 
 - [ ] Add `SIMILAR_ARTISTS` and `SIMILAR_TRACKS` to ProviderFeature enum (upstream)
 - [ ] Add `get_similar_artists()` and `get_similar_tracks()` to MetadataProvider base
+- [ ] **Add `get_similar_artists()` and `get_similar_tracks()` to Metadata controller (REQUIRED)**
 - [ ] Change Last.fm base class from MusicProvider to MetadataProvider
 - [ ] Update Last.fm supported features
 - [ ] Implement `get_similar_artists()` in Last.fm provider
@@ -900,15 +907,15 @@ async def test_backward_compatibility():
 - [ ] Keep existing `recommendations()` method as-is
 - [ ] Update manifest type to "metadata"
 - [ ] Unit tests for new methods
+- [ ] Unit tests for controller aggregation
 - [ ] Integration tests for backward compatibility
 - [ ] Documentation updates
 
 ### Phase 2: Adoption (Optional)
-**Outcome**: Other parts of Music Assistant can use similarity data
+**Outcome**: Other parts of Music Assistant use similarity data through controller
 
-- [ ] Add metadata controller aggregation methods (if desired)
-- [ ] Update radio mode to use similarity data (if desired)
-- [ ] Add "Related Artists" UI feature (if desired)
+- [ ] Update radio mode to use similarity data via metadata controller
+- [ ] Add "Related Artists" UI feature using metadata controller
 - [ ] Additional metadata providers implement similarity (if desired)
 
 ### Phase 3: Optimization (Future)
