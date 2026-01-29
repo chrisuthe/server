@@ -740,7 +740,9 @@ def _parse_icy_metadata(meta_data: bytes, streamdetails: StreamDetails) -> None:
         LOGGER.debug("ICY metadata block is empty")
         return
     meta_data = meta_data.rstrip(b"\0")
-    stream_title_re = re.search(rb"StreamTitle='([^']*)';", meta_data)
+    # Match StreamTitle, handling apostrophes in titles by looking for '; pattern
+    # Use non-greedy match .*? to stop at the first '; we encounter
+    stream_title_re = re.search(rb"StreamTitle='(.*?)';", meta_data)
     if not stream_title_re:
         # Log raw metadata to help debug why extraction failed
         LOGGER.debug(
@@ -1094,7 +1096,9 @@ async def get_shoutcast_stream(
 
                 # Parse metadata
                 meta_data = meta_data.rstrip(b"\0")
-                stream_title_re = re.search(rb"StreamTitle='([^']*)';", meta_data)
+                # Match StreamTitle, handling apostrophes in titles by looking for '; pattern
+                # Use non-greedy match .*? to stop at the first '; we encounter
+                stream_title_re = re.search(rb"StreamTitle='(.*?)';", meta_data)
                 if not stream_title_re:
                     LOGGER.log(
                         VERBOSE_LOG_LEVEL,
