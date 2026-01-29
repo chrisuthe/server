@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from json import JSONDecodeError
 from typing import TYPE_CHECKING, Any, cast
 
@@ -84,6 +85,18 @@ CONF_ENABLE_ALBUM_METADATA = "enable_album_metadata"
 CONF_ENABLE_TRACK_METADATA = "enable_track_metadata"
 
 
+def _normalize_string(text: str) -> str:
+    """Normalize string by removing diacritics for fuzzy matching.
+
+    Converts "Blue Öyster Cult" → "Blue Oyster Cult" for matching purposes.
+    Uses Unicode NFD decomposition to separate base characters from combining marks.
+    """
+    # Decompose characters (e.g., Ö → O + combining umlaut)
+    nfd = unicodedata.normalize("NFD", text)
+    # Keep only non-combining characters (removes diacritics)
+    return "".join(char for char in nfd if unicodedata.category(char) != "Mn")
+
+
 async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
 ) -> ProviderInstanceType:
@@ -154,14 +167,15 @@ class AudioDbMetadataProvider(MetadataProvider):
                     return self.__parse_artist(data["artists"][0])
             # if there was no match on mbid, there will certainly be no match by name
             return None
-        # Fallback if no musicbrainzid: lookup by name
-        # Try original name first
+        # Fallback to name-based search when MusicBrainz ID is unavailable
+        # Try original artist name first
         result = await self._get_data("search.php", s=artist.name)
         if result and result.get("artists"):
             for item in result["artists"]:
-                # Handle "The" prefix variations (e.g., "Rolling Stones" vs "The Rolling Stones")
-                artist_name_normalized = artist.name.lower()
-                db_name_normalized = item["strArtist"].lower()
+                # Match with "The" prefix variations and diacritics normalization
+                # Normalize both names: lowercase + remove diacritics (e.g., "Ö" → "O")
+                artist_name_normalized = _normalize_string(artist.name).lower()
+                db_name_normalized = _normalize_string(item["strArtist"]).lower()
 
                 # Try exact match first
                 if artist_name_normalized == db_name_normalized:
@@ -177,16 +191,18 @@ class AudioDbMetadataProvider(MetadataProvider):
                     if artist_name_normalized == db_name_no_the:
                         return self.__parse_artist(item)
 
-        # If no results and name doesn't start with "The", try prepending it
-        # This handles cases like "Doobie Brothers" → "The Doobie Brothers"
+        # Attempt second search with "The" prefix if no initial results found
+        # Handles cases where radio streams omit "The" (e.g., "Doobie Brothers")
         if not artist.name.lower().startswith("the "):
             search_name = f"The {artist.name}"
             result = await self._get_data("search.php", s=search_name)
             if result and result.get("artists"):
                 for item in result["artists"]:
-                    db_name_normalized = item["strArtist"].lower()
+                    # Normalize both names for diacritics matching
+                    search_name_normalized = _normalize_string(search_name).lower()
+                    db_name_normalized = _normalize_string(item["strArtist"]).lower()
                     # Check if this matches with "The" prefix
-                    if search_name.lower() == db_name_normalized:
+                    if search_name_normalized == db_name_normalized:
                         return self.__parse_artist(item)
 
         return None

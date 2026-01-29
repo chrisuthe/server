@@ -700,14 +700,14 @@ async def _get_station_image_url(mass: MusicAssistant, streamdetails: StreamDeta
 def _normalize_radio_artist_name(artist_name: str, log_prefix: str = "") -> str:
     """Normalize artist name from radio stream metadata.
 
-    Handles common formatting issues in radio stream metadata:
+    Internet radio metadata is poorly standardized and often contains formatting issues.
+    This function handles common problems:
     - Replaces underscores with spaces (e.g., "Bon_Jovi" → "Bon Jovi")
     - Swaps "Lastname, Firstname" format ONLY if no "and" or "&" present
       (e.g., "Squier, Billy" → "Billy Squier")
     - Preserves group names (e.g., "Crosby, Stills and Nash" stays as-is)
 
-    TODO: This normalization is currently only used for metadata lookup.
-    Consider also using it for frontend display to improve UX and search functionality.
+    Used for both frontend display (better UX, improved search) and metadata lookup.
 
     :param artist_name: Raw artist name from stream metadata.
     :param log_prefix: Optional prefix for log messages.
@@ -716,7 +716,7 @@ def _normalize_radio_artist_name(artist_name: str, log_prefix: str = "") -> str:
     normalized = artist_name.replace("_", " ")
 
     # Handle "Lastname, Firstname" format (e.g., "Squier, Billy" → "Billy Squier")
-    # BUT only if there's no "and" or "&" in the name (to preserve "Crosby, Stills and Nash")
+    # Only swap if no "and" or "&" present to preserve group names like "Crosby, Stills and Nash"
     if "," in normalized:
         # Check if "and" or "&" is present (case-insensitive)
         has_and = " and " in normalized.lower() or " & " in normalized
@@ -757,9 +757,9 @@ async def _fetch_artist_artwork_for_radio_stream(
     # Normalize artist name for metadata lookup
     artist_name_normalized = _normalize_radio_artist_name(artist_name_raw, log_prefix)
 
-    # Handle slash separator with spaces (e.g., "Rose Gray / Shygirl")
-    # Split on " / " (with spaces) to preserve artists like "AC/DC"
-    # Safe for radio: artist names with " / " are rare vs collaborations
+    # Extract primary artist from collaborations (e.g., "Rose Gray / Shygirl" → "Rose Gray")
+    # Split on " / " (with spaces) to preserve artists like "AC/DC" who use "/" without spaces
+    # This is safe for radio streams where " / " typically indicates collaborations
     if " / " in artist_name_normalized:
         artist_name = artist_name_normalized.split(" / ")[0].strip()
     else:
@@ -782,25 +782,52 @@ async def _fetch_artist_artwork_for_radio_stream(
         )
         image_url = station_image_url
     else:
-        # Check cache first (use lowercase artist name as key for case-insensitive matching)
-        cache_key = artist_name.lower()
-        cached_result = await mass.cache.get(
-            key=cache_key,
-            provider=CACHE_PROVIDER,
-            category=CACHE_CATEGORY_RADIO_ARTIST_ARTWORK,
-        )
+        # Check if artist exists in library to determine caching strategy
+        # Library artists are never cached to ensure users see image updates immediately
+        library_artists = await mass.music.artists.search(artist_name, "library", limit=1)
+        has_library_match = False
+        if library_artists:
+            # Perform quick name matching (full matching happens in metadata lookup)
+            for lib_artist in library_artists:
+                artist_normalized = artist_name.lower()
+                lib_normalized = lib_artist.name.lower()
+                if (
+                    artist_normalized == lib_normalized
+                    or (
+                        artist_normalized.startswith("the ")
+                        and artist_normalized[4:] == lib_normalized
+                    )
+                    or (
+                        lib_normalized.startswith("the ")
+                        and artist_normalized == lib_normalized[4:]
+                    )
+                ):
+                    has_library_match = True
+                    break
 
-        if cached_result is not None:
-            # Cache hit - use cached image URL (or None if previously not found)
-            image_url = cached_result if cached_result != "" else None
-            LOGGER.debug(
-                "%s metadata: Using cached result for '%s': %s",
-                log_prefix,
-                artist_name,
-                image_url if image_url else "no artwork",
+        # Check cache only if artist is NOT in library
+        cache_key = artist_name.lower()
+        use_cached = False
+        if not has_library_match:
+            cached_result = await mass.cache.get(
+                key=cache_key,
+                provider=CACHE_PROVIDER,
+                category=CACHE_CATEGORY_RADIO_ARTIST_ARTWORK,
             )
-        else:
-            # Cache miss - fetch from metadata providers
+
+            if cached_result is not None:
+                # Cache hit - use cached image URL (or None if previously not found)
+                image_url = cached_result if cached_result != "" else None
+                use_cached = True
+                LOGGER.debug(
+                    "%s metadata: Using cached result for '%s': %s",
+                    log_prefix,
+                    artist_name,
+                    image_url if image_url else "no artwork",
+                )
+
+        # Fetch from metadata providers if not using cache
+        if not use_cached:
             LOGGER.debug(
                 "%s stream artist lookup: '%s' (from '%s')",
                 log_prefix,
@@ -809,16 +836,20 @@ async def _fetch_artist_artwork_for_radio_stream(
             )
 
             try:
-                if metadata := await mass.metadata.get_artist_metadata_by_name(artist_name):
-                    if metadata.images:
-                        # Use artist artwork
-                        image_url = metadata.images[0].path
-                        LOGGER.debug(
-                            "%s metadata: Artist artwork found: %s",
-                            log_prefix,
-                            image_url,
-                        )
-                        # Cache successful result for 90 days
+                metadata = await mass.metadata.get_artist_metadata_by_name(artist_name)
+                if metadata and metadata.images:
+                    # Successfully retrieved artist artwork
+                    image_url = metadata.images[0].path
+                    LOGGER.debug(
+                        "%s metadata: Artist artwork found: %s",
+                        log_prefix,
+                        image_url,
+                    )
+                    # Only cache external provider results (not library images)
+                    # Library images contain "imageproxy" in the URL and are already fast to fetch
+                    # External provider images (e.g., TheAudioDB, fanart.tv) benefit from caching
+                    is_library_image = "imageproxy" in image_url
+                    if not is_library_image:
                         await mass.cache.set(
                             key=cache_key,
                             data=image_url,
@@ -826,27 +857,13 @@ async def _fetch_artist_artwork_for_radio_stream(
                             provider=CACHE_PROVIDER,
                             category=CACHE_CATEGORY_RADIO_ARTIST_ARTWORK,
                         )
-                    else:
-                        LOGGER.debug(
-                            "%s metadata: Artist metadata found but no images for '%s'",
-                            log_prefix,
-                            artist_name,
-                        )
-                        # Cache negative result (empty string) for 7 days
-                        await mass.cache.set(
-                            key=cache_key,
-                            data="",
-                            expiration=CACHE_EXPIRATION_ARTIST_ARTWORK_MISS,
-                            provider=CACHE_PROVIDER,
-                            category=CACHE_CATEGORY_RADIO_ARTIST_ARTWORK,
-                        )
                 else:
+                    # No artwork found - cache negative result to avoid repeated lookups
                     LOGGER.debug(
-                        "%s metadata: No artist metadata found for '%s'",
+                        "%s metadata: No artist artwork found for '%s'",
                         log_prefix,
                         artist_name,
                     )
-                    # Cache negative result (empty string) for 7 days
                     await mass.cache.set(
                         key=cache_key,
                         data="",
@@ -1001,12 +1018,23 @@ async def _parse_icy_metadata(
         streamdetails.stream_title = cleaned_stream_title
 
         # Try to parse artist and title from "Artist - Title" format
+        # Only support standard " - " (space-dash-space) separator
+        # Single dash format is not supported due to ambiguity with artist names
+        # that contain dashes (e.g., "Jean-Michel Jarre", "Hootie & The Blow-fish")
         if " - " in cleaned_stream_title:
             parts = cleaned_stream_title.split(" - ", 1)
             artist_name_raw = parts[0].strip()
             track_name = parts[1].strip()
 
             if artist_name_raw and track_name:
+                # Normalize artist name for display
+                # Internet radio metadata is poorly standardized with formatting issues like
+                # underscores ("Bon_Jovi") or reversed names ("Squier, Billy").
+                # Normalize for better UX and search functionality.
+                artist_name_display = _normalize_radio_artist_name(
+                    artist_name_raw, log_prefix="ICY"
+                )
+
                 # Fetch artist artwork
                 image_url = await _fetch_artist_artwork_for_radio_stream(
                     mass, artist_name_raw, station_image_url, log_prefix="ICY"
@@ -1015,27 +1043,23 @@ async def _parse_icy_metadata(
                 # Log final image_url decision
                 LOGGER.debug(
                     "ICY metadata: Final image_url for '%s - %s': %s (station_image=%s)",
-                    artist_name_raw,
+                    artist_name_display,
                     track_name,
                     image_url,
                     station_image_url,
                 )
 
                 # Update stream metadata with title, artist, and image
-                # TODO: Consider using normalized artist name for frontend display
-                # Currently shows raw metadata (e.g., "Bon_Jovi, Jon" or "Squier, Billy")
-                # which looks poor in UI and affects search when user clicks the name.
-                # Should we apply _normalize_radio_artist_name() for display too?
                 stream_metadata = StreamMetadata(
                     title=track_name,
-                    artist=artist_name_raw,  # Use original artist string for display
+                    artist=artist_name_display,  # Use normalized artist name for display
                     image_url=image_url,
                 )
                 streamdetails.stream_metadata = stream_metadata
                 streamdetails.stream_metadata_last_updated = time.time()
                 LOGGER.info(
                     "Updated ICY stream metadata: %s - %s (image: %s)",
-                    artist_name_raw,
+                    artist_name_display,
                     track_name,
                     image_url,
                 )
@@ -1478,6 +1502,16 @@ async def _update_hls_radio_metadata(
                         )
                         streamdetails.stream_title = cleaned_title
 
+                        # Normalize artist name for display if present
+                        # Internet radio metadata is poorly standardized with formatting issues
+                        # like underscores ("Bon_Jovi") or reversed names ("Squier, Billy").
+                        # Normalize for better UX and search functionality.
+                        artist_display = (
+                            _normalize_radio_artist_name(artist, log_prefix="HLS")
+                            if artist
+                            else None
+                        )
+
                         # Fetch artist artwork only if no image URL provided by stream
                         if artist and not image_url:
                             image_url = await _fetch_artist_artwork_for_radio_stream(
@@ -1487,26 +1521,22 @@ async def _update_hls_radio_metadata(
                         # Log final image_url decision
                         LOGGER.debug(
                             "HLS metadata: Final image_url for '%s': %s (station_image=%s)",
-                            artist if artist else title,
+                            artist_display if artist_display else title,
                             image_url,
                             station_image_url,
                         )
 
                         # Build StreamMetadata (using stream image, artist image, or station image)
-                        # TODO: Consider using normalized artist name for frontend display
-                        # Currently shows raw metadata (e.g., "Bon_Jovi, Jon" or "Squier, Billy")
-                        # which looks poor in UI and affects search when user clicks the name.
-                        # Should we apply _normalize_radio_artist_name() for display too?
                         stream_metadata = StreamMetadata(
                             title=title if title else cleaned_title,
-                            artist=artist,  # Use original artist string for display
+                            artist=artist_display,  # Use normalized artist name for display
                             image_url=image_url,
                         )
                         streamdetails.stream_metadata = stream_metadata
                         streamdetails.stream_metadata_last_updated = time.time()
                         LOGGER.debug(
                             "Updated HLS stream metadata: %s (image: %s)",
-                            artist,
+                            artist_display,
                             image_url,
                         )
                         # Signal the frontend that the queue has been updated

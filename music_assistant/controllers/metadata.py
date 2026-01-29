@@ -564,16 +564,14 @@ class MetaDataController(CoreController):
         return None, None
 
     async def get_artist_metadata_by_name(self, artist_name: str) -> MediaItemMetadata | None:
-        """
-        Search metadata providers for artist metadata by artist name.
+        """Search metadata providers for artist metadata by artist name.
 
-        Useful for ICY streams and other scenarios where we only have basic text info.
-        Returns metadata with images if found, otherwise None.
+        Searches library first, then queries external metadata providers. Useful for
+        radio streams and other scenarios where only text metadata is available.
 
         :param artist_name: Artist name to search for.
         """
-        # First check if the artist exists in the library
-        # This is faster and respects existing curated data
+        # Check library first - faster and respects user-curated metadata
         try:
             library_artists = await self.mass.music.artists.search(artist_name, "library", limit=5)
             for library_artist in library_artists:
@@ -594,16 +592,15 @@ class MetaDataController(CoreController):
                         matches = True
 
                 if matches:
-                    # Found a match in the library, use their existing metadata
+                    # Found matching artist in library
                     if library_artist.metadata and library_artist.metadata.images:
                         self.logger.debug(
                             "Found artist '%s' in library with %d image(s)",
                             artist_name,
                             len(library_artist.metadata.images),
                         )
-                        # Convert library image paths to full URLs
-                        # Library images have relative paths, convert to imageproxy URLs
-                        # Prioritize THUMB images for radio stream artwork
+                        # Convert relative library paths to full imageproxy URLs
+                        # Prioritize THUMB type images for optimal radio stream display
                         full_url_images: UniqueList[MediaItemImage] = UniqueList()
 
                         # Sort images to put THUMB type first
