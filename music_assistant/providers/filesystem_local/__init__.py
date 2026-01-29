@@ -10,6 +10,7 @@ import os.path
 import time
 import urllib.parse
 from collections.abc import AsyncGenerator, Iterator, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -59,7 +60,6 @@ from music_assistant.constants import (
     VARIOUS_ARTISTS_NAME,
     VERBOSE_LOG_LEVEL,
 )
-from music_assistant.controllers.cache import use_cache
 from music_assistant.helpers.compare import compare_strings, create_safe_string
 from music_assistant.helpers.json import json_loads
 from music_assistant.helpers.playlists import parse_m3u, parse_pls
@@ -703,7 +703,6 @@ class LocalFileSystemProvider(MusicProvider):
             if any(x.provider_instance == self.instance_id for x in track.provider_mappings)
         ]
 
-    @use_cache(3600)  # Cache for 1 hour
     async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
         """Get playlist tracks."""
         result: list[Track] = []
@@ -713,6 +712,23 @@ class LocalFileSystemProvider(MusicProvider):
         if not await self.exists(prov_playlist_id):
             msg = f"Playlist path does not exist: {prov_playlist_id}"
             raise MediaNotFoundError(msg)
+
+        file_item = await self.resolve(prov_playlist_id)
+        # We are using the checksum of the playlist file here to invalidate the cache
+        # when a change has been made to the playlist file (ie track addition/deletion)
+        cache_checksum = file_item.checksum
+
+        cache_key = f"get_playlist_tracks.{prov_playlist_id}"
+        cached_data = await self.mass.cache.get(
+            cache_key,
+            provider=self.instance_id,
+            checksum=cache_checksum,
+            category=0,
+        )
+        if cached_data is not None:
+            if cached_data and isinstance(cached_data[0], dict):
+                return [Track.from_dict(track_dict) for track_dict in cached_data]
+            return cast("list[Track]", cached_data)
 
         _, ext = prov_playlist_id.rsplit(".", 1)
         try:
@@ -744,6 +760,16 @@ class LocalFileSystemProvider(MusicProvider):
                 str(err),
                 exc_info=err if self.logger.isEnabledFor(10) else None,
             )
+
+        await self.mass.cache.set(
+            key=cache_key,
+            data=result,
+            expiration=3600 * 24,  # Cache for 24 hours
+            provider=self.instance_id,
+            checksum=cache_checksum,
+            category=0,
+        )
+
         return result
 
     async def get_podcast_episodes(
@@ -916,6 +942,11 @@ class LocalFileSystemProvider(MusicProvider):
             },
             disc_number=tags.disc or 0,
             track_number=tags.track or 0,
+            date_added=(
+                datetime.fromtimestamp(file_item.created_at, tz=UTC)
+                if file_item.created_at
+                else None
+            ),
         )
 
         if isrc_tags := tags.isrc:
@@ -927,7 +958,11 @@ class LocalFileSystemProvider(MusicProvider):
 
         # album
         album = track.album = (
-            await self._parse_album(track_path=file_item.relative_path, track_tags=tags)
+            await self._parse_album(
+                track_path=file_item.relative_path,
+                track_tags=tags,
+                track_created_at=file_item.created_at,
+            )
             if tags.album
             else None
         )
@@ -1360,8 +1395,15 @@ class LocalFileSystemProvider(MusicProvider):
             )
         return episode
 
-    async def _parse_album(self, track_path: str, track_tags: AudioTags) -> Album:
-        """Parse Album metadata from Track tags."""
+    async def _parse_album(
+        self, track_path: str, track_tags: AudioTags, track_created_at: int | None = None
+    ) -> Album:
+        """Parse Album metadata from Track tags.
+
+        :param track_path: Path to the track file.
+        :param track_tags: Audio tags from the track.
+        :param track_created_at: Creation timestamp of the track file (Unix epoch).
+        """
         assert track_tags.album
         # work out if we have an album and/or disc folder
         # track_dir is the folder level where the tracks are located
@@ -1459,6 +1501,9 @@ class LocalFileSystemProvider(MusicProvider):
                     in_library=True,
                 )
             },
+            date_added=(
+                datetime.fromtimestamp(track_created_at, tz=UTC) if track_created_at else None
+            ),
         )
         if track_tags.barcode:
             album.external_ids.add((ExternalID.BARCODE, track_tags.barcode))

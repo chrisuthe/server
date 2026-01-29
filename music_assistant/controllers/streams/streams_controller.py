@@ -262,6 +262,7 @@ class StreamsController(CoreController):
                 "otherwise audio streaming will not work.",
                 required=False,
                 category="advanced",
+                requires_reload=True,
             ),
             ConfigEntry(
                 key=CONF_BIND_PORT,
@@ -272,6 +273,7 @@ class StreamsController(CoreController):
                 "Make sure that this server can be reached "
                 "on the given IP and TCP port by players on the local network.",
                 category="advanced",
+                requires_reload=True,
             ),
             ConfigEntry(
                 key=CONF_BIND_IP,
@@ -285,6 +287,7 @@ class StreamsController(CoreController):
                 "not be adjusted in regular setups.",
                 category="advanced",
                 required=False,
+                requires_reload=True,
             ),
             ConfigEntry(
                 key=CONF_SMART_FADES_LOG_LEVEL,
@@ -589,6 +592,8 @@ class StreamsController(CoreController):
         start_queue_item = self.mass.player_queues.get_item(queue_id, start_queue_item_id)
         if not start_queue_item:
             raise web.HTTPNotFound(reason=f"Unknown Queue item: {start_queue_item_id}")
+
+        queue.flow_mode_stream_log = []
 
         # select the highest possible PCM settings for this player
         flow_pcm_format = await self._select_flow_format(queue_player)
