@@ -25,7 +25,12 @@ from music_assistant_models.enums import (
     ProviderFeature,
     ProviderType,
 )
-from music_assistant_models.errors import MediaNotFoundError, ProviderUnavailableError
+from music_assistant_models.errors import (
+    InvalidDataError,
+    MediaNotFoundError,
+    ProviderUnavailableError,
+    ResourceTemporarilyUnavailable,
+)
 from music_assistant_models.helpers import get_global_cache_value
 from music_assistant_models.media_items import (
     Album,
@@ -34,6 +39,7 @@ from music_assistant_models.media_items import (
     BrowseFolder,
     ItemMapping,
     MediaItemImage,
+    MediaItemMetadata,
     MediaItemType,
     Playlist,
     Podcast,
@@ -556,6 +562,133 @@ class MetaDataController(CoreController):
             ):
                 return metadata.lyrics, metadata.lrc_lyrics
         return None, None
+
+    async def get_artist_metadata_by_name(self, artist_name: str) -> MediaItemMetadata | None:
+        """
+        Search metadata providers for artist metadata by artist name.
+
+        Useful for ICY streams and other scenarios where we only have basic text info.
+        Returns metadata with images if found, otherwise None.
+
+        :param artist_name: Artist name to search for.
+        """
+        # First check if the artist exists in the library
+        # This is faster and respects existing curated data
+        try:
+            library_artists = await self.mass.music.artists.search(artist_name, "library", limit=5)
+            for library_artist in library_artists:
+                # Handle "The" prefix variations (e.g., "Rolling Stones" vs "The Rolling Stones")
+                artist_name_normalized = artist_name.lower()
+                lib_name_normalized = library_artist.name.lower()
+
+                matches = False
+                # Try exact match first
+                if artist_name_normalized == lib_name_normalized:
+                    matches = True
+                # Try with "the " prefix added/removed
+                elif artist_name_normalized.startswith("the "):
+                    if artist_name_normalized[4:] == lib_name_normalized:
+                        matches = True
+                elif lib_name_normalized.startswith("the "):
+                    if artist_name_normalized == lib_name_normalized[4:]:
+                        matches = True
+
+                if matches:
+                    # Found a match in the library, use their existing metadata
+                    if library_artist.metadata and library_artist.metadata.images:
+                        self.logger.debug(
+                            "Found artist '%s' in library with %d image(s)",
+                            artist_name,
+                            len(library_artist.metadata.images),
+                        )
+                        # Convert library image paths to full URLs
+                        # Library images have relative paths, convert to imageproxy URLs
+                        full_url_images: UniqueList[MediaItemImage] = UniqueList()
+                        for img in library_artist.metadata.images:
+                            # Get the full imageproxy URL for this library image
+                            full_url = self.get_image_url(img, prefer_proxy=True)
+                            # Create a new MediaItemImage with the full URL
+                            full_url_images.append(
+                                MediaItemImage(
+                                    type=img.type,
+                                    path=full_url,
+                                    provider=img.provider,
+                                    remotely_accessible=True,
+                                )
+                            )
+                        # Return a copy to avoid modifying the cached library item
+                        return MediaItemMetadata(
+                            description=library_artist.metadata.description,
+                            images=full_url_images,
+                            genres=library_artist.metadata.genres,
+                            mood=library_artist.metadata.mood,
+                            style=library_artist.metadata.style,
+                            links=library_artist.metadata.links,
+                            label=library_artist.metadata.label,
+                            copyright=library_artist.metadata.copyright,
+                            lyrics=library_artist.metadata.lyrics,
+                            review=library_artist.metadata.review,
+                        )
+        except InvalidDataError as err:
+            self.logger.debug("Error searching library for artist '%s': %s", artist_name, err)
+
+        # Create a minimal Artist object for metadata provider lookups
+        # NOTE: This temp artist has no MusicBrainz ID, which means providers that
+        # require MBID (like FanartTV) will return None. Only providers with name-based
+        # search support (like TheAudioDB) will return results.
+        # TODO: Consider adding MusicBrainz lookup to get MBID if we implement a proxy
+        # in the future to handle rate limiting, as this would enable FanartTV and other
+        # MBID-based providers but requires an additional API call.
+        temp_artist = Artist(
+            item_id="temp",
+            provider="temp",
+            name=artist_name,
+            provider_mappings=set(),
+        )
+
+        # Query enabled metadata providers
+        for provider in self.providers:
+            if ProviderFeature.ARTIST_METADATA not in provider.supported_features:
+                continue
+
+            try:
+                self.logger.debug(
+                    "Searching %s for artist metadata: %s", provider.name, artist_name
+                )
+                if metadata := await provider.get_artist_metadata(temp_artist):
+                    # Only return if we got images (the main reason for this lookup)
+                    if metadata.images:
+                        self.logger.debug(
+                            "Found %d image(s) for artist '%s' from %s",
+                            len(metadata.images),
+                            artist_name,
+                            provider.name,
+                        )
+                        return metadata
+                    self.logger.debug(
+                        "Got metadata for artist '%s' from %s but no images",
+                        artist_name,
+                        provider.name,
+                    )
+                else:
+                    self.logger.debug(
+                        "No metadata found for artist '%s' from %s",
+                        artist_name,
+                        provider.name,
+                    )
+            except (
+                ProviderUnavailableError,
+                ResourceTemporarilyUnavailable,
+                InvalidDataError,
+            ) as err:
+                self.logger.debug(
+                    "Error getting metadata for artist '%s' from %s: %s",
+                    artist_name,
+                    provider.name,
+                    err,
+                )
+
+        return None
 
     async def _update_artist_metadata(self, artist: Artist, force_refresh: bool = False) -> None:
         """Get/update rich metadata for an artist."""

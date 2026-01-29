@@ -33,9 +33,10 @@ from music_assistant_models.errors import (
     MediaNotFoundError,
     MusicAssistantError,
     ProviderUnavailableError,
+    ResourceTemporarilyUnavailable,
 )
 from music_assistant_models.media_items import AudioFormat
-from music_assistant_models.streamdetails import MultiPartPath
+from music_assistant_models.streamdetails import MultiPartPath, StreamMetadata
 
 from music_assistant.constants import (
     CONF_ENTRY_OUTPUT_LIMITER,
@@ -49,6 +50,7 @@ from music_assistant.constants import (
 )
 from music_assistant.controllers.players.sync_groups import SyncGroupPlayer
 from music_assistant.helpers.json import JSON_DECODE_EXCEPTIONS, json_loads
+from music_assistant.helpers.tags import split_artists
 from music_assistant.helpers.throttle_retry import BYPASS_THROTTLER
 from music_assistant.helpers.util import clean_stream_title, remove_file
 
@@ -77,8 +79,14 @@ HTTP_HEADERS_ICY = {**HTTP_HEADERS, "Icy-MetaData": "1"}
 
 SLOW_PROVIDERS = ("tidal", "ytmusic", "apple_music")
 
+# Phrases in artist names that indicate advertisements (lowercase for case-insensitive matching)
+AD_DETECTION_PHRASES = ("asset link", "asset stop", "advert")
+
 CACHE_CATEGORY_RESOLVED_RADIO_URL: Final[int] = 100
+CACHE_CATEGORY_RADIO_ARTIST_ARTWORK: Final[int] = 101
 CACHE_PROVIDER: Final[str] = "audio"
+CACHE_EXPIRATION_ARTIST_ARTWORK: Final[int] = 86400 * 90  # 90 days
+CACHE_EXPIRATION_ARTIST_ARTWORK_MISS: Final[int] = 86400 * 7  # 7 days for cache misses
 
 
 def align_audio_to_frame_boundary(audio_data: bytes, pcm_format: AudioFormat) -> bytes:
@@ -542,7 +550,7 @@ async def get_media_stream(
         seek_position = 0  # seeking not possible on radio streams
     elif stream_type == StreamType.SHOUTCAST:
         assert isinstance(streamdetails.path, str)  # for type checking
-        audio_source = get_shoutcast_stream(streamdetails.path, streamdetails)
+        audio_source = get_shoutcast_stream(streamdetails.path, streamdetails, mass)
         seek_position = 0  # seeking not possible on radio streams
     elif stream_type == StreamType.HLS:
         assert isinstance(streamdetails.path, str)  # for type checking
@@ -675,6 +683,201 @@ async def get_media_stream(
                 )
 
 
+async def _get_station_image_url(mass: MusicAssistant, streamdetails: StreamDetails) -> str | None:
+    """Get station image URL from queue current item.
+
+    :param mass: MusicAssistant instance.
+    :param streamdetails: StreamDetails with queue_id to lookup.
+    """
+    if streamdetails.queue_id and (queue := mass.player_queues.get(streamdetails.queue_id)):
+        if queue.current_item and queue.current_item.media_item:
+            station_image = queue.current_item.media_item.image
+            if station_image:
+                return station_image.path
+    return None
+
+
+def _normalize_radio_artist_name(artist_name: str, log_prefix: str = "") -> str:
+    """Normalize artist name from radio stream metadata.
+
+    Handles common formatting issues in radio stream metadata:
+    - Replaces underscores with spaces (e.g., "Bon_Jovi" → "Bon Jovi")
+    - Swaps "Lastname, Firstname" format ONLY if no "and" or "&" present
+      (e.g., "Squier, Billy" → "Billy Squier")
+    - Preserves group names (e.g., "Crosby, Stills and Nash" stays as-is)
+
+    TODO: This normalization is currently only used for metadata lookup.
+    Consider also using it for frontend display to improve UX and search functionality.
+
+    :param artist_name: Raw artist name from stream metadata.
+    :param log_prefix: Optional prefix for log messages.
+    """
+    # Replace underscores with spaces
+    normalized = artist_name.replace("_", " ")
+
+    # Handle "Lastname, Firstname" format (e.g., "Squier, Billy" → "Billy Squier")
+    # BUT only if there's no "and" or "&" in the name (to preserve "Crosby, Stills and Nash")
+    if "," in normalized:
+        # Check if "and" or "&" is present (case-insensitive)
+        has_and = " and " in normalized.lower() or " & " in normalized
+        if not has_and:
+            # Split on first comma and swap
+            parts = normalized.split(",", 1)
+            if len(parts) == 2:
+                lastname = parts[0].strip()
+                firstname = parts[1].strip()
+                normalized = f"{firstname} {lastname}"
+                if log_prefix:
+                    LOGGER.debug(
+                        "%s: Swapped artist name format: '%s' → '%s'",
+                        log_prefix,
+                        artist_name,
+                        normalized,
+                    )
+
+    return normalized
+
+
+async def _fetch_artist_artwork_for_radio_stream(
+    mass: MusicAssistant,
+    artist_name_raw: str,
+    station_image_url: str | None,
+    log_prefix: str = "",
+) -> str | None:
+    """Fetch artist artwork for radio stream metadata.
+
+    Handles artist name parsing, advertisement detection, metadata lookup,
+    and fallback to station image. Results are cached to reduce API calls.
+
+    :param mass: MusicAssistant instance for metadata lookup.
+    :param artist_name_raw: Raw artist name from stream metadata.
+    :param station_image_url: Station logo URL to use as fallback.
+    :param log_prefix: Prefix for log messages (e.g., "ICY" or "HLS").
+    """
+    # Normalize artist name for metadata lookup
+    artist_name_normalized = _normalize_radio_artist_name(artist_name_raw, log_prefix)
+
+    # Handle slash separator with spaces (e.g., "Rose Gray / Shygirl")
+    # Split on " / " (with spaces) to preserve artists like "AC/DC"
+    # Safe for radio: artist names with " / " are rare vs collaborations
+    if " / " in artist_name_normalized:
+        artist_name = artist_name_normalized.split(" / ")[0].strip()
+    else:
+        # Handle collaborations (feat., &, etc.)
+        # Extract main artist using split_artists (with extra splitters)
+        artists_tuple = split_artists(artist_name_normalized, allow_extra_splitters=True)
+        artist_name = artists_tuple[0] if artists_tuple else artist_name_normalized
+
+    # Check if this is an advertisement
+    artist_lower = artist_name_raw.lower()
+    is_advertisement = any(phrase in artist_lower for phrase in AD_DETECTION_PHRASES)
+
+    image_url = None
+    if is_advertisement:
+        # For advertisements, use station image (no caching needed)
+        LOGGER.debug(
+            "%s: Advertisement detected: '%s', using station image",
+            log_prefix,
+            artist_name_raw,
+        )
+        image_url = station_image_url
+    else:
+        # Check cache first (use lowercase artist name as key for case-insensitive matching)
+        cache_key = artist_name.lower()
+        cached_result = await mass.cache.get(
+            key=cache_key,
+            provider=CACHE_PROVIDER,
+            category=CACHE_CATEGORY_RADIO_ARTIST_ARTWORK,
+        )
+
+        if cached_result is not None:
+            # Cache hit - use cached image URL (or None if previously not found)
+            image_url = cached_result if cached_result != "" else None
+            LOGGER.debug(
+                "%s metadata: Using cached result for '%s': %s",
+                log_prefix,
+                artist_name,
+                image_url if image_url else "no artwork",
+            )
+        else:
+            # Cache miss - fetch from metadata providers
+            LOGGER.debug(
+                "%s stream artist lookup: '%s' (from '%s')",
+                log_prefix,
+                artist_name,
+                artist_name_raw,
+            )
+
+            try:
+                if metadata := await mass.metadata.get_artist_metadata_by_name(artist_name):
+                    if metadata.images:
+                        # Use artist artwork
+                        image_url = metadata.images[0].path
+                        LOGGER.debug(
+                            "%s metadata: Artist artwork found: %s",
+                            log_prefix,
+                            image_url,
+                        )
+                        # Cache successful result for 90 days
+                        await mass.cache.set(
+                            key=cache_key,
+                            data=image_url,
+                            expiration=CACHE_EXPIRATION_ARTIST_ARTWORK,
+                            provider=CACHE_PROVIDER,
+                            category=CACHE_CATEGORY_RADIO_ARTIST_ARTWORK,
+                        )
+                    else:
+                        LOGGER.debug(
+                            "%s metadata: Artist metadata found but no images for '%s'",
+                            log_prefix,
+                            artist_name,
+                        )
+                        # Cache negative result (empty string) for 7 days
+                        await mass.cache.set(
+                            key=cache_key,
+                            data="",
+                            expiration=CACHE_EXPIRATION_ARTIST_ARTWORK_MISS,
+                            provider=CACHE_PROVIDER,
+                            category=CACHE_CATEGORY_RADIO_ARTIST_ARTWORK,
+                        )
+                else:
+                    LOGGER.debug(
+                        "%s metadata: No artist metadata found for '%s'",
+                        log_prefix,
+                        artist_name,
+                    )
+                    # Cache negative result (empty string) for 7 days
+                    await mass.cache.set(
+                        key=cache_key,
+                        data="",
+                        expiration=CACHE_EXPIRATION_ARTIST_ARTWORK_MISS,
+                        provider=CACHE_PROVIDER,
+                        category=CACHE_CATEGORY_RADIO_ARTIST_ARTWORK,
+                    )
+            except (
+                ProviderUnavailableError,
+                ResourceTemporarilyUnavailable,
+                InvalidDataError,
+            ) as err:
+                LOGGER.debug(
+                    "Error fetching metadata for %s stream '%s': %s",
+                    log_prefix,
+                    artist_name_raw,
+                    err,
+                )
+                # Don't cache errors - allow retry on next request
+
+        # Fall back to station image if no artist artwork found
+        if not image_url and station_image_url:
+            LOGGER.debug(
+                "No artist artwork found, using station image for '%s'",
+                artist_name_raw,
+            )
+            image_url = station_image_url
+
+    return image_url
+
+
 def create_wave_header(
     samplerate: int = 44100, channels: int = 2, bitspersample: int = 16, duration: int | None = None
 ) -> bytes:
@@ -730,22 +933,46 @@ def create_wave_header(
     return file.getvalue()
 
 
-def _parse_icy_metadata(meta_data: bytes, streamdetails: StreamDetails) -> None:
-    """Parse ICY metadata and update streamdetails with stream title.
+async def _parse_icy_metadata(
+    meta_data: bytes, streamdetails: StreamDetails, mass: MusicAssistant
+) -> None:
+    """Parse ICY metadata and update streamdetails with stream title and artwork.
 
     :param meta_data: Raw metadata bytes from ICY stream.
     :param streamdetails: StreamDetails object to update with parsed title.
+    :param mass: MusicAssistant instance for fetching metadata.
     """
     if not meta_data:
         LOGGER.debug("ICY metadata block is empty")
         return
+
+    # Get station image as fallback for when no artist artwork is found
+    station_image_url = await _get_station_image_url(mass, streamdetails)
+    LOGGER.debug("ICY metadata parsing: station_image_url=%s", station_image_url)
+
+    # Strip null bytes and log the result for debugging
+    meta_data_original = meta_data
     meta_data = meta_data.rstrip(b"\0")
-    stream_title_re = re.search(rb"StreamTitle='([^']*)';", meta_data)
+
+    # Check if metadata is now empty after stripping
+    if not meta_data:
+        LOGGER.debug(
+            "ICY metadata block became empty after stripping null bytes (original length: %d)",
+            len(meta_data_original),
+        )
+        return
+
+    # Match StreamTitle, handling apostrophes in titles by looking for '; pattern
+    # Use non-greedy match .*? to stop at the first '; we encounter
+    stream_title_re = re.search(rb"StreamTitle='(.*?)';", meta_data)
     if not stream_title_re:
         # Log raw metadata to help debug why extraction failed
+        decoded = meta_data.decode("utf-8", errors="replace")
         LOGGER.debug(
-            "ICY metadata does not contain StreamTitle field. Raw metadata: %s",
-            meta_data.decode("utf-8", errors="replace")[:200],
+            "ICY metadata does not contain StreamTitle field. Raw metadata (len=%d, repr=%s): %s",
+            len(meta_data),
+            repr(meta_data[:100]),
+            decoded[:200],
         )
         return
 
@@ -765,10 +992,58 @@ def _parse_icy_metadata(meta_data: bytes, streamdetails: StreamDetails) -> None:
         )
         return
 
-    if cleaned_stream_title != streamdetails.stream_title:
+    # Check if track changed
+    track_changed = cleaned_stream_title != streamdetails.stream_title
+
+    if track_changed:
         LOGGER.debug("ICY Radio streamtitle original: %s", stream_title)
         LOGGER.debug("ICY Radio streamtitle cleaned: %s", cleaned_stream_title)
         streamdetails.stream_title = cleaned_stream_title
+
+        # Try to parse artist and title from "Artist - Title" format
+        if " - " in cleaned_stream_title:
+            parts = cleaned_stream_title.split(" - ", 1)
+            artist_name_raw = parts[0].strip()
+            track_name = parts[1].strip()
+
+            if artist_name_raw and track_name:
+                # Fetch artist artwork
+                image_url = await _fetch_artist_artwork_for_radio_stream(
+                    mass, artist_name_raw, station_image_url, log_prefix="ICY"
+                )
+
+                # Log final image_url decision
+                LOGGER.debug(
+                    "ICY metadata: Final image_url for '%s - %s': %s (station_image=%s)",
+                    artist_name_raw,
+                    track_name,
+                    image_url,
+                    station_image_url,
+                )
+
+                # Update stream metadata with title, artist, and image
+                # TODO: Consider using normalized artist name for frontend display
+                # Currently shows raw metadata (e.g., "Bon_Jovi, Jon" or "Squier, Billy")
+                # which looks poor in UI and affects search when user clicks the name.
+                # Should we apply _normalize_radio_artist_name() for display too?
+                stream_metadata = StreamMetadata(
+                    title=track_name,
+                    artist=artist_name_raw,  # Use original artist string for display
+                    image_url=image_url,
+                )
+                streamdetails.stream_metadata = stream_metadata
+                streamdetails.stream_metadata_last_updated = time.time()
+                LOGGER.info(
+                    "Updated ICY stream metadata: %s - %s (image: %s)",
+                    artist_name_raw,
+                    track_name,
+                    image_url,
+                )
+                # Signal the frontend that the queue has been updated
+                # This ensures the UI reflects the new metadata
+                if streamdetails.queue_id:
+                    mass.player_queues.signal_update(streamdetails.queue_id)
+                    LOGGER.debug("Signaled queue update for ICY metadata change")
 
 
 async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, StreamType]:
@@ -923,7 +1198,7 @@ async def get_icy_radio_stream(
                         continue
                     meta_length = ord(meta_byte) * 16
                     meta_data = await resp.content.readexactly(meta_length)
-                    _parse_icy_metadata(meta_data, streamdetails)
+                    await _parse_icy_metadata(meta_data, streamdetails, mass)
                 except asyncio.exceptions.IncompleteReadError:
                     break
     except (aiohttp.ClientError, KeyError, ValueError) as err:
@@ -990,7 +1265,7 @@ async def get_icy_radio_stream(
 
                     meta_length = ord(meta_byte) * 16
                     meta_data = await reader.readexactly(meta_length)
-                    _parse_icy_metadata(meta_data, streamdetails)
+                    await _parse_icy_metadata(meta_data, streamdetails, mass)
 
                 except asyncio.exceptions.IncompleteReadError:
                     break
@@ -1000,7 +1275,7 @@ async def get_icy_radio_stream(
 
 
 async def get_shoutcast_stream(
-    url: str, streamdetails: StreamDetails
+    url: str, streamdetails: StreamDetails, mass: MusicAssistant
 ) -> AsyncGenerator[bytes, None]:
     """Get (radio) audio stream from legacy Shoutcast server using raw socket connection.
 
@@ -1089,48 +1364,8 @@ async def get_shoutcast_stream(
                 meta_length = ord(meta_byte) * 16
                 meta_data = await reader.readexactly(meta_length)
 
-                if not meta_data:
-                    continue
-
-                # Parse metadata
-                meta_data = meta_data.rstrip(b"\0")
-                stream_title_re = re.search(rb"StreamTitle='([^']*)';", meta_data)
-                if not stream_title_re:
-                    LOGGER.log(
-                        VERBOSE_LOG_LEVEL,
-                        "Shoutcast metadata does not contain StreamTitle field. Raw: %s",
-                        meta_data.decode("utf-8", errors="replace")[:200],
-                    )
-                    continue
-
-                try:
-                    stream_title = stream_title_re.group(1).decode("utf-8")
-                except UnicodeDecodeError:
-                    stream_title = stream_title_re.group(1).decode("iso-8859-1", errors="replace")
-
-                cleaned_stream_title = clean_stream_title(stream_title)
-
-                # Log if cleaning resulted in empty string
-                if not cleaned_stream_title:
-                    LOGGER.log(
-                        VERBOSE_LOG_LEVEL,
-                        "Shoutcast streamtitle cleaning resulted in empty string. Original: %s",
-                        stream_title,
-                    )
-                    continue
-
-                if cleaned_stream_title != streamdetails.stream_title:
-                    LOGGER.log(
-                        VERBOSE_LOG_LEVEL,
-                        "Shoutcast streamtitle original: %s",
-                        stream_title,
-                    )
-                    LOGGER.log(
-                        VERBOSE_LOG_LEVEL,
-                        "Shoutcast streamtitle cleaned: %s",
-                        cleaned_stream_title,
-                    )
-                    streamdetails.stream_title = cleaned_stream_title
+                # Use shared ICY metadata parsing (with artwork fetching)
+                await _parse_icy_metadata(meta_data, streamdetails, mass)
 
             except asyncio.exceptions.IncompleteReadError:
                 # End of stream
@@ -1177,6 +1412,10 @@ async def _update_hls_radio_metadata(
     :param streamdetails: StreamDetails object to update with metadata
     :param elapsed_time: Current playback position in seconds (unused for live radio)
     """
+    # Get station image as fallback for when no artist artwork is found
+    station_image_url = await _get_station_image_url(mass, streamdetails)
+    LOGGER.debug("HLS metadata parsing: station_image_url=%s", station_image_url)
+
     try:
         # Get the actual media playlist URL from cache or resolve it
         # We cache the media_playlist_url in streamdetails.data to avoid re-resolving
@@ -1213,6 +1452,10 @@ async def _update_hls_radio_metadata(
                 # Build stream title from title and artist
                 title = metadata.get("title", "")
                 artist = metadata.get("artist", "")
+                # Check for image URL in metadata (some streams provide it)
+                image_url = (
+                    metadata.get("image") or metadata.get("artwork") or metadata.get("cover")
+                )
 
                 if title or artist:
                     # Format as "Artist - Title"
@@ -1234,6 +1477,43 @@ async def _update_hls_radio_metadata(
                             cleaned_title,
                         )
                         streamdetails.stream_title = cleaned_title
+
+                        # Fetch artist artwork only if no image URL provided by stream
+                        if artist and not image_url:
+                            image_url = await _fetch_artist_artwork_for_radio_stream(
+                                mass, artist, station_image_url, log_prefix="HLS"
+                            )
+
+                        # Log final image_url decision
+                        LOGGER.debug(
+                            "HLS metadata: Final image_url for '%s': %s (station_image=%s)",
+                            artist if artist else title,
+                            image_url,
+                            station_image_url,
+                        )
+
+                        # Build StreamMetadata (using stream image, artist image, or station image)
+                        # TODO: Consider using normalized artist name for frontend display
+                        # Currently shows raw metadata (e.g., "Bon_Jovi, Jon" or "Squier, Billy")
+                        # which looks poor in UI and affects search when user clicks the name.
+                        # Should we apply _normalize_radio_artist_name() for display too?
+                        stream_metadata = StreamMetadata(
+                            title=title if title else cleaned_title,
+                            artist=artist,  # Use original artist string for display
+                            image_url=image_url,
+                        )
+                        streamdetails.stream_metadata = stream_metadata
+                        streamdetails.stream_metadata_last_updated = time.time()
+                        LOGGER.debug(
+                            "Updated HLS stream metadata: %s (image: %s)",
+                            artist,
+                            image_url,
+                        )
+                        # Signal the frontend that the queue has been updated
+                        # This ensures the UI reflects the new metadata
+                        if streamdetails.queue_id:
+                            mass.player_queues.signal_update(streamdetails.queue_id)
+                            LOGGER.debug("Signaled queue update for HLS metadata change")
 
                 # Only check the most recent EXTINF
                 break
@@ -1805,7 +2085,7 @@ async def analyze_loudness(
         audio_source = get_icy_radio_stream(mass, streamdetails.path, streamdetails)
     elif stream_type == StreamType.SHOUTCAST:
         assert isinstance(streamdetails.path, str)  # for type checking
-        audio_source = get_shoutcast_stream(streamdetails.path, streamdetails)
+        audio_source = get_shoutcast_stream(streamdetails.path, streamdetails, mass)
     elif stream_type == StreamType.HLS:
         assert isinstance(streamdetails.path, str)  # for type checking
         substream = await get_hls_substream(mass, streamdetails.path)

@@ -147,12 +147,48 @@ class AudioDbMetadataProvider(MetadataProvider):
         """Retrieve metadata for artist on theaudiodb."""
         if not self.config.get_value(CONF_ENABLE_ARTIST_METADATA):
             return None
-        if not artist.mbid:
-            # for 100% accuracy we require the musicbrainz id for all lookups
+        if artist.mbid:
+            # Prefer MusicBrainz ID lookup for 100% accuracy
+            if data := await self._get_data("artist-mb.php", i=artist.mbid):
+                if data.get("artists"):
+                    return self.__parse_artist(data["artists"][0])
+            # if there was no match on mbid, there will certainly be no match by name
             return None
-        if data := await self._get_data("artist-mb.php", i=artist.mbid):
-            if data.get("artists"):
-                return self.__parse_artist(data["artists"][0])
+        # Fallback if no musicbrainzid: lookup by name
+        # Try original name first
+        result = await self._get_data("search.php", s=artist.name)
+        if result and result.get("artists"):
+            for item in result["artists"]:
+                # Handle "The" prefix variations (e.g., "Rolling Stones" vs "The Rolling Stones")
+                artist_name_normalized = artist.name.lower()
+                db_name_normalized = item["strArtist"].lower()
+
+                # Try exact match first
+                if artist_name_normalized == db_name_normalized:
+                    return self.__parse_artist(item)
+
+                # Try with "the " prefix added/removed
+                if artist_name_normalized.startswith("the "):
+                    artist_name_no_the = artist_name_normalized[4:]
+                    if artist_name_no_the == db_name_normalized:
+                        return self.__parse_artist(item)
+                elif db_name_normalized.startswith("the "):
+                    db_name_no_the = db_name_normalized[4:]
+                    if artist_name_normalized == db_name_no_the:
+                        return self.__parse_artist(item)
+
+        # If no results and name doesn't start with "The", try prepending it
+        # This handles cases like "Doobie Brothers" → "The Doobie Brothers"
+        if not artist.name.lower().startswith("the "):
+            search_name = f"The {artist.name}"
+            result = await self._get_data("search.php", s=search_name)
+            if result and result.get("artists"):
+                for item in result["artists"]:
+                    db_name_normalized = item["strArtist"].lower()
+                    # Check if this matches with "The" prefix
+                    if search_name.lower() == db_name_normalized:
+                        return self.__parse_artist(item)
+
         return None
 
     async def get_album_metadata(self, album: Album) -> MediaItemMetadata | None:
