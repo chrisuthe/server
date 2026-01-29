@@ -737,10 +737,16 @@ def _parse_icy_metadata(meta_data: bytes, streamdetails: StreamDetails) -> None:
     :param streamdetails: StreamDetails object to update with parsed title.
     """
     if not meta_data:
+        LOGGER.debug("ICY metadata block is empty")
         return
     meta_data = meta_data.rstrip(b"\0")
     stream_title_re = re.search(rb"StreamTitle='([^']*)';", meta_data)
     if not stream_title_re:
+        # Log raw metadata to help debug why extraction failed
+        LOGGER.debug(
+            "ICY metadata does not contain StreamTitle field. Raw metadata: %s",
+            meta_data.decode("utf-8", errors="replace")[:200],
+        )
         return
 
     try:
@@ -751,6 +757,14 @@ def _parse_icy_metadata(meta_data: bytes, streamdetails: StreamDetails) -> None:
         stream_title = stream_title_re.group(1).decode("iso-8859-1", errors="replace")
 
     cleaned_stream_title = clean_stream_title(stream_title)
+
+    # Log if cleaning resulted in empty string
+    if not cleaned_stream_title:
+        LOGGER.debug(
+            "ICY streamtitle cleaning resulted in empty string. Original: %s", stream_title
+        )
+        return
+
     if cleaned_stream_title != streamdetails.stream_title:
         LOGGER.debug("ICY Radio streamtitle original: %s", stream_title)
         LOGGER.debug("ICY Radio streamtitle cleaned: %s", cleaned_stream_title)
@@ -1082,6 +1096,11 @@ async def get_shoutcast_stream(
                 meta_data = meta_data.rstrip(b"\0")
                 stream_title_re = re.search(rb"StreamTitle='([^']*)';", meta_data)
                 if not stream_title_re:
+                    LOGGER.log(
+                        VERBOSE_LOG_LEVEL,
+                        "Shoutcast metadata does not contain StreamTitle field. Raw: %s",
+                        meta_data.decode("utf-8", errors="replace")[:200],
+                    )
                     continue
 
                 try:
@@ -1090,6 +1109,16 @@ async def get_shoutcast_stream(
                     stream_title = stream_title_re.group(1).decode("iso-8859-1", errors="replace")
 
                 cleaned_stream_title = clean_stream_title(stream_title)
+
+                # Log if cleaning resulted in empty string
+                if not cleaned_stream_title:
+                    LOGGER.log(
+                        VERBOSE_LOG_LEVEL,
+                        "Shoutcast streamtitle cleaning resulted in empty string. Original: %s",
+                        stream_title,
+                    )
+                    continue
+
                 if cleaned_stream_title != streamdetails.stream_title:
                     LOGGER.log(
                         VERBOSE_LOG_LEVEL,
