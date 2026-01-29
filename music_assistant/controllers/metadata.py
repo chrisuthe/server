@@ -603,8 +603,16 @@ class MetaDataController(CoreController):
                         )
                         # Convert library image paths to full URLs
                         # Library images have relative paths, convert to imageproxy URLs
+                        # Prioritize THUMB images for radio stream artwork
                         full_url_images: UniqueList[MediaItemImage] = UniqueList()
-                        for img in library_artist.metadata.images:
+
+                        # Sort images to put THUMB type first
+                        sorted_images = sorted(
+                            library_artist.metadata.images,
+                            key=lambda img: 0 if img.type == ImageType.THUMB else 1,
+                        )
+
+                        for img in sorted_images:
                             # Get the full imageproxy URL for this library image
                             full_url = self.get_image_url(img, prefer_proxy=True)
                             # Create a new MediaItemImage with the full URL
