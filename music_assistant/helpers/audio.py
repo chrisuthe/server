@@ -31,9 +31,10 @@ from music_assistant_models.errors import (
     MediaNotFoundError,
     MusicAssistantError,
     ProviderUnavailableError,
+    ResourceTemporarilyUnavailable,
 )
 from music_assistant_models.media_items import AudioFormat
-from music_assistant_models.streamdetails import MultiPartPath
+from music_assistant_models.streamdetails import MultiPartPath, StreamMetadata
 
 from music_assistant.constants import (
     CONF_ENTRY_OUTPUT_LIMITER,
@@ -47,6 +48,7 @@ from music_assistant.constants import (
 )
 from music_assistant.controllers.players.sync_groups import SyncGroupPlayer
 from music_assistant.helpers.json import JSON_DECODE_EXCEPTIONS, json_loads
+from music_assistant.helpers.tags import split_artists
 from music_assistant.helpers.throttle_retry import BYPASS_THROTTLER
 from music_assistant.helpers.util import clean_stream_title, remove_file
 
@@ -75,8 +77,13 @@ HTTP_HEADERS_ICY = {**HTTP_HEADERS, "Icy-MetaData": "1"}
 
 SLOW_PROVIDERS = ("tidal", "ytmusic", "apple_music")
 
+AD_DETECTION_PHRASES = ("asset link", "asset stop", "advert")
+
 CACHE_CATEGORY_RESOLVED_RADIO_URL: Final[int] = 100
+CACHE_CATEGORY_RADIO_ARTIST_ARTWORK: Final[int] = 101
 CACHE_PROVIDER: Final[str] = "audio"
+CACHE_EXPIRATION_ARTIST_ARTWORK: Final[int] = 86400 * 90
+CACHE_EXPIRATION_ARTIST_ARTWORK_MISS: Final[int] = 86400 * 7
 
 
 def align_audio_to_frame_boundary(audio_data: bytes, pcm_format: AudioFormat) -> bytes:
@@ -791,6 +798,91 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
     return result
 
 
+async def _get_station_image_url(mass: MusicAssistant, streamdetails: StreamDetails) -> str | None:
+    """Get station image URL from queue current item."""
+    if streamdetails.queue_id and (queue := mass.player_queues.get(streamdetails.queue_id)):
+        if queue.current_item and queue.current_item.media_item:
+            if station_image := queue.current_item.media_item.image:
+                return station_image.path
+    return None
+
+
+def _normalize_radio_artist_name(artist_name: str) -> str:
+    """Normalize artist name from radio stream metadata.
+
+    Handles underscores and "Lastname, Firstname" format.
+    """
+    normalized = artist_name.replace("_", " ")
+    if "," in normalized and " and " not in normalized.lower() and " & " not in normalized:
+        parts = normalized.split(",", 1)
+        if len(parts) == 2:
+            normalized = f"{parts[1].strip()} {parts[0].strip()}"
+    return normalized
+
+
+async def _fetch_artist_artwork_for_radio_stream(
+    mass: MusicAssistant,
+    artist_name_raw: str,
+    station_image_url: str | None,
+) -> str | None:
+    """Fetch artist artwork for radio stream, with caching and station image fallback."""
+    artist_name_normalized = _normalize_radio_artist_name(artist_name_raw)
+
+    if " / " in artist_name_normalized:
+        artist_name = artist_name_normalized.split(" / ")[0].strip()
+    else:
+        artists_tuple = split_artists(artist_name_normalized, expected_count=2)
+        artist_name = artists_tuple[0] if artists_tuple else artist_name_normalized
+
+    if any(phrase in artist_name_raw.lower() for phrase in AD_DETECTION_PHRASES):
+        return station_image_url
+
+    artist_name_lower = artist_name.lower()
+    library_artists = await mass.music.artists.search(artist_name, "library", limit=1)
+    has_library_match = any(
+        artist_name_lower
+        in (lib.name.lower(), f"the {lib.name.lower()}", lib.name.lower().removeprefix("the "))
+        for lib in library_artists
+    )
+
+    cache_key = artist_name_lower
+    image_url = None
+
+    if not has_library_match:
+        cached_result = await mass.cache.get(
+            key=cache_key,
+            provider=CACHE_PROVIDER,
+            category=CACHE_CATEGORY_RADIO_ARTIST_ARTWORK,
+        )
+        if cached_result is not None:
+            return cached_result if cached_result != "" else station_image_url
+
+    try:
+        metadata = await mass.metadata.get_artist_metadata_by_name(artist_name)
+        if metadata and metadata.images:
+            image_url = metadata.images[0].path
+            if not has_library_match and "imageproxy" not in image_url:
+                await mass.cache.set(
+                    key=cache_key,
+                    data=image_url,
+                    expiration=CACHE_EXPIRATION_ARTIST_ARTWORK,
+                    provider=CACHE_PROVIDER,
+                    category=CACHE_CATEGORY_RADIO_ARTIST_ARTWORK,
+                )
+        elif not has_library_match:
+            await mass.cache.set(
+                key=cache_key,
+                data="",
+                expiration=CACHE_EXPIRATION_ARTIST_ARTWORK_MISS,
+                provider=CACHE_PROVIDER,
+                category=CACHE_CATEGORY_RADIO_ARTIST_ARTWORK,
+            )
+    except (ProviderUnavailableError, ResourceTemporarilyUnavailable, InvalidDataError):
+        pass
+
+    return image_url or station_image_url
+
+
 async def get_icy_radio_stream(
     mass: MusicAssistant, url: str, streamdetails: StreamDetails
 ) -> AsyncGenerator[bytes, None]:
@@ -825,7 +917,7 @@ async def get_icy_radio_stream(
                 # fallback to iso-8859-1
                 stream_title = stream_title_re.group(1).decode("iso-8859-1", errors="replace")
             cleaned_stream_title = clean_stream_title(stream_title)
-            if cleaned_stream_title != streamdetails.stream_title:
+            if cleaned_stream_title and cleaned_stream_title != streamdetails.stream_title:
                 LOGGER.log(
                     VERBOSE_LOG_LEVEL,
                     "ICY Radio streamtitle original: %s",
@@ -837,6 +929,25 @@ async def get_icy_radio_stream(
                     cleaned_stream_title,
                 )
                 streamdetails.stream_title = cleaned_stream_title
+
+                if " - " in cleaned_stream_title:
+                    parts = cleaned_stream_title.split(" - ", 1)
+                    artist_name_raw = parts[0].strip()
+                    track_name = parts[1].strip()
+
+                    if artist_name_raw and track_name:
+                        station_image_url = await _get_station_image_url(mass, streamdetails)
+                        image_url = await _fetch_artist_artwork_for_radio_stream(
+                            mass, artist_name_raw, station_image_url
+                        )
+                        streamdetails.stream_metadata = StreamMetadata(
+                            title=track_name,
+                            artist=_normalize_radio_artist_name(artist_name_raw),
+                            image_url=image_url,
+                        )
+                        streamdetails.stream_metadata_last_updated = time.time()
+                        if streamdetails.queue_id:
+                            mass.player_queues.signal_update(streamdetails.queue_id)
 
 
 def parse_extinf_metadata(extinf_line: str) -> dict[str, str]:
@@ -911,9 +1022,11 @@ async def _update_hls_radio_metadata(
                 # Build stream title from title and artist
                 title = metadata.get("title", "")
                 artist = metadata.get("artist", "")
+                image_url = (
+                    metadata.get("image") or metadata.get("artwork") or metadata.get("cover")
+                )
 
                 if title or artist:
-                    # Format as "Artist - Title"
                     if artist and title:
                         stream_title = f"{artist} - {title}"
                     elif title:
@@ -921,10 +1034,8 @@ async def _update_hls_radio_metadata(
                     else:
                         stream_title = artist
 
-                    # Clean the stream title
                     cleaned_title = clean_stream_title(stream_title)
 
-                    # Only update if changed
                     if cleaned_title != streamdetails.stream_title and cleaned_title:
                         LOGGER.log(
                             VERBOSE_LOG_LEVEL,
@@ -932,6 +1043,21 @@ async def _update_hls_radio_metadata(
                             cleaned_title,
                         )
                         streamdetails.stream_title = cleaned_title
+
+                        if artist and not image_url:
+                            station_image_url = await _get_station_image_url(mass, streamdetails)
+                            image_url = await _fetch_artist_artwork_for_radio_stream(
+                                mass, artist, station_image_url
+                            )
+
+                        streamdetails.stream_metadata = StreamMetadata(
+                            title=title or cleaned_title,
+                            artist=_normalize_radio_artist_name(artist) if artist else None,
+                            image_url=image_url,
+                        )
+                        streamdetails.stream_metadata_last_updated = time.time()
+                        if streamdetails.queue_id:
+                            mass.player_queues.signal_update(streamdetails.queue_id)
 
                 # Only check the most recent EXTINF
                 break

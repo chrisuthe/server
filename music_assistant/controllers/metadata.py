@@ -25,7 +25,12 @@ from music_assistant_models.enums import (
     ProviderFeature,
     ProviderType,
 )
-from music_assistant_models.errors import MediaNotFoundError, ProviderUnavailableError
+from music_assistant_models.errors import (
+    InvalidDataError,
+    MediaNotFoundError,
+    ProviderUnavailableError,
+    ResourceTemporarilyUnavailable,
+)
 from music_assistant_models.helpers import get_global_cache_value
 from music_assistant_models.media_items import (
     Album,
@@ -34,6 +39,7 @@ from music_assistant_models.media_items import (
     BrowseFolder,
     ItemMapping,
     MediaItemImage,
+    MediaItemMetadata,
     MediaItemType,
     Playlist,
     Podcast,
@@ -556,6 +562,88 @@ class MetaDataController(CoreController):
             ):
                 return metadata.lyrics, metadata.lrc_lyrics
         return None, None
+
+    async def get_artist_metadata_by_name(self, artist_name: str) -> MediaItemMetadata | None:
+        """Search for artist metadata by name.
+
+        Searches library first, then queries external metadata providers.
+
+        :param artist_name: Artist name to search for.
+        """
+        # Check library first
+        try:
+            library_artists = await self.mass.music.artists.search(artist_name, "library", limit=5)
+            for library_artist in library_artists:
+                # Match with "The" prefix variations
+                if not (
+                    compare_strings(artist_name, library_artist.name, strict=False)
+                    or compare_strings(f"The {artist_name}", library_artist.name, strict=False)
+                    or (
+                        library_artist.name.lower().startswith("the ")
+                        and compare_strings(artist_name, library_artist.name[4:], strict=False)
+                    )
+                ):
+                    continue
+
+                if not (library_artist.metadata and library_artist.metadata.images):
+                    continue
+
+                # Convert library paths to full URLs, prioritizing THUMB images
+                full_url_images: UniqueList[MediaItemImage] = UniqueList()
+                sorted_images = sorted(
+                    library_artist.metadata.images,
+                    key=lambda img: 0 if img.type == ImageType.THUMB else 1,
+                )
+                for img in sorted_images:
+                    full_url = self.get_image_url(img, prefer_proxy=True)
+                    full_url_images.append(
+                        MediaItemImage(
+                            type=img.type,
+                            path=full_url,
+                            provider=img.provider,
+                            remotely_accessible=True,
+                        )
+                    )
+                return MediaItemMetadata(
+                    description=library_artist.metadata.description,
+                    images=full_url_images,
+                    genres=library_artist.metadata.genres,
+                    mood=library_artist.metadata.mood,
+                    style=library_artist.metadata.style,
+                    links=library_artist.metadata.links,
+                    label=library_artist.metadata.label,
+                    copyright=library_artist.metadata.copyright,
+                    lyrics=library_artist.metadata.lyrics,
+                    review=library_artist.metadata.review,
+                )
+        except InvalidDataError:
+            pass
+
+        # Query metadata providers (only those supporting name-based search will return results)
+        # NOTE: No MusicBrainz ID available, so MBID-dependent providers like FanartTV won't match.
+        # TODO: Consider adding MusicBrainz lookup if a rate-limiting proxy is implemented.
+        temp_artist = Artist(
+            item_id="temp",
+            provider="temp",
+            name=artist_name,
+            provider_mappings=set(),
+        )
+
+        for provider in self.providers:
+            if ProviderFeature.ARTIST_METADATA not in provider.supported_features:
+                continue
+            try:
+                if metadata := await provider.get_artist_metadata(temp_artist):
+                    if metadata.images:
+                        return metadata
+            except (
+                ProviderUnavailableError,
+                ResourceTemporarilyUnavailable,
+                InvalidDataError,
+            ):
+                pass
+
+        return None
 
     async def _update_artist_metadata(self, artist: Artist, force_refresh: bool = False) -> None:
         """Get/update rich metadata for an artist."""
