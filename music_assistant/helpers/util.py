@@ -88,11 +88,16 @@ VERSION_PARTS = (
     "instrumental",
     "karaoke",
     "remaster",
+    "remastered",
     "versie",
     "unplugged",
     "disco",
     "akoestisch",
     "deluxe",
+    "video",
+    "radio",
+    "extended",
+    "single",
 )
 IGNORE_TITLE_PARTS = (
     # strings that may be stripped off a title part
@@ -112,6 +117,92 @@ WITH_TITLE_WORDS = (
     "you",
     "no",
 )
+
+# Keywords for aggressive search cleaning (includes featuring).
+# Based on genius_lyrics helper pattern, expanded with additional keywords.
+_SEARCH_KEYWORDS = (
+    r"remaster(?:ed)?|anniversary|instrumental|live|edit(?:ion)?|single(?:s)?|"
+    r"stereo|album|radio|version|feat(?:uring)?|ft|mix|bonus|video|extended|"
+    r"acoustic|unplugged|karaoke|deluxe|remix"
+)
+_SEARCH_PAREN_PATTERN = re.compile(
+    rf"[\(\[][^\)\]]*\b({_SEARCH_KEYWORDS})\b[^\)\]]*[\)\]]",
+    re.IGNORECASE,
+)
+_SEARCH_HYPHEN_PATTERN = re.compile(
+    rf"(\s*-\s*(\d{{4}}|{_SEARCH_KEYWORDS}).*)$",
+    re.IGNORECASE,
+)
+
+# Featuring patterns for stripping from titles (not in parentheses).
+# Examples: "Song Feat. Artist" -> "Song", "Song ft. Someone" -> "Song"
+_FEATURING_PATTERNS = (
+    " featuring ",
+    " feat. ",
+    " feat ",
+    " ft. ",
+    " ft ",
+)
+
+# Suffixes to strip for display purposes only (minimal, obvious junk).
+_DISPLAY_SUFFIXES = (
+    "[Lyric Video]",
+    "[Official Video]",
+    "[Music Video]",
+    "[Official Audio]",
+    "(Official Video)",
+    "(Lyric Video)",
+    "(Music Video)",
+    "(Official Audio)",
+)
+
+
+def clean_title_for_search(title: str) -> str:
+    """Remove version info and featuring credits from a song title for search matching.
+
+    Performs aggressive cleaning to maximize search API matching accuracy.
+    Removes parenthetical/bracketed metadata (remastered, live, featuring, etc.),
+    hyphen-separated suffixes, and standalone featuring credits.
+
+    TODO: Refactor genius_lyrics provider to use this function instead of its
+    own clean_song_title helper (providers/genius_lyrics/helpers.py).
+
+    :param title: The song title to clean.
+    """
+    # Strip parentheses/brackets containing keywords (including feat)
+    cleaned = _SEARCH_PAREN_PATTERN.sub("", title)
+
+    # Strip hyphen suffixes like "- Remastered 2019" or "- 2019"
+    cleaned = _SEARCH_HYPHEN_PATTERN.sub("", cleaned)
+
+    # Strip bare featuring credits (not in parentheses)
+    cleaned_lower = cleaned.lower()
+    for pattern in _FEATURING_PATTERNS:
+        if pattern in cleaned_lower:
+            idx = cleaned_lower.find(pattern)
+            cleaned = cleaned[:idx]
+            break
+
+    # Clean up dangling hyphens and extra spaces
+    cleaned = re.sub(r"\s*-\s*$", "", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def clean_title_for_display(title: str) -> str:
+    """Remove video-related suffixes from a song title for display.
+
+    Performs minimal cleaning, removing only video platform artifacts
+    such as "[Lyric Video]" or "[Official Video]". Preserves featuring
+    credits and version information that may be relevant to the user.
+
+    :param title: The song title to clean.
+    """
+    cleaned = title
+    for suffix in _DISPLAY_SUFFIXES:
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].strip()
+            break
+    return cleaned
 
 
 def filename_from_string(string: str) -> str:

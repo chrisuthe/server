@@ -7,7 +7,6 @@ import collections
 import logging
 import os
 import random
-import re
 import urllib.parse
 from base64 import b64encode
 from contextlib import suppress
@@ -63,8 +62,9 @@ from music_assistant.helpers.api import api_command
 from music_assistant.helpers.compare import compare_strings
 from music_assistant.helpers.images import create_collage, get_image_thumb
 from music_assistant.helpers.security import is_safe_path
-from music_assistant.helpers.tags import FEATURING_SPLITTERS, split_artists
+from music_assistant.helpers.tags import split_artists
 from music_assistant.helpers.throttle_retry import Throttler
+from music_assistant.helpers.util import clean_title_for_search
 from music_assistant.models.core_controller import CoreController
 from music_assistant.models.music_provider import MusicProvider
 
@@ -129,36 +129,6 @@ CACHE_EXPIRATION_RADIO_ARTWORK = 86400 * 90  # 90 days
 CACHE_EXPIRATION_RADIO_ARTWORK_MISS = 86400 * 7  # 7 days
 AD_DETECTION_PHRASES = ("asset link", "asset stop", "asset spot", "advert")
 
-# Regex pattern to strip version/remix/video suffixes from track names before searching.
-# Only strips parentheses/brackets containing known version keywords.
-# Examples: "Song (Remastered)" -> "Song", "Song [Live]" -> "Song", "Song [Lyric Video]" -> "Song"
-# But preserves: "Kiss (When the Sun Don't Shine)" (no version keyword)
-_VERSION_KEYWORDS = (
-    "version",
-    "live",
-    "edit",
-    "remix",
-    "mix",
-    "acoustic",
-    "instrumental",
-    "karaoke",
-    "remaster",
-    "remastered",
-    "unplugged",
-    "deluxe",
-    "video",
-    "explicit",
-    "clean",
-    "radio",
-    "extended",
-    "short",
-    "single",
-    "album",
-)
-_VERSION_PATTERN = "|".join(re.escape(kw) for kw in _VERSION_KEYWORDS)
-TRACK_TITLE_SUFFIX_PATTERN = re.compile(
-    rf"\s*[\(\[][^\)\]]*\b({_VERSION_PATTERN})\b[^\)\]]*[\)\]]\s*$", re.IGNORECASE
-)
 PERIODIC_SCAN_INTERVAL = 60 * 60 * 6  # 6 hours
 CONF_ENABLE_ONLINE_METADATA = "enable_online_metadata"
 
@@ -618,14 +588,8 @@ class MetaDataController(CoreController):
         :param artist_name: Artist name to search for.
         :param track_name: Track title to search for.
         """
-        # Strip version/remix/video suffixes from track name (common in radio streams)
-        clean_track_name = TRACK_TITLE_SUFFIX_PATTERN.sub("", track_name).strip()
-
-        # Strip featuring artist from track name (e.g., "Song Feat. Artist" -> "Song")
-        for splitter in FEATURING_SPLITTERS:
-            if splitter in clean_track_name:
-                clean_track_name = clean_track_name.split(splitter)[0].strip()
-                break
+        # Clean track name by stripping version suffixes and featuring credits
+        clean_track_name = clean_title_for_search(track_name)
 
         # Check library first - fast, no API calls, respects user-curated images
         if metadata := await self._get_library_track_metadata(artist_name, clean_track_name):
