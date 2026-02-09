@@ -631,6 +631,14 @@ class MetaDataController(CoreController):
                 ):
                     pass
 
+        # Log when falling back to artist artwork
+        if not mb_release_group:
+            self.logger.debug(
+                "No album found for '%s - %s', falling back to artist artwork",
+                artist_name,
+                clean_track_name,
+            )
+
         # Check library for artist before external lookup
         if metadata := await self._get_library_artist_metadata(mb_artist.name):
             return metadata
