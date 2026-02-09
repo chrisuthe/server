@@ -88,6 +88,14 @@ FEATURING_SPLITTERS = [
     " Ft. ",
     " vs. ",
     " Vs. ",
+    " (feat. ",
+    " (Feat. ",
+    " (ft. ",
+    " (Ft. ",
+    "(feat. ",
+    "(Feat. ",
+    "(ft. ",
+    "(Ft. ",
 ]
 
 # Extra splitters - only use these when we have MB ID evidence of multiple artists

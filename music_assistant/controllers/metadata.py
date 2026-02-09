@@ -20,6 +20,7 @@ from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import (
     AlbumType,
     ConfigEntryType,
+    ExternalID,
     ImageType,
     MediaType,
     ProviderFeature,
@@ -28,6 +29,7 @@ from music_assistant_models.enums import (
 from music_assistant_models.errors import (
     InvalidDataError,
     MediaNotFoundError,
+    MusicAssistantError,
     ProviderUnavailableError,
     ResourceTemporarilyUnavailable,
 )
@@ -45,6 +47,7 @@ from music_assistant_models.media_items import (
     Podcast,
     Track,
 )
+from music_assistant_models.streamdetails import StreamDetails, StreamMetadata
 from music_assistant_models.unique_list import UniqueList
 
 from music_assistant.constants import (
@@ -59,6 +62,7 @@ from music_assistant.helpers.api import api_command
 from music_assistant.helpers.compare import compare_strings
 from music_assistant.helpers.images import create_collage, get_image_thumb
 from music_assistant.helpers.security import is_safe_path
+from music_assistant.helpers.tags import split_artists
 from music_assistant.helpers.throttle_retry import Throttler
 from music_assistant.models.core_controller import CoreController
 from music_assistant.models.music_provider import MusicProvider
@@ -117,6 +121,12 @@ REFRESH_INTERVAL_TRACKS = 60 * 60 * 24 * 90  # 90 days
 REFRESH_INTERVAL_AUDIOBOOKS = 60 * 60 * 24 * 90  # 90 days
 REFRESH_INTERVAL_PODCASTS = 60 * 60 * 24 * 90  # 90 days
 REFRESH_INTERVAL_PLAYLISTS = 60 * 60 * 24 * 14  # 14 days
+
+# Radio stream artwork cache settings
+CACHE_CATEGORY_RADIO_ARTWORK = 101
+CACHE_EXPIRATION_RADIO_ARTWORK = 86400 * 90  # 90 days
+CACHE_EXPIRATION_RADIO_ARTWORK_MISS = 86400 * 7  # 7 days
+AD_DETECTION_PHRASES = ("asset link", "asset stop", "asset spot", "advert")
 PERIODIC_SCAN_INTERVAL = 60 * 60 * 6  # 6 hours
 CONF_ENABLE_ONLINE_METADATA = "enable_online_metadata"
 
@@ -563,72 +573,71 @@ class MetaDataController(CoreController):
                 return metadata.lyrics, metadata.lrc_lyrics
         return None, None
 
-    async def get_artist_metadata_by_name(self, artist_name: str) -> MediaItemMetadata | None:
-        """Search for artist metadata by name.
+    async def get_track_metadata_by_name(
+        self,
+        artist_name: str,
+        track_name: str,
+    ) -> MediaItemMetadata | None:
+        """Search for track/artist metadata by name.
 
-        Searches library first, then queries external metadata providers.
+        Checks library first for immediate results, then falls back to
+        MusicBrainz for external metadata lookups.
 
         :param artist_name: Artist name to search for.
+        :param track_name: Track title to search for.
         """
-        # Check library first
-        try:
-            library_artists = await self.mass.music.artists.search(artist_name, "library", limit=5)
-            for library_artist in library_artists:
-                # Match with "The" prefix variations
-                if not (
-                    compare_strings(artist_name, library_artist.name, strict=False)
-                    or compare_strings(f"The {artist_name}", library_artist.name, strict=False)
-                    or (
-                        library_artist.name.lower().startswith("the ")
-                        and compare_strings(artist_name, library_artist.name[4:], strict=False)
-                    )
+        # Check library first - fast, no API calls, respects user-curated images
+        if metadata := await self._get_library_track_metadata(artist_name, track_name):
+            return metadata
+
+        # Use MusicBrainz to get IDs for accurate external metadata lookups
+        musicbrainz_provider = self.mass.get_provider("musicbrainz")
+        if not musicbrainz_provider:
+            return None
+        musicbrainz: MusicbrainzProvider = cast("MusicbrainzProvider", musicbrainz_provider)
+
+        mb_result = await musicbrainz.search_recording(artist_name, track_name)
+        if not mb_result:
+            self.logger.debug("No MusicBrainz match for '%s - %s'", artist_name, track_name)
+            return None
+
+        mb_artist, mb_release_group = mb_result
+
+        # Try album artwork first if we have a unique release group
+        if mb_release_group:
+            temp_album = Album(
+                item_id="temp",
+                provider="temp",
+                name=mb_release_group.title,
+                provider_mappings=set(),
+            )
+            temp_album.add_external_id(ExternalID.MB_RELEASEGROUP, mb_release_group.id)
+            for provider in self.providers:
+                if ProviderFeature.ALBUM_METADATA not in provider.supported_features:
+                    continue
+                try:
+                    if metadata := await provider.get_album_metadata(temp_album):
+                        if metadata.images:
+                            return metadata
+                except (
+                    ProviderUnavailableError,
+                    ResourceTemporarilyUnavailable,
+                    InvalidDataError,
                 ):
-                    continue
+                    pass
 
-                if not (library_artist.metadata and library_artist.metadata.images):
-                    continue
+        # Check library for artist before external lookup
+        if metadata := await self._get_library_artist_metadata(mb_artist.name):
+            return metadata
 
-                # Convert library paths to full URLs, prioritizing THUMB images
-                full_url_images: UniqueList[MediaItemImage] = UniqueList()
-                sorted_images = sorted(
-                    library_artist.metadata.images,
-                    key=lambda img: 0 if img.type == ImageType.THUMB else 1,
-                )
-                for img in sorted_images:
-                    full_url = self.get_image_url(img, prefer_proxy=True)
-                    full_url_images.append(
-                        MediaItemImage(
-                            type=img.type,
-                            path=full_url,
-                            provider=img.provider,
-                            remotely_accessible=True,
-                        )
-                    )
-                return MediaItemMetadata(
-                    description=library_artist.metadata.description,
-                    images=full_url_images,
-                    genres=library_artist.metadata.genres,
-                    mood=library_artist.metadata.mood,
-                    style=library_artist.metadata.style,
-                    links=library_artist.metadata.links,
-                    label=library_artist.metadata.label,
-                    copyright=library_artist.metadata.copyright,
-                    lyrics=library_artist.metadata.lyrics,
-                    review=library_artist.metadata.review,
-                )
-        except InvalidDataError:
-            pass
-
-        # Query metadata providers (only those supporting name-based search will return results)
-        # NOTE: No MusicBrainz ID available, so MBID-dependent providers like FanartTV won't match.
-        # TODO: Consider adding MusicBrainz lookup if a rate-limiting proxy is implemented.
+        # Fall back to external artist artwork
         temp_artist = Artist(
             item_id="temp",
             provider="temp",
-            name=artist_name,
+            name=mb_artist.name,
             provider_mappings=set(),
         )
-
+        temp_artist.mbid = mb_artist.id
         for provider in self.providers:
             if ProviderFeature.ARTIST_METADATA not in provider.supported_features:
                 continue
@@ -644,6 +653,242 @@ class MetaDataController(CoreController):
                 pass
 
         return None
+
+    async def _get_library_track_metadata(
+        self, artist_name: str, track_name: str
+    ) -> MediaItemMetadata | None:
+        """Search library for matching track and return its metadata.
+
+        :param artist_name: Artist name to match.
+        :param track_name: Track title to match.
+        """
+        try:
+            search_query = f"{artist_name} {track_name}"
+            library_tracks = await self.mass.music.tracks.search(search_query, "library", limit=5)
+            for track in library_tracks:
+                if not self._match_artist_name(artist_name, track.artists):
+                    continue
+                if not compare_strings(track_name, track.name, strict=False):
+                    continue
+                if image_url := await self._get_library_item_image(track):
+                    return MediaItemMetadata(
+                        images=UniqueList(
+                            [
+                                MediaItemImage(
+                                    type=ImageType.THUMB,
+                                    path=image_url,
+                                    provider="library",
+                                    remotely_accessible=True,
+                                )
+                            ]
+                        )
+                    )
+        except InvalidDataError:
+            pass
+        return None
+
+    async def _get_library_artist_metadata(self, artist_name: str) -> MediaItemMetadata | None:
+        """Search library for matching artist and return its metadata.
+
+        :param artist_name: Artist name to match.
+        """
+        try:
+            library_artists = await self.mass.music.artists.search(artist_name, "library", limit=5)
+            for artist in library_artists:
+                if not compare_strings(artist_name, artist.name, strict=False):
+                    continue
+                if artist.metadata and artist.metadata.images:
+                    for img in artist.metadata.images:
+                        if img.type == ImageType.THUMB:
+                            return MediaItemMetadata(
+                                images=UniqueList(
+                                    [
+                                        MediaItemImage(
+                                            type=ImageType.THUMB,
+                                            path=self.get_image_url(img, prefer_proxy=True),
+                                            provider="library",
+                                            remotely_accessible=True,
+                                        )
+                                    ]
+                                )
+                            )
+        except InvalidDataError:
+            pass
+        return None
+
+    def _match_artist_name(self, search_name: str, artists: list[Artist | ItemMapping]) -> bool:
+        """Check if any artist matches the search name.
+
+        :param search_name: Artist name to search for.
+        :param artists: List of artists to check against.
+        """
+        for artist in artists:
+            if compare_strings(search_name, artist.name, strict=False):
+                return True
+            # Handle "The" prefix variations
+            if compare_strings(f"The {search_name}", artist.name, strict=False):
+                return True
+            if artist.name.lower().startswith("the "):
+                if compare_strings(search_name, artist.name[4:], strict=False):
+                    return True
+        return False
+
+    async def _get_library_item_image(self, track: Track) -> str | None:
+        """Get image URL for library track with fallback: track -> album -> artist.
+
+        :param track: Track to get image for.
+        """
+        # Try track image
+        if track.metadata and track.metadata.images:
+            for img in track.metadata.images:
+                if img.type == ImageType.THUMB:
+                    return self.get_image_url(img, prefer_proxy=True)
+
+        # Try album image
+        if track.album:
+            album = track.album
+            if isinstance(album, ItemMapping):
+                try:
+                    full_album = await self.mass.music.albums.get_library_item(album.item_id)
+                    if full_album and full_album.metadata and full_album.metadata.images:
+                        for img in full_album.metadata.images:
+                            if img.type == ImageType.THUMB:
+                                return self.get_image_url(img, prefer_proxy=True)
+                except MediaNotFoundError:
+                    pass
+            elif isinstance(album, Album) and album.metadata and album.metadata.images:
+                for img in album.metadata.images:
+                    if img.type == ImageType.THUMB:
+                        return self.get_image_url(img, prefer_proxy=True)
+
+        # Try artist image
+        for artist in track.artists:
+            if isinstance(artist, ItemMapping):
+                try:
+                    full_artist = await self.mass.music.artists.get_library_item(artist.item_id)
+                    if full_artist and full_artist.metadata and full_artist.metadata.images:
+                        for img in full_artist.metadata.images:
+                            if img.type == ImageType.THUMB:
+                                return self.get_image_url(img, prefer_proxy=True)
+                except MediaNotFoundError:
+                    pass
+            elif isinstance(artist, Artist) and artist.metadata and artist.metadata.images:
+                for img in artist.metadata.images:
+                    if img.type == ImageType.THUMB:
+                        return self.get_image_url(img, prefer_proxy=True)
+
+        return None
+
+    def get_radio_stream_station_image(self, streamdetails: StreamDetails) -> str | None:
+        """Get station image URL from queue current item.
+
+        :param streamdetails: StreamDetails for the radio stream.
+        """
+        if streamdetails.queue_id and (
+            queue := self.mass.player_queues.get(streamdetails.queue_id)
+        ):
+            if queue.current_item and queue.current_item.media_item:
+                if station_image := queue.current_item.media_item.image:
+                    return station_image.path
+        return None
+
+    @staticmethod
+    def normalize_radio_artist_name(artist_name: str) -> str:
+        """Normalize artist name from radio stream metadata.
+
+        :param artist_name: Raw artist name to normalize.
+        """
+        normalized = artist_name.replace("_", " ")
+        if "," in normalized and " and " not in normalized.lower() and " & " not in normalized:
+            parts = normalized.split(",", 1)
+            if len(parts) == 2:
+                normalized = f"{parts[1].strip()} {parts[0].strip()}"
+        return normalized
+
+    async def get_radio_stream_artwork(
+        self,
+        artist_name: str,
+        track_name: str,
+        fallback_image_url: str | None = None,
+    ) -> str | None:
+        """Fetch artwork for radio stream based on current track metadata.
+
+        :param artist_name: Artist name (already normalized).
+        :param track_name: Track title.
+        :param fallback_image_url: Fallback image URL (e.g., station logo).
+        """
+        if " / " in artist_name:
+            artist_name = artist_name.split(" / ")[0].strip()
+        else:
+            artists_tuple = split_artists(artist_name)
+            artist_name = artists_tuple[0] if artists_tuple else artist_name
+
+        if any(phrase in artist_name.lower() for phrase in AD_DETECTION_PHRASES):
+            return fallback_image_url
+
+        cache_key = f"{artist_name.lower()}|{track_name.lower()}"
+        cached_result = await self.mass.cache.get(
+            key=cache_key,
+            category=CACHE_CATEGORY_RADIO_ARTWORK,
+        )
+        if cached_result is not None:
+            return cached_result if cached_result != "" else fallback_image_url
+
+        image_url = None
+        try:
+            metadata = await self.get_track_metadata_by_name(
+                artist_name=artist_name,
+                track_name=track_name,
+            )
+            if metadata and metadata.images:
+                image_url = metadata.images[0].path
+                if "imageproxy" not in image_url:
+                    await self.mass.cache.set(
+                        key=cache_key,
+                        data=image_url,
+                        expiration=CACHE_EXPIRATION_RADIO_ARTWORK,
+                        category=CACHE_CATEGORY_RADIO_ARTWORK,
+                    )
+            else:
+                await self.mass.cache.set(
+                    key=cache_key,
+                    data="",
+                    expiration=CACHE_EXPIRATION_RADIO_ARTWORK_MISS,
+                    category=CACHE_CATEGORY_RADIO_ARTWORK,
+                )
+        except (ProviderUnavailableError, ResourceTemporarilyUnavailable, InvalidDataError):
+            pass
+
+        return image_url or fallback_image_url
+
+    async def update_radio_stream_artwork(self, streamdetails: StreamDetails) -> None:
+        """Fetch and update radio stream artwork.
+
+        :param streamdetails: StreamDetails to update with artwork.
+        """
+        if not streamdetails.stream_metadata:
+            return
+        if not streamdetails.stream_metadata.artist or not streamdetails.stream_metadata.title:
+            return
+
+        try:
+            fallback_url = streamdetails.stream_metadata.image_url
+            image_url = await self.get_radio_stream_artwork(
+                artist_name=streamdetails.stream_metadata.artist,
+                track_name=streamdetails.stream_metadata.title,
+                fallback_image_url=fallback_url,
+            )
+            if image_url and image_url != fallback_url:
+                streamdetails.stream_metadata = StreamMetadata(
+                    title=streamdetails.stream_metadata.title,
+                    artist=streamdetails.stream_metadata.artist,
+                    image_url=image_url,
+                )
+                streamdetails.stream_metadata_last_updated = time()
+                if streamdetails.queue_id:
+                    self.mass.player_queues.signal_update(streamdetails.queue_id)
+        except MusicAssistantError:
+            pass
 
     async def _update_artist_metadata(self, artist: Artist, force_refresh: bool = False) -> None:
         """Get/update rich metadata for an artist."""

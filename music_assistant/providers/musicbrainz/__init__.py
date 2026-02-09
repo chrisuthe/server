@@ -426,6 +426,89 @@ class MusicbrainzProvider(MetadataProvider):
                 return MusicBrainzArtist.from_raw(artist)
         return None
 
+    async def search_recording(
+        self, artist_name: str, track_name: str
+    ) -> tuple[MusicBrainzArtist, MusicBrainzReleaseGroup | None] | None:
+        """Search for a recording by artist and track name.
+
+        :param artist_name: Artist name to search for.
+        :param track_name: Track name to search for.
+        :returns: Tuple of (artist, release_group) or None. Release group is only
+                  returned if there's exactly one unique album for the recording.
+        """
+        search_artist = re.sub(LUCENE_SPECIAL, r"\\\1", artist_name)
+        search_track = re.sub(LUCENE_SPECIAL, r"\\\1", track_name)
+        result = await self.get_data(
+            "recording",
+            query=f'"{search_track}" AND artist:"{search_artist}"',
+            limit="5",
+        )
+        if not result or "recordings" not in result:
+            return None
+
+        for strict in (True, False):
+            for item in result["recordings"]:
+                if not compare_strings(item["title"], track_name, strict):
+                    continue
+                for artist_credit in item.get("artist-credit", []):
+                    artist = artist_credit.get("artist", {})
+                    if compare_strings(artist.get("name", ""), artist_name, strict):
+                        release_group = self._get_unique_release_group(item)
+                        return (MusicBrainzArtist.from_raw(artist), release_group)
+                    for alias in artist.get("aliases", []):
+                        if compare_strings(alias.get("name", ""), artist_name, strict):
+                            release_group = self._get_unique_release_group(item)
+                            return (MusicBrainzArtist.from_raw(artist), release_group)
+        return None
+
+    def _get_unique_release_group(
+        self, recording: dict[str, Any]
+    ) -> MusicBrainzReleaseGroup | None:
+        """Extract release group if recording has exactly one unique studio album.
+
+        Filters to prefer "Album" type release groups (studio albums) over
+        compilations, singles, EPs, or video releases.
+
+        :param recording: MusicBrainz recording dict.
+        """
+        releases = recording.get("releases", [])
+        if not releases:
+            return None
+
+        # Collect unique release groups, filtering to studio albums only
+        album_release_groups: dict[str, dict[str, Any]] = {}
+        all_release_groups: dict[str, dict[str, Any]] = {}
+        for release in releases:
+            rg = release.get("release-group", {})
+            rg_id = rg.get("id")
+            if not rg_id:
+                continue
+            all_release_groups[rg_id] = rg
+            # Only include "Album" primary type without secondary types
+            # (excludes compilations, live albums, video albums, etc.)
+            primary_type = rg.get("primary-type")
+            secondary_types = rg.get("secondary-types", [])
+            if primary_type == "Album" and not secondary_types:
+                album_release_groups[rg_id] = rg
+
+        # Prefer studio albums if we have exactly one
+        if len(album_release_groups) == 1:
+            rg_id = next(iter(album_release_groups))
+            return MusicBrainzReleaseGroup.from_raw(album_release_groups[rg_id])
+
+        # Log why we're skipping album fallback
+        if len(album_release_groups) > 1:
+            self.logger.debug(
+                "Recording has %d studio albums, skipping album fallback",
+                len(album_release_groups),
+            )
+        elif len(all_release_groups) > 0:
+            self.logger.debug(
+                "Recording has %d release groups but no unique studio album",
+                len(all_release_groups),
+            )
+        return None
+
     @use_cache(86400 * 30)  # Cache for 30 days
     @throttle_with_retries
     async def get_data(self, endpoint: str, **kwargs: str) -> Any:

@@ -147,34 +147,12 @@ class AudioDbMetadataProvider(MetadataProvider):
         """Retrieve metadata for artist on theaudiodb."""
         if not self.config.get_value(CONF_ENABLE_ARTIST_METADATA):
             return None
-        if artist.mbid:
-            if data := await self._get_data("artist-mb.php", i=artist.mbid):
-                if data.get("artists"):
-                    return self.__parse_artist(data["artists"][0])
+        if not artist.mbid:
+            # for 100% accuracy we require the musicbrainz id for all lookups
             return None
-
-        # Fallback to name-based search
-        result = await self._get_data("search.php", s=artist.name)
-        if result and result.get("artists"):
-            for item in result["artists"]:
-                db_name = item["strArtist"]
-                if compare_strings(artist.name, db_name, strict=False):
-                    return self.__parse_artist(item)
-                # Handle "The" prefix variations
-                if compare_strings(f"The {artist.name}", db_name, strict=False):
-                    return self.__parse_artist(item)
-                if db_name.lower().startswith("the "):
-                    if compare_strings(artist.name, db_name[4:], strict=False):
-                        return self.__parse_artist(item)
-
-        # Try search with "The" prefix added
-        if not artist.name.lower().startswith("the "):
-            result = await self._get_data("search.php", s=f"The {artist.name}")
-            if result and result.get("artists"):
-                for item in result["artists"]:
-                    if compare_strings(f"The {artist.name}", item["strArtist"], strict=False):
-                        return self.__parse_artist(item)
-
+        if data := await self._get_data("artist-mb.php", i=artist.mbid):
+            if data.get("artists"):
+                return self.__parse_artist(data["artists"][0])
         return None
 
     async def get_album_metadata(self, album: Album) -> MediaItemMetadata | None:
