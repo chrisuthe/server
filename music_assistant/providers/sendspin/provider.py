@@ -52,7 +52,7 @@ class SendspinProvider(PlayerProvider):
                 self.logger.error("Unknown sendspin event: %s", event)
 
     async def _handle_client_added(self, client_id: str) -> None:
-        """Handle client added event asynchronously."""
+        """Handle a new client connection asynchronously."""
         # Wait for any pending unregister to complete before registering
         # This prevents a race condition where a slow unregister removes
         # a newly registered player after a quick reconnect
@@ -77,7 +77,7 @@ class SendspinProvider(PlayerProvider):
         await self.mass.players.register(player)
 
     async def _handle_client_removed(self, client_id: str) -> None:
-        """Handle client removed event asynchronously."""
+        """Handle a client disconnection asynchronously."""
         self.logger.debug("Client %s disconnected", client_id)
         unregister_event = asyncio.Event()
         self._pending_unregisters[client_id] = unregister_event
@@ -117,8 +117,10 @@ class SendspinProvider(PlayerProvider):
         clients = list(self.server_api.clients)
         disconnect_tasks = []
         for client in clients:
+            if client.connection is None:
+                continue
             self.logger.debug("Disconnecting client %s", client.client_id)
-            disconnect_tasks.append(client.disconnect(retry_connection=False))
+            disconnect_tasks.append(client.connection.disconnect(retry_connection=False))
         if disconnect_tasks:
             results = await asyncio.gather(*disconnect_tasks, return_exceptions=True)
             for client, result in zip(clients, results, strict=True):

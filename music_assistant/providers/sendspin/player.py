@@ -3,23 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import Callable
+from contextlib import suppress
 from io import BytesIO
 from typing import TYPE_CHECKING, cast
+from uuid import UUID
 
-from aiosendspin.models import MediaCommand
-from aiosendspin.models.types import ArtworkSource, PlaybackStateType
+from aiosendspin.models import AudioCodec, MediaCommand
+from aiosendspin.models.types import PlaybackStateType
 from aiosendspin.models.types import RepeatMode as SendspinRepeatMode
-from aiosendspin.server import AudioFormat as SendspinAudioFormat
 from aiosendspin.server import (
     ClientEvent,
-    GroupCommandEvent,
     GroupEvent,
     GroupStateChangedEvent,
     SendspinGroup,
     VolumeChangedEvent,
 )
+from aiosendspin.server.audio import AudioFormat as SendspinAudioFormat
+from aiosendspin.server.channels import MAIN_CHANNEL, ChannelResolver
 from aiosendspin.server.client import DisconnectBehaviour
 from aiosendspin.server.events import ClientGroupChangedEvent
 from aiosendspin.server.group import (
@@ -27,10 +30,26 @@ from aiosendspin.server.group import (
     GroupMemberAddedEvent,
     GroupMemberRemovedEvent,
 )
-from aiosendspin.server.metadata import Metadata
-from aiosendspin.server.stream import AudioCodec, MediaStream
+from aiosendspin.server.roles import (
+    ArtworkGroupRole,
+    ControllerEvent,
+    ControllerGroupRole,
+    ControllerNextEvent,
+    ControllerPauseEvent,
+    ControllerPlayEvent,
+    ControllerPreviousEvent,
+    ControllerRepeatEvent,
+    ControllerShuffleEvent,
+    ControllerStopEvent,
+    MetadataGroupRole,
+    PlayerGroupRole,
+)
+from aiosendspin.server.roles.metadata.state import Metadata
+from aiosendspin.server.roles.player.types import PlayerRoleProtocol
+from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.constants import PLAYER_CONTROL_NONE
 from music_assistant_models.enums import (
+    ConfigEntryType,
     ContentType,
     ImageType,
     PlaybackState,
@@ -42,11 +61,15 @@ from music_assistant_models.media_items import AudioFormat
 from music_assistant_models.player import DeviceInfo
 from PIL import Image
 
-from music_assistant.constants import CONF_OUTPUT_CHANNELS, CONF_OUTPUT_CODEC, INTERNAL_PCM_FORMAT
+from music_assistant.constants import (
+    CONF_ENTRY_FLOW_MODE,
+    CONF_ENTRY_HTTP_PROFILE_HIDDEN,
+    CONF_ENTRY_OUTPUT_CODEC_HIDDEN,
+    CONF_ENTRY_SAMPLE_RATES,
+)
 from music_assistant.helpers.audio import get_player_filter_params
+from music_assistant.helpers.ffmpeg import get_ffmpeg_stream
 from music_assistant.models.player import Player, PlayerMedia
-
-from .timed_client_stream import TimedClientStream
 
 # Supported group commands for Sendspin players
 SUPPORTED_GROUP_COMMANDS = [
@@ -62,111 +85,165 @@ SUPPORTED_GROUP_COMMANDS = [
     MediaCommand.UNSHUFFLE,
 ]
 
+# Config constants for Sendspin audio format
+CONF_PREFERRED_SENDSPIN_FORMAT = "preferred_sendspin_format"
+SENDSPIN_FORMAT_AUTOMATIC = "automatic"
+
+
+def format_to_option_value(fmt: SupportedAudioFormat) -> str:
+    """Convert SupportedAudioFormat to "codec:sample_rate:bit_depth:channels"."""
+    return f"{fmt.codec.value}:{fmt.sample_rate}:{fmt.bit_depth}:{fmt.channels}"
+
+
+def option_value_to_format(value: str) -> tuple[AudioCodec, SendspinAudioFormat] | None:
+    """Parse option value back to (AudioCodec, SendspinAudioFormat).
+
+    :param value: Option value in format "codec:sample_rate:bit_depth:channels".
+    :return: Tuple of (AudioCodec, SendspinAudioFormat) or None if parsing fails.
+    """
+    try:
+        codec_str, sample_rate_str, bit_depth_str, channels_str = value.split(":")
+        codec = AudioCodec(codec_str)
+        audio_format = SendspinAudioFormat(
+            sample_rate=int(sample_rate_str),
+            bit_depth=int(bit_depth_str),
+            channels=int(channels_str),
+        )
+        return (codec, audio_format)
+    except (ValueError, KeyError):
+        return None
+
+
+def format_to_display_string(fmt: SupportedAudioFormat) -> str:
+    """Convert to display string like "FLAC 48kHz/24bit stereo"."""
+    codec_name = fmt.codec.name
+    sample_rate_khz = fmt.sample_rate / 1000
+    # Format sample rate: show as integer if whole number, otherwise one decimal
+    if sample_rate_khz == int(sample_rate_khz):
+        sample_rate_str = f"{int(sample_rate_khz)}kHz"
+    else:
+        sample_rate_str = f"{sample_rate_khz:.1f}kHz"
+    if fmt.channels == 2:
+        channels_str = "stereo"
+    elif fmt.channels == 1:
+        channels_str = "mono"
+    else:
+        channels_str = f"{fmt.channels}ch"
+    return f"{codec_name} {sample_rate_str}/{fmt.bit_depth}bit {channels_str}"
+
+
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
+    from aiosendspin.models.player import SupportedAudioFormat
     from aiosendspin.server.client import SendspinClient
+    from aiosendspin.server.push_stream import PushStream
+    from music_assistant_models.config_entries import ConfigValueType
+    from music_assistant_models.dsp import DSPConfig
     from music_assistant_models.player_queue import PlayerQueue
     from music_assistant_models.queue_item import QueueItem
+
+    from music_assistant.mass import MusicAssistant
 
     from .provider import SendspinProvider
 
 
-class MusicAssistantMediaStream(MediaStream):
-    """MediaStream implementation for Music Assistant with per-player DSP support."""
+def _hash_dsp_config(dsp_config: DSPConfig) -> str:
+    """Create a deterministic hash from a DSP configuration.
 
-    player_instance: SendspinPlayer
-    internal_format: AudioFormat
-    output_format: AudioFormat
+    Players with identical DSP settings produce the same hash, allowing
+    them to share a single DSP processing channel.
 
-    def __init__(
-        self,
-        *,
-        main_channel_source: AsyncGenerator[bytes, None],
-        main_channel_format: SendspinAudioFormat,
-        player_instance: SendspinPlayer,
-        internal_format: AudioFormat,
-        output_format: AudioFormat,
-    ) -> None:
-        """
-        Initialise the media stream with audio source and format for main_channel().
+    :param dsp_config: The DSP configuration to hash.
+    :return: Hex digest string.
+    """
+    h = hashlib.md5(usedforsecurity=False)
+    h.update(f"input_gain={dsp_config.input_gain}".encode())
+    h.update(f"output_gain={dsp_config.output_gain}".encode())
+    for f in dsp_config.filters:
+        if not f.enabled:
+            continue
+        # Use the dict representation for a stable, complete hash of filter params
+        h.update(str(f.to_dict()).encode())
+    return h.hexdigest()
 
-        Args:
-            main_channel_source: Audio source generator for the main channel.
-            main_channel_format: Audio format for the main channel (includes codec).
-            player_instance: The SendspinPlayer instance for accessing mass and streams.
-            internal_format: Internal processing format (float32 for headroom).
-            output_format: Output PCM format (16-bit for player output).
-        """
-        super().__init__(
-            main_channel_source=main_channel_source,
-            main_channel_format=main_channel_format,
-        )
-        self.player_instance = player_instance
-        self.internal_format = internal_format
-        self.output_format = output_format
 
-    async def player_channel(
-        self,
-        player_id: str,
-        preferred_format: SendspinAudioFormat | None = None,
-        position_us: int = 0,
-    ) -> tuple[AsyncGenerator[bytes, None], SendspinAudioFormat, int] | None:
-        """
-        Get a player-specific audio stream with per-player DSP.
+def _build_channel_map(
+    mass: MusicAssistant,
+    leader_player_id: str,
+    group_member_ids: list[str],
+) -> tuple[ChannelResolver, dict[UUID, tuple[DSPConfig, list[str]]]]:
+    """Build a channel map for grouped playback with per-player DSP.
 
-        Args:
-            player_id: Identifier for the player requesting the stream.
-            preferred_format: The player's preferred native format for the stream.
-                The implementation may return a different format; the library
-                will handle any necessary conversion.
-            position_us: Position in microseconds relative to the main_stream start.
-                Used for late-joining players to sync with the main stream.
+    :param mass: MusicAssistant instance.
+    :param leader_player_id: Player ID of the group leader.
+    :param group_member_ids: Player IDs of group members (excluding leader).
+    :return: Tuple of (channel_resolver, unique_channels) where unique_channels
+        maps channel_id -> (dsp_config, player_ids) for channels that need DSP processing.
+    """
+    all_player_ids = [leader_player_id, *group_member_ids]
 
-        Returns:
-            A tuple of (audio generator, audio format, actual position in microseconds)
-            or None if unavailable. If None, the main_stream is used as fallback.
-        """
-        mass = self.player_instance.mass
-        multi_client_stream = self.player_instance.timed_client_stream
-        assert multi_client_stream is not None
+    # Map each unique DSP hash to a channel UUID and config
+    hash_to_channel: dict[str, UUID] = {}
+    hash_to_config: dict[str, DSPConfig] = {}
+    player_to_channel: dict[str, UUID] = {}
 
-        dsp = mass.config.get_player_dsp_config(player_id)
-        output_channels = mass.config.get_raw_player_config_value(
-            player_id, CONF_OUTPUT_CHANNELS, "stereo"
-        )
-        if not dsp.enabled and output_channels == "stereo":
-            # DSP is disabled and output is stereo, use main_stream
-            return None
+    for player_id in all_player_ids:
+        dsp_config = mass.config.get_player_dsp_config(player_id)
 
-        # Get per-player DSP filter parameters
-        filter_params = get_player_filter_params(
-            mass, player_id, self.internal_format, self.output_format
+        # Check if DSP is enabled and has any active filters/gains
+        has_active_dsp = dsp_config.enabled and (
+            dsp_config.input_gain != 0
+            or dsp_config.output_gain != 0
+            or any(f.enabled for f in dsp_config.filters)
         )
 
-        # Get the stream with position (in seconds)
-        stream_gen, actual_position = await multi_client_stream.get_stream(
-            output_format=self.output_format,
-            filter_params=filter_params,
-        )
+        if not has_active_dsp:
+            player_to_channel[player_id] = MAIN_CHANNEL
+            continue
 
-        # Convert position from seconds to microseconds for aiosendspin API
-        actual_position_us = int(actual_position * 1_000_000)
+        # Remove disabled filters for consistent hashing
+        dsp_config.filters = [f for f in dsp_config.filters if f.enabled]
+        config_hash = _hash_dsp_config(dsp_config)
 
-        # Return actual position in microseconds relative to main_stream start
-        self.player_instance.logger.debug(
-            "Providing channel stream for player %s at position %d us",
-            player_id,
-            actual_position_us,
-        )
-        return (
-            stream_gen,
-            SendspinAudioFormat(
-                sample_rate=self.output_format.sample_rate,
-                bit_depth=self.output_format.bit_depth,
-                channels=self.output_format.channels,
-                codec=self._main_channel_format.codec,
-            ),
-            actual_position_us,
-        )
+        if config_hash not in hash_to_channel:
+            # Generate a deterministic UUID from the hash
+            channel_uuid = UUID(
+                hashlib.md5(config_hash.encode(), usedforsecurity=False).hexdigest()
+            )
+            hash_to_channel[config_hash] = channel_uuid
+            hash_to_config[config_hash] = dsp_config
+
+        player_to_channel[player_id] = hash_to_channel[config_hash]
+
+    # Build unique_channels: channel_id -> (dsp_config, [player_ids])
+    unique_channels: dict[UUID, tuple[DSPConfig, list[str]]] = {}
+    for config_hash, channel_id in hash_to_channel.items():
+        players_for_channel = [pid for pid, cid in player_to_channel.items() if cid == channel_id]
+        unique_channels[channel_id] = (hash_to_config[config_hash], players_for_channel)
+
+    def channel_resolver(player_id: str) -> UUID:
+        return player_to_channel.get(player_id, MAIN_CHANNEL)
+
+    return channel_resolver, unique_channels
+
+
+def _dsp_config_to_filter_params(
+    mass: MusicAssistant,
+    player_id: str,
+    pcm_format: AudioFormat,
+) -> list[str]:
+    """Get ffmpeg filter parameters for a player's DSP configuration.
+
+    Reuses the existing ``get_player_filter_params`` helper which handles
+    input/output gain, EQ filters, channel mixing, and the output limiter.
+
+    :param mass: MusicAssistant instance.
+    :param player_id: The player to get filter params for.
+    :param pcm_format: The PCM audio format (used as both input and output format).
+    :return: List of ffmpeg filter parameter strings.
+    """
+    return get_player_filter_params(mass, player_id, pcm_format, pcm_format)
 
 
 class SendspinPlayer(Player):
@@ -175,10 +252,11 @@ class SendspinPlayer(Player):
     api: SendspinClient
     unsub_event_cb: Callable[[], None]
     unsub_group_event_cb: Callable[[], None]
+    unsub_controller_event_cb: Callable[[], None] | None = None
     last_sent_artwork_url: str | None = None
     last_sent_artist_artwork_url: str | None = None
     _playback_task: asyncio.Task[None] | None = None
-    timed_client_stream: TimedClientStream | None = None
+    _push_stream: PushStream | None = None
     is_web_player: bool = False
 
     @property
@@ -195,6 +273,7 @@ class SendspinPlayer(Player):
         self.api.disconnect_behaviour = DisconnectBehaviour.STOP
         self.unsub_event_cb = sendspin_client.add_event_listener(self.event_cb)
         self.unsub_group_event_cb = sendspin_client.group.add_event_listener(self.group_event_cb)
+        self._subscribe_to_controller_events(sendspin_client.group)
         sendspin_client.group.set_supported_commands(SUPPORTED_GROUP_COMMANDS)
 
         self.logger = self.provider.logger.getChild(player_id)
@@ -217,9 +296,16 @@ class SendspinPlayer(Player):
             )
         else:
             self._attr_device_info = DeviceInfo()
-        if player_client := sendspin_client.player:
-            self._attr_volume_level = player_client.volume
-            self._attr_volume_muted = player_client.muted
+        if sendspin_client.info.player_support:
+            for role in sendspin_client.roles_by_family("player"):
+                volume = role.get_player_volume()
+                muted = role.get_player_muted()
+                if volume is not None:
+                    self._attr_volume_level = volume
+                if muted is not None:
+                    self._attr_volume_muted = muted
+                if volume is not None or muted is not None:
+                    break
         self._attr_available = True
         self.is_web_player = sendspin_client.name.startswith(
             "Web ("  # The regular Web Interface
@@ -229,8 +315,94 @@ class SendspinPlayer(Player):
         self._attr_expose_to_ha_by_default = not self.is_web_player
         self._attr_hidden_by_default = self.is_web_player
 
+    @property
+    def _artwork_role(self) -> ArtworkGroupRole | None:
+        """Get the ArtworkGroupRole for this player's group."""
+        role = self.api.group.group_role("artwork")
+        if isinstance(role, ArtworkGroupRole):
+            return role
+        return None
+
+    @property
+    def _metadata_role(self) -> MetadataGroupRole | None:
+        """Get the MetadataGroupRole for this player's group."""
+        role = self.api.group.group_role("metadata")
+        if isinstance(role, MetadataGroupRole):
+            return role
+        return None
+
+    @property
+    def _player_group_role(self) -> PlayerGroupRole | None:
+        """Get the PlayerGroupRole for this player's group."""
+        role = self.api.group.group_role("player")
+        if isinstance(role, PlayerGroupRole):
+            return role
+        return None
+
+    @property
+    def _controller_role(self) -> ControllerGroupRole | None:
+        """Get the ControllerGroupRole for this player's group."""
+        role = self.api.group.group_role("controller")
+        if isinstance(role, ControllerGroupRole):
+            return role
+        return None
+
+    def _subscribe_to_controller_events(self, group: SendspinGroup) -> None:
+        """Subscribe to controller events from the group's ControllerGroupRole."""
+        if self.unsub_controller_event_cb is not None:
+            self.unsub_controller_event_cb()
+            self.unsub_controller_event_cb = None
+        controller_role = group.group_role("controller")
+        self.logger.debug(
+            "Subscribing to controller events: group=%s, controller_role=%s",
+            group.group_id,
+            controller_role,
+        )
+        if isinstance(controller_role, ControllerGroupRole):
+            self.unsub_controller_event_cb = controller_role.add_event_listener(
+                self.controller_event_cb
+            )
+
+    def controller_event_cb(self, event: ControllerEvent) -> None:
+        """Event callback registered to the ControllerGroupRole."""
+        self.logger.debug(
+            "Received ControllerEvent: %s, synced_to=%s, player_id=%s",
+            event,
+            self.synced_to,
+            self.player_id,
+        )
+        if self.synced_to is not None:
+            # Only leader handles controller events
+            return
+        self.mass.create_task(self._handle_controller_event(event))
+
+    async def _handle_controller_event(self, event: ControllerEvent) -> None:
+        """Handle a controller event from the ControllerGroupRole."""
+        queue = self.mass.player_queues.get_active_queue(self.player_id)
+        match event:
+            case ControllerPlayEvent():
+                await self.mass.players.cmd_play(self.player_id)
+            case ControllerPauseEvent():
+                await self.mass.players.cmd_pause(self.player_id)
+            case ControllerStopEvent():
+                await self.mass.players.cmd_stop(self.player_id)
+            case ControllerNextEvent():
+                await self.mass.players.cmd_next_track(self.player_id)
+            case ControllerPreviousEvent():
+                await self.mass.players.cmd_previous_track(self.player_id)
+            case ControllerRepeatEvent(mode=mode) if queue:
+                match mode:
+                    case SendspinRepeatMode.OFF:
+                        self.mass.player_queues.set_repeat(queue.queue_id, RepeatMode.OFF)
+                    case SendspinRepeatMode.ONE:
+                        self.mass.player_queues.set_repeat(queue.queue_id, RepeatMode.ONE)
+                    case SendspinRepeatMode.ALL:
+                        self.mass.player_queues.set_repeat(queue.queue_id, RepeatMode.ALL)
+            case ControllerShuffleEvent(shuffle=shuffle) if queue:
+                await self.mass.player_queues.set_shuffle(queue.queue_id, shuffle_enabled=shuffle)
+
     def event_cb(self, client: SendspinClient, event: ClientEvent) -> None:
-        """Event callback registered to the sendspin server."""
+        """Event callback registered to the sendspin client."""
         self.logger.debug("Received PlayerEvent: %s", event)
         match event:
             case VolumeChangedEvent(volume=volume, muted=muted):
@@ -240,6 +412,8 @@ class SendspinPlayer(Player):
             case ClientGroupChangedEvent(new_group=new_group):
                 self.unsub_group_event_cb()
                 self.unsub_group_event_cb = new_group.add_event_listener(self.group_event_cb)
+                # Re-subscribe to controller events for the new group
+                self._subscribe_to_controller_events(new_group)
                 # Sync playback state from the new group
                 match new_group.state:
                     case PlaybackStateType.PLAYING:
@@ -259,31 +433,6 @@ class SendspinPlayer(Player):
                     self.api.disconnect_behaviour = DisconnectBehaviour.UNGROUP
                 self.update_state()
 
-    async def _handle_group_command(self, command: MediaCommand) -> None:
-        """Handle a group command from aiosendspin."""
-        queue = self.mass.player_queues.get_active_queue(self.player_id)
-        match command:
-            case MediaCommand.PLAY:
-                await self.mass.players.cmd_play(self.player_id)
-            case MediaCommand.PAUSE:
-                await self.mass.players.cmd_pause(self.player_id)
-            case MediaCommand.STOP:
-                await self.mass.players.cmd_stop(self.player_id)
-            case MediaCommand.NEXT:
-                await self.mass.players.cmd_next_track(self.player_id)
-            case MediaCommand.PREVIOUS:
-                await self.mass.players.cmd_previous_track(self.player_id)
-            case MediaCommand.REPEAT_OFF if queue:
-                self.mass.player_queues.set_repeat(queue.queue_id, RepeatMode.OFF)
-            case MediaCommand.REPEAT_ONE if queue:
-                self.mass.player_queues.set_repeat(queue.queue_id, RepeatMode.ONE)
-            case MediaCommand.REPEAT_ALL if queue:
-                self.mass.player_queues.set_repeat(queue.queue_id, RepeatMode.ALL)
-            case MediaCommand.SHUFFLE if queue:
-                await self.mass.player_queues.set_shuffle(queue.queue_id, shuffle_enabled=True)
-            case MediaCommand.UNSHUFFLE if queue:
-                await self.mass.player_queues.set_shuffle(queue.queue_id, shuffle_enabled=False)
-
     def group_event_cb(self, group: SendspinGroup, event: GroupEvent) -> None:
         """Event callback registered to the sendspin group this player belongs to."""
         if self.synced_to is not None:
@@ -295,9 +444,6 @@ class SendspinPlayer(Player):
         self.logger.debug("Received GroupEvent: %s", event)
 
         match event:
-            case GroupCommandEvent(command=command):
-                self.logger.debug("Group command received: %s", command)
-                self.mass.create_task(self._handle_group_command(command))
             case GroupStateChangedEvent(state=state):
                 self.logger.debug("Group state changed to: %s", state)
                 match state:
@@ -317,12 +463,12 @@ class SendspinPlayer(Player):
                     self.update_state()
             case GroupMemberRemovedEvent(client_id=client_id):
                 self.logger.debug("Group member removed: %s", client_id)
-                self.mass.create_task(self._handle_member_removed(group, client_id))
+                self.mass.create_task(self._handle_group_member_removed(group, client_id))
             case GroupDeletedEvent():
                 pass
 
-    async def _handle_member_removed(self, group: SendspinGroup, client_id: str) -> None:
-        """Handle group member removed event asynchronously."""
+    async def _handle_group_member_removed(self, group: SendspinGroup, client_id: str) -> None:
+        """Handle a group member being removed asynchronously."""
         if client_id == self.player_id:
             if len(self._attr_group_members) > 0:
                 # We were just removed as a leader:
@@ -349,20 +495,23 @@ class SendspinPlayer(Player):
 
     async def volume_set(self, volume_level: int) -> None:
         """Handle VOLUME_SET command on the player."""
-        if player_client := self.api.player:
-            player_client.set_volume(volume_level)
+        roles = self.api.roles_by_family("player")
+        for role in roles:
+            role.set_player_volume(volume_level)
 
     async def volume_mute(self, muted: bool) -> None:
         """Handle VOLUME MUTE command on the player."""
-        if player_client := self.api.player:
-            if muted:
-                player_client.mute()
-            else:
-                player_client.unmute()
+        roles = self.api.roles_by_family("player")
+        for role in roles:
+            role.set_player_mute(muted)
 
     async def stop(self) -> None:
         """Stop command."""
         self.logger.debug("Received STOP command on player %s", self.display_name)
+        if self._playback_task and not self._playback_task.done():
+            self._playback_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._playback_task
         # We don't care if we stopped the stream or it was already stopped
         await self.api.group.stop()
         # Clear the playback task reference (group.stop() handles stopping the stream)
@@ -383,73 +532,289 @@ class SendspinPlayer(Player):
         # playback_state will be set by the group state change event
 
         # Stop previous stream in case we were already playing something
+        if self._playback_task and not self._playback_task.done():
+            self._playback_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._playback_task
         await self.api.group.stop()
         # Run playback in background task to immediately return
         self._playback_task = asyncio.create_task(self._run_playback(media))
         self.update_state()
 
+    def _get_player_role(self) -> PlayerRoleProtocol | None:
+        """Get the player role for this client (not group role)."""
+        for role in self.api.roles_by_family("player"):
+            if isinstance(role, PlayerRoleProtocol):
+                return role
+        return None
+
+    async def on_config_updated(self) -> None:
+        """Apply preferred format when config changes."""
+        await self._apply_preferred_format()
+
+    async def _apply_preferred_format(self) -> None:
+        """Read config and call set_preferred_format() if not automatic."""
+        player_role = self._get_player_role()
+        if player_role is None:
+            return
+
+        config_value = cast(
+            "str",
+            self.config.get_value(CONF_PREFERRED_SENDSPIN_FORMAT, SENDSPIN_FORMAT_AUTOMATIC),
+        )
+        if config_value == SENDSPIN_FORMAT_AUTOMATIC:
+            # Automatic mode: don't set a preferred format, let client decide
+            self.logger.debug("Audio format set to automatic for player %s", self.display_name)
+            return
+
+        parsed = option_value_to_format(config_value)
+        if parsed is None:
+            self.logger.warning(
+                "Invalid audio format config value '%s' for player %s",
+                config_value,
+                self.display_name,
+            )
+            return
+
+        codec, audio_format = parsed
+        success = player_role.set_preferred_format(audio_format, codec)
+        if success:
+            self.logger.debug(
+                "Set preferred audio format to %s %s for player %s",
+                codec.name,
+                audio_format,
+                self.display_name,
+            )
+        else:
+            self.logger.warning(
+                "Failed to set preferred audio format %s %s for player %s",
+                codec.name,
+                audio_format,
+                self.display_name,
+            )
+
+    def _setup_dsp_channels(
+        self,
+        push_stream: PushStream,
+        pcm_format: AudioFormat,
+        sendspin_source_format: SendspinAudioFormat,
+    ) -> tuple[dict[UUID, asyncio.Queue[bytes | None]], list[asyncio.Task[None]]]:
+        """Set up per-player DSP processing channels.
+
+        :param push_stream: The active PushStream.
+        :param pcm_format: The PCM audio format.
+        :param sendspin_source_format: The sendspin source format.
+        :return: Tuple of (dsp_queues, dsp_tasks).
+        """
+        _, unique_channels = _build_channel_map(self.mass, self.player_id, self._attr_group_members)
+
+        dsp_queues: dict[UUID, asyncio.Queue[bytes | None]] = {}
+        dsp_tasks: list[asyncio.Task[None]] = []
+
+        if unique_channels:
+            self.logger.debug(
+                "Multi-device DSP: %d unique DSP channel(s) for %d players",
+                len(unique_channels),
+                1 + len(self._attr_group_members),
+            )
+
+        for channel_id, (_dsp_config, player_ids) in unique_channels.items():
+            queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=10)
+            dsp_queues[channel_id] = queue
+            task = asyncio.create_task(
+                self._channel_dsp_processor(
+                    channel_id=channel_id,
+                    player_id=player_ids[0],
+                    raw_queue=queue,
+                    push_stream=push_stream,
+                    pcm_format=pcm_format,
+                    sendspin_format=sendspin_source_format,
+                )
+            )
+            dsp_tasks.append(task)
+            push_stream.enable_pcm_cache_for_channel(channel_id)
+
+        return dsp_queues, dsp_tasks
+
+    async def _throttle_playback(
+        self,
+        chunk_size: int,
+        pcm_format: AudioFormat,
+        play_start_us: int,
+    ) -> int:
+        """Throttle audio production to stay at most ~6s ahead of realtime.
+
+        :param chunk_size: Size of the current audio chunk in bytes.
+        :param pcm_format: The PCM audio format.
+        :param play_start_us: The play start timestamp from commit_audio().
+        :return: The playback end timestamp in microseconds.
+        """
+        bytes_per_second = (
+            pcm_format.sample_rate * pcm_format.channels * (pcm_format.bit_depth // 8)
+        )
+        chunk_duration_us = int(chunk_size * 1_000_000 / bytes_per_second)
+        playback_end_us = play_start_us + max(chunk_duration_us, 0)
+        target_ahead_us = 6_000_000
+        while True:
+            now_us = int(self.mass.loop.time() * 1_000_000)
+            ahead_us = playback_end_us - now_us
+            if ahead_us <= target_ahead_us:
+                break
+            await asyncio.sleep(min((ahead_us - target_ahead_us) / 1_000_000, 1.0))
+        return playback_end_us
+
     async def _run_playback(self, media: PlayerMedia) -> None:
         """Run the actual playback in a background task."""
+        audio_source: AsyncGenerator[bytes, None] | None = None
+        playback_end_us: int | None = None
+        cancelled = False
+        errored = False
+        dsp_tasks: list[asyncio.Task[None]] = []
+        dsp_queues: dict[UUID, asyncio.Queue[bytes | None]] = {}
         try:
-            # Use 32-bit for the main channel: aiosendspin converts per player as needed
+            # Define source PCM format for streaming (what MA yields).
+            # aiosendspin only supports 16-bit PCM for now.
             pcm_format = AudioFormat(
-                content_type=ContentType.PCM_S32LE,
+                content_type=ContentType.PCM_S16LE,
                 sample_rate=48000,
-                bit_depth=32,
+                bit_depth=16,
                 channels=2,
             )
-            flow_pcm_format = AudioFormat(
-                content_type=INTERNAL_PCM_FORMAT.content_type,
+
+            # PushStream expects raw PCM with a PCM source format; encoding happens per-player.
+            sendspin_source_format = SendspinAudioFormat(
                 sample_rate=pcm_format.sample_rate,
-                bit_depth=INTERNAL_PCM_FORMAT.bit_depth,
+                bit_depth=pcm_format.bit_depth,
                 channels=pcm_format.channels,
             )
 
-            output_codec = cast("str", self.config.get_value(CONF_OUTPUT_CODEC, "pcm"))
-
-            # Convert string codec to AudioCodec enum
-            audio_codec = AudioCodec(output_codec)
-
-            # Get clean audio source in flow format (high quality internal format)
-            # Format conversion and per-player DSP will be applied via player_channel
-            audio_source = self.mass.streams.get_stream(media, flow_pcm_format)
-
-            # Create TimedClientStream to wrap the clean audio source
-            # This distributes the audio to multiple subscribers without DSP
-            self.timed_client_stream = TimedClientStream(
-                audio_source=audio_source,
-                audio_format=flow_pcm_format,
+            # Build channel resolver for per-player DSP routing
+            channel_resolver, unique_channels = _build_channel_map(
+                self.mass, self.player_id, self._attr_group_members
             )
 
-            # Setup the main channel subscription
-            main_channel_gen, main_position = await self.timed_client_stream.get_stream(
-                output_format=pcm_format,
-                filter_params=None,  # TODO: this should probably still include the safety limiter
-            )
-            assert main_position == 0.0  # first subscriber, should be zero
-            media_stream = MusicAssistantMediaStream(
-                main_channel_source=main_channel_gen,
-                main_channel_format=SendspinAudioFormat(
-                    sample_rate=pcm_format.sample_rate,
-                    bit_depth=pcm_format.bit_depth,
-                    channels=pcm_format.channels,
-                    codec=audio_codec,
-                ),
-                player_instance=self,
-                internal_format=flow_pcm_format,
-                output_format=pcm_format,
+            # Start push stream with channel resolver for audio delivery
+            self._push_stream = self.api.group.start_stream(
+                channel_resolver=channel_resolver if unique_channels else None,
             )
 
-            stop_time = await self.api.group.play_media(media_stream)
-            await self.api.group.stop(stop_time)
+            # Set up per-player DSP processing channels
+            dsp_queues, dsp_tasks = self._setup_dsp_channels(
+                self._push_stream, pcm_format, sendspin_source_format
+            )
+
+            # Get raw audio source from Music Assistant (no DSP applied at source level)
+            audio_source = self.mass.streams.get_stream(media, pcm_format)
+
+            # Push audio chunks to connected players
+            async for chunk in audio_source:
+                if self._push_stream is None or self._push_stream.is_stopped:
+                    break
+
+                # Send raw PCM to MAIN_CHANNEL (players without DSP)
+                self._push_stream.prepare_audio(chunk, sendspin_source_format)
+
+                # Multicast raw PCM to all DSP processor queues
+                if dsp_queues:
+                    await asyncio.gather(*(q.put(chunk) for q in dsp_queues.values()))
+
+                play_start_us = await self._push_stream.commit_audio()
+                playback_end_us = await self._throttle_playback(
+                    len(chunk), pcm_format, play_start_us
+                )
+
         except asyncio.CancelledError:
+            cancelled = True
             self.logger.debug("Playback cancelled for player %s", self.display_name)
             raise
         except Exception:
+            errored = True
             self.logger.exception("Error during playback for player %s", self.display_name)
             raise
         finally:
-            self.timed_client_stream = None
+            # Signal DSP tasks to stop by sending sentinel values
+            for queue in dsp_queues.values():
+                with suppress(Exception):
+                    await queue.put(None)
+            if dsp_tasks:
+                await asyncio.gather(*dsp_tasks, return_exceptions=True)
+
+            # Ensure the source generator is closed to avoid leaking ffmpeg processes.
+            if audio_source is not None:
+                with suppress(Exception):
+                    await audio_source.aclose()
+
+            # If we reached end-of-stream normally, schedule stop at the actual end time
+            # so clients can play the queued audio. On cancel/error: stop immediately.
+            if (
+                not cancelled
+                and not errored
+                and playback_end_us is not None
+                and self._push_stream is not None
+                and not self._push_stream.is_stopped
+            ):
+                with suppress(Exception):
+                    await self.api.group.stop(stop_time_us=playback_end_us)
+            else:
+                with suppress(Exception):
+                    self.api.group.stop_stream()
+            self._push_stream = None
+
+    async def _channel_dsp_processor(
+        self,
+        channel_id: UUID,
+        player_id: str,
+        raw_queue: asyncio.Queue[bytes | None],
+        push_stream: PushStream,
+        pcm_format: AudioFormat,
+        sendspin_format: SendspinAudioFormat,
+    ) -> None:
+        """Process a single DSP channel by piping raw PCM through ffmpeg.
+
+        Reads raw PCM chunks from the queue, pipes them through an ffmpeg process
+        with the player's DSP filter chain, and feeds the processed output to
+        the push stream on the assigned channel.
+
+        :param channel_id: The channel UUID to push processed audio to.
+        :param player_id: Player ID used to derive DSP filter parameters.
+        :param raw_queue: Queue receiving raw PCM chunks (None = end of stream).
+        :param push_stream: The PushStream to push processed audio to.
+        :param pcm_format: The PCM audio format for input and output.
+        :param sendspin_format: The sendspin audio format for push_stream.
+        """
+        filter_params = _dsp_config_to_filter_params(self.mass, player_id, pcm_format)
+
+        if not filter_params:
+            # No active filters; just pass through to channel
+            while True:
+                chunk = await raw_queue.get()
+                if chunk is None or push_stream.is_stopped:
+                    break
+                push_stream.prepare_audio(chunk, sendspin_format, channel_id=channel_id)
+            return
+
+        async def _queue_to_generator() -> AsyncGenerator[bytes, None]:
+            """Convert the raw queue into an async generator for ffmpeg input."""
+            while True:
+                chunk = await raw_queue.get()
+                if chunk is None:
+                    return
+                yield chunk
+
+        try:
+            async for processed_chunk in get_ffmpeg_stream(
+                audio_input=_queue_to_generator(),
+                input_format=pcm_format,
+                output_format=pcm_format,
+                filter_params=filter_params,
+            ):
+                if push_stream.is_stopped:
+                    break
+                push_stream.prepare_audio(processed_chunk, sendspin_format, channel_id=channel_id)
+        except Exception:
+            self.logger.exception(
+                "DSP processor error for channel %s (player %s)", channel_id, player_id
+            )
 
     async def set_members(
         self,
@@ -490,10 +855,11 @@ class SendspinPlayer(Player):
                 )
                 if image_data is not None:
                     image = await asyncio.to_thread(Image.open, BytesIO(image_data))
-                    await self.api.group.set_media_art(image, source=ArtworkSource.ALBUM)
-            else:
-                # Clear artwork if none available
-                await self.api.group.set_media_art(None, source=ArtworkSource.ALBUM)
+                    if (artwork_role := self._artwork_role) is not None:
+                        await artwork_role.set_album_artwork(image)
+            # Clear artwork if none available
+            elif (artwork_role := self._artwork_role) is not None:
+                await artwork_role.set_album_artwork(None)
 
         return artwork_url
 
@@ -524,10 +890,11 @@ class SendspinPlayer(Player):
                 )
                 if artist_image_data is not None:
                     artist_image = await asyncio.to_thread(Image.open, BytesIO(artist_image_data))
-                    await self.api.group.set_media_art(artist_image, source=ArtworkSource.ARTIST)
-            else:
-                # Clear artist artwork if none available
-                await self.api.group.set_media_art(None, source=ArtworkSource.ARTIST)
+                    if (artwork_role := self._artwork_role) is not None:
+                        await artwork_role.set_artist_artwork(artist_image)
+            # Clear artist artwork if none available
+            elif (artwork_role := self._artwork_role) is not None:
+                await artwork_role.set_artist_artwork(None)
 
     def _on_player_media_updated(self) -> None:
         """Handle callback when the current media of the player is updated."""
@@ -537,7 +904,8 @@ class SendspinPlayer(Player):
 
         if self.current_media is None:
             # Clear metadata when no media loaded
-            self.api.group.set_metadata(Metadata())
+            if (metadata_role := self._metadata_role) is not None:
+                metadata_role.set_metadata(Metadata())
             return
         self.mass.create_task(self.send_current_media_metadata())
 
@@ -589,10 +957,62 @@ class SendspinPlayer(Player):
         )
 
         # Send metadata to the group
-        self.api.group.set_metadata(metadata)
+        if (metadata_role := self._metadata_role) is not None:
+            metadata_role.set_metadata(metadata)
+
+    async def get_config_entries(
+        self,
+        action: str | None = None,
+        values: dict[str, ConfigValueType] | None = None,
+    ) -> list[ConfigEntry]:
+        """Return all (provider/player specific) Config Entries for the player."""
+        default_entries = await super().get_config_entries(action=action, values=values)
+        entries = [
+            *default_entries,
+            ConfigEntry.from_dict(
+                {**CONF_ENTRY_FLOW_MODE.to_dict(), "default_value": True, "hidden": True}
+            ),
+            CONF_ENTRY_OUTPUT_CODEC_HIDDEN,
+            CONF_ENTRY_HTTP_PROFILE_HIDDEN,
+            ConfigEntry.from_dict({**CONF_ENTRY_SAMPLE_RATES.to_dict(), "hidden": True}),
+        ]
+
+        # Build dynamic format options from player's supported formats
+        player_role = self._get_player_role()
+        if player_role is not None:
+            supported_formats = player_role.get_supported_formats()
+            if supported_formats:
+                format_options = [
+                    ConfigValueOption(
+                        title="Automatic (let client decide)",
+                        value=SENDSPIN_FORMAT_AUTOMATIC,
+                    ),
+                ]
+                for fmt in supported_formats:
+                    format_options.append(
+                        ConfigValueOption(
+                            title=format_to_display_string(fmt),
+                            value=format_to_option_value(fmt),
+                        )
+                    )
+                entries.append(
+                    ConfigEntry(
+                        key=CONF_PREFERRED_SENDSPIN_FORMAT,
+                        type=ConfigEntryType.STRING,
+                        label="Preferred audio format",
+                        description="Select the audio format to use for playback on this player.",
+                        category="audio",
+                        default_value=SENDSPIN_FORMAT_AUTOMATIC,
+                        options=format_options,
+                    )
+                )
+
+        return entries
 
     async def on_unload(self) -> None:
         """Handle logic when the player is unloaded from the Player controller."""
         await super().on_unload()
         self.unsub_event_cb()
         self.unsub_group_event_cb()
+        if self.unsub_controller_event_cb is not None:
+            self.unsub_controller_event_cb()
