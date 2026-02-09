@@ -825,14 +825,49 @@ class MetaDataController(CoreController):
     def normalize_radio_artist_name(artist_name: str) -> str:
         """Normalize artist name from radio stream metadata.
 
+        Handles common formats like "Squier, Billy" -> "Billy Squier" while
+        avoiding mangling of names like "Lipps, Inc." or "Portugal. The Man".
+
         :param artist_name: Raw artist name to normalize.
         """
+        # Business/title suffixes that should not be flipped
+        no_flip_suffixes = ("inc", "inc.", "ltd", "ltd.", "llc", "corp", "the creator")
+
         normalized = artist_name.replace("_", " ")
-        if "," in normalized and " and " not in normalized.lower() and " & " not in normalized:
-            parts = normalized.split(",", 1)
-            if len(parts) == 2:
-                normalized = f"{parts[1].strip()} {parts[0].strip()}"
-        return normalized
+
+        if "," not in normalized:
+            return normalized
+
+        # Don't flip if contains "and" or "&" (e.g., "Crosby, Stills & Nash")
+        if " and " in normalized.lower() or " & " in normalized:
+            return normalized
+
+        parts = normalized.split(",", 1)
+        if len(parts) != 2:
+            return normalized
+
+        before_comma = parts[0].strip()
+        after_comma = parts[1].strip()
+        after_comma_lower = after_comma.lower()
+
+        # Don't flip if suffix is a business/title term
+        if after_comma_lower in no_flip_suffixes:
+            return normalized
+
+        # Flip if suffix is exactly "The" (e.g., "Beatles, The" -> "The Beatles")
+        if after_comma_lower == "the":
+            return f"{after_comma} {before_comma}"
+
+        # Don't flip if 2+ words after comma (e.g., "Portugal, The Man")
+        if len(after_comma.split()) >= 2:
+            return normalized
+
+        # Don't flip if 2+ words before comma (likely a phrase, e.g., "Hello, Goodbye")
+        if len(before_comma.split()) >= 2:
+            return normalized
+
+        # Standard flip (e.g., "Squier, Billy" -> "Billy Squier")
+        return f"{after_comma} {before_comma}"
 
     async def get_radio_stream_artwork(
         self,
