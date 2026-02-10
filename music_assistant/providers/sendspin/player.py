@@ -755,11 +755,11 @@ class SendspinPlayer(Player):
         dsp_queues: dict[UUID, _DSPQueue] = {}
         try:
             # Define source PCM format for streaming (what MA yields).
-            # aiosendspin only supports 16-bit PCM for now.
+            # aiosendspin converts to per-player formats as needed.
             pcm_format = AudioFormat(
-                content_type=ContentType.PCM_S16LE,
+                content_type=ContentType.PCM_S32LE,
                 sample_rate=48000,
-                bit_depth=16,
+                bit_depth=32,
                 channels=2,
             )
 
