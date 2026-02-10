@@ -89,10 +89,14 @@ class PlaylistController(MediaControllerBase[Playlist]):
         item_id: str,
         provider_instance_id_or_domain: str,
         force_refresh: bool = False,
+        _from_metadata_update: bool = False,
     ) -> AsyncGenerator[PlaylistPlayableItem, None]:
         """Return playlist tracks for the given provider playlist id."""
+        library_item = None
         if provider_instance_id_or_domain == "library":
             library_item = await self.get_library_item(item_id)
+            if not library_item or not library_item.provider_mappings:
+                return
             provider_instance_id_or_domain, item_id = self._select_provider_id(library_item)
         # playlist tracks are not stored in the db,
         # we always fetched them (cached) from the provider
@@ -109,6 +113,17 @@ class PlaylistController(MediaControllerBase[Playlist]):
             for track in tracks:
                 yield track
             page += 1
+
+        # trigger metadata update for builtin playlists when tracks are refreshed
+        if (
+            force_refresh
+            and library_item
+            and provider_instance_id_or_domain == "builtin"
+            and not _from_metadata_update
+        ):
+            self.mass.create_task(
+                self.mass.metadata.update_metadata(library_item, force_refresh=True)
+            )
 
     async def create_playlist(
         self, name: str, provider_instance_or_domain: str | None = None
