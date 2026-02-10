@@ -1087,8 +1087,19 @@ class PlayerQueuesController(CoreController):
                 for idx, item_data in enumerate(prev_items):
                     qi = QueueItem.from_cache(item_data)
                     if not qi.media_item:
-                        # Skip items with missing media_item - this can happen if
-                        # MA was killed during shutdown while cache was being written
+                        # Try to recover missing media_item from raw cache data first.
+                        # Older cache entries or partial writes may restore without it.
+                        if isinstance(item_data, dict) and item_data.get("media_item"):
+                            with suppress(Exception):
+                                restored_item = media_from_dict(item_data["media_item"])
+                                qi.media_item = cast("PlayableMediaItemType", restored_item)
+                        # Last fallback: try to resolve by URI.
+                        if not qi.media_item and qi.uri:
+                            with suppress(MusicAssistantError):
+                                restored_from_uri = await self.mass.music.get_item_by_uri(qi.uri)
+                                if not isinstance(restored_from_uri, BrowseFolder):
+                                    qi.media_item = cast("PlayableMediaItemType", restored_from_uri)
+                    if not qi.media_item:
                         self.logger.debug(
                             "Skipping queue item %s (index %d) restored from cache "
                             "without media_item",
