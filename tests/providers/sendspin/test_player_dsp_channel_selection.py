@@ -7,7 +7,10 @@ from typing import Any
 
 from aiosendspin.server.channels import MAIN_CHANNEL
 
-from music_assistant.providers.sendspin.player import _compute_unique_dsp_channels, _get_player_channel
+from music_assistant.providers.sendspin.player import (
+    _compute_unique_dsp_channels,
+    _get_player_channel,
+)
 
 
 def _make_dsp_config(*, enabled: bool, filter_enabled: bool = True) -> SimpleNamespace:
