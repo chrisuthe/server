@@ -4,13 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, cast
-from uuid import NAMESPACE_URL, UUID, uuid5
+from typing import TYPE_CHECKING, cast
 
 from aiosendspin.models import AudioCodec, MediaCommand
 from aiosendspin.models.types import PlaybackStateType
@@ -23,7 +20,6 @@ from aiosendspin.server import (
     VolumeChangedEvent,
 )
 from aiosendspin.server.audio import AudioFormat as SendspinAudioFormat
-from aiosendspin.server.channels import MAIN_CHANNEL
 from aiosendspin.server.client import DisconnectBehaviour
 from aiosendspin.server.events import ClientGroupChangedEvent
 from aiosendspin.server.group import (
@@ -67,10 +63,7 @@ from music_assistant.constants import (
     CONF_ENTRY_HTTP_PROFILE_HIDDEN,
     CONF_ENTRY_OUTPUT_CODEC_HIDDEN,
     CONF_ENTRY_SAMPLE_RATES,
-    CONF_OUTPUT_CHANNELS,
 )
-from music_assistant.helpers.audio import get_chunksize, get_player_filter_params
-from music_assistant.helpers.ffmpeg import get_ffmpeg_stream
 from music_assistant.models.player import Player, PlayerMedia
 
 # Supported group commands for Sendspin players
@@ -139,130 +132,12 @@ if TYPE_CHECKING:
 
     from aiosendspin.models.player import SupportedAudioFormat
     from aiosendspin.server.client import SendspinClient
-    from aiosendspin.server.push_stream import CachedPCMChunk, PushStream
+    from aiosendspin.server.push_stream import PushStream
     from music_assistant_models.config_entries import ConfigValueType
-    from music_assistant_models.dsp import DSPConfig
     from music_assistant_models.player_queue import PlayerQueue
     from music_assistant_models.queue_item import QueueItem
 
-    from music_assistant.mass import MusicAssistant
-
     from .provider import SendspinProvider
-
-
-def _get_player_channel(mass: MusicAssistant, player_id: str) -> UUID:
-    """Compute the channel UUID for a player based on their DSP configuration.
-
-    Players use MAIN_CHANNEL only when they have no per-player output processing.
-    A dedicated channel is created when:
-    - DSP is explicitly enabled for the player, or
-    - output channel mode is not stereo.
-
-    :param mass: MusicAssistant instance.
-    :param player_id: The player ID to compute channel for.
-    :return: Channel UUID (MAIN_CHANNEL or a per-player custom channel).
-    """
-    return MAIN_CHANNEL  # TODO: just use MAIN_CHANNEL for now to test basic playback without DSP
-    dsp_config = mass.config.get_player_dsp_config(player_id)
-    output_channels = mass.config.get_raw_player_config_value(
-        player_id, CONF_OUTPUT_CHANNELS, "stereo"
-    )
-    needs_custom_channel = dsp_config.enabled or output_channels != "stereo"
-
-    if not needs_custom_channel:
-        return MAIN_CHANNEL
-
-    # Dedicated deterministic channel per player.
-    return uuid5(NAMESPACE_URL, f"sendspin:dsp:{player_id}")
-
-
-def _compute_unique_dsp_channels(
-    mass: MusicAssistant,
-    player_ids: list[str],
-) -> dict[UUID, tuple[DSPConfig, list[str]]]:
-    """Compute custom DSP channels for players.
-
-    :param mass: MusicAssistant instance.
-    :param player_ids: Player IDs to compute channels for.
-    :return: Dict mapping channel_id -> (dsp_config, player_ids).
-    """
-    channel_map: dict[UUID, tuple[DSPConfig, list[str]]] = {}
-
-    for player_id in player_ids:
-        channel_id = _get_player_channel(mass, player_id)
-
-        # Skip MAIN_CHANNEL (no DSP needed)
-        if channel_id == MAIN_CHANNEL:
-            continue
-
-        dsp_config = mass.config.get_player_dsp_config(player_id)
-        dsp_config.filters = [f for f in dsp_config.filters if f.enabled]
-        channel_map[channel_id] = (dsp_config, [player_id])
-
-    return channel_map
-
-
-def _dsp_config_to_filter_params(
-    mass: MusicAssistant,
-    player_id: str,
-    pcm_format: AudioFormat,
-) -> list[str]:
-    """Get ffmpeg filter parameters for a player's DSP configuration.
-
-    Reuses the existing ``get_player_filter_params`` helper which handles
-    input/output gain, EQ filters, channel mixing, and the output limiter.
-
-    :param mass: MusicAssistant instance.
-    :param player_id: The player to get filter params for.
-    :param pcm_format: The PCM audio format (used as both input and output format).
-    :return: List of ffmpeg filter parameter strings.
-    """
-    return get_player_filter_params(mass, player_id, pcm_format, pcm_format)
-
-
-@dataclass(slots=True)
-class _DSPChunkRequest:
-    """Track one source chunk awaiting DSP-processed output."""
-
-    future: asyncio.Future[bytes]
-    expected_bytes: int
-    buffer: bytearray
-
-
-@dataclass(slots=True)
-class _PendingDSPBatch:
-    """One source chunk plus DSP futures that must be committed in order."""
-
-    main_chunk: bytes
-    dsp_results: list[tuple[UUID, asyncio.Future[bytes]]]
-    created_monotonic: float
-
-
-type _DSPQueue = asyncio.Queue[tuple[bytes, asyncio.Future[bytes]] | None]
-
-
-def _resolve_ready_dsp_requests(
-    output_buffer: bytearray,
-    pending_requests: deque[_DSPChunkRequest],
-) -> None:
-    """Move buffered DSP output into pending requests in FIFO order."""
-    while pending_requests and output_buffer:
-        request = pending_requests[0]
-        bytes_needed = request.expected_bytes - len(request.buffer)
-        if bytes_needed <= 0:
-            pending_requests.popleft()
-            if not request.future.done():
-                request.future.set_result(bytes(request.buffer))
-            continue
-
-        bytes_to_take = min(bytes_needed, len(output_buffer))
-        request.buffer.extend(output_buffer[:bytes_to_take])
-        del output_buffer[:bytes_to_take]
-
-        if len(request.buffer) == request.expected_bytes:
-            pending_requests.popleft()
-            if not request.future.done():
-                request.future.set_result(bytes(request.buffer))
 
 
 class SendspinPlayer(Player):
@@ -301,7 +176,6 @@ class SendspinPlayer(Player):
         self._attr_type = PlayerType.PLAYER
         self._attr_supported_features = {
             PlayerFeature.SET_MEMBERS,
-            PlayerFeature.MULTI_DEVICE_DSP,
             PlayerFeature.VOLUME_SET,
             PlayerFeature.VOLUME_MUTE,
         }
@@ -612,167 +486,46 @@ class SendspinPlayer(Player):
                 self.display_name,
             )
 
-    def _setup_dsp_channels(
+    async def _throttle_playback(
         self,
-        push_stream: PushStream,
+        chunk_size: int,
         pcm_format: AudioFormat,
-    ) -> tuple[dict[UUID, _DSPQueue], list[asyncio.Task[None]]]:
-        """Set up per-player DSP processing channels.
+        play_start_us: int,
+    ) -> int:
+        """Throttle audio production to stay at most ~6s ahead of realtime.
 
-        :param push_stream: The active PushStream.
+        :param chunk_size: Size of the current audio chunk in bytes.
         :param pcm_format: The PCM audio format.
-        :return: Tuple of (dsp_queues, dsp_tasks).
+        :param play_start_us: The play start timestamp from commit_audio().
+        :return: The playback end timestamp in microseconds.
         """
-        all_player_ids = [self.player_id, *self._attr_group_members]
-        unique_channels = _compute_unique_dsp_channels(self.mass, all_player_ids)
-
-        dsp_queues: dict[UUID, _DSPQueue] = {}
-        dsp_tasks: list[asyncio.Task[None]] = []
-
-        if unique_channels:
-            self.logger.debug(
-                "Multi-device DSP: %d unique DSP channel(s) for %d players",
-                len(unique_channels),
-                1 + len(self._attr_group_members),
-            )
-
-        for channel_id, (_dsp_config, player_ids) in unique_channels.items():
-            queue: _DSPQueue = asyncio.Queue(maxsize=10)
-            dsp_queues[channel_id] = queue
-            task = asyncio.create_task(
-                self._channel_dsp_processor(
-                    channel_id=channel_id,
-                    player_id=player_ids[0],
-                    raw_queue=queue,
-                    push_stream=push_stream,
-                    pcm_format=pcm_format,
-                )
-            )
-            dsp_tasks.append(task)
-            push_stream.enable_pcm_cache_for_channel(channel_id)
-
-        return dsp_queues, dsp_tasks
-
-    async def _process_cached_audio_through_dsp(
-        self,
-        cached_chunks: list[CachedPCMChunk],
-        player_id: str,
-        pcm_format: AudioFormat,
-    ) -> list[bytes]:
-        """Process cached PCM chunks through a player's DSP filter chain.
-
-        :param cached_chunks: Cached PCM chunks to process.
-        :param player_id: Player ID for DSP config lookup.
-        :param pcm_format: PCM audio format.
-        :return: List of processed PCM chunks in chronological order.
-        """
-        filter_params = _dsp_config_to_filter_params(self.mass, player_id, pcm_format)
-
-        if not filter_params:
-            return [chunk.pcm_data for chunk in cached_chunks]
-
-        async def chunk_generator() -> AsyncGenerator[bytes, None]:
-            for chunk in cached_chunks:
-                yield chunk.pcm_data
-
-        processed_chunks: list[bytes] = []
-        async for processed_chunk in get_ffmpeg_stream(
-            audio_input=chunk_generator(),
-            input_format=pcm_format,
-            output_format=pcm_format,
-            filter_params=filter_params,
-        ):
-            processed_chunks.append(processed_chunk)
-
-        return processed_chunks
-
-    async def _bootstrap_new_dsp_channel(
-        self,
-        channel_id: UUID,
-        player_id: str,
-        push_stream: PushStream,
-        pcm_format: AudioFormat,
-    ) -> tuple[_DSPQueue, asyncio.Task[None]]:
-        """Bootstrap a new DSP channel for a late-joining player with unique DSP config.
-
-        Retrieves MAIN_CHANNEL PCM cache, processes it through the player's DSP,
-        and injects the result as historical audio before starting the live DSP
-        processor task.
-
-        :param channel_id: UUID of the new channel to create.
-        :param player_id: Player ID for DSP config lookup.
-        :param push_stream: Active PushStream instance.
-        :param pcm_format: PCM format for audio processing.
-        :return: Tuple of (raw_pcm_queue, dsp_processor_task).
-        """
-        # Retrieve cached MAIN_CHANNEL PCM and process through DSP
-        cached_chunks = push_stream.get_cached_pcm_chunks(MAIN_CHANNEL)
-        if cached_chunks:
-            try:
-                join_target_ts = push_stream.get_late_join_target_timestamp_us()
-                eligible_chunks = [
-                    chunk
-                    for chunk in cached_chunks
-                    if chunk.timestamp_us + chunk.duration_us > join_target_ts
-                ]
-                if not eligible_chunks:
-                    eligible_chunks = cached_chunks
-
-                processed = await self._process_cached_audio_through_dsp(
-                    eligible_chunks, player_id, pcm_format
-                )
-                sendspin_fmt = SendspinAudioFormat(
-                    sample_rate=pcm_format.sample_rate,
-                    bit_depth=pcm_format.bit_depth,
-                    channels=pcm_format.channels,
-                )
-                for idx, chunk_pcm in enumerate(processed):
-                    push_stream.prepare_historical_audio(
-                        chunk_pcm,
-                        sendspin_fmt,
-                        channel_id=channel_id,
-                        start_time_us=eligible_chunks[0].timestamp_us if idx == 0 else None,
-                    )
-            except Exception:
-                self.logger.exception(
-                    "Failed to process historical audio for channel %s (player %s), "
-                    "starting without catch-up",
-                    channel_id,
-                    player_id,
-                )
-
-        # Enable PCM caching for the new channel
-        push_stream.enable_pcm_cache_for_channel(channel_id)
-
-        # Create queue and DSP processor task for ongoing live audio
-        queue: _DSPQueue = asyncio.Queue(maxsize=10)
-        task = asyncio.create_task(
-            self._channel_dsp_processor(
-                channel_id=channel_id,
-                player_id=player_id,
-                raw_queue=queue,
-                push_stream=push_stream,
-                pcm_format=pcm_format,
-            )
+        bytes_per_second = (
+            pcm_format.sample_rate * pcm_format.channels * (pcm_format.bit_depth // 8)
         )
+        chunk_duration_us = int(chunk_size * 1_000_000 / bytes_per_second)
+        playback_end_us = play_start_us + max(chunk_duration_us, 0)
+        target_ahead_us = 6_000_000
+        while True:
+            now_us = int(self.mass.loop.time() * 1_000_000)
+            ahead_us = playback_end_us - now_us
+            if ahead_us <= target_ahead_us:
+                break
+            await asyncio.sleep(min((ahead_us - target_ahead_us) / 1_000_000, 1.0))
+        return playback_end_us
 
-        return queue, task
-
-    async def _run_playback(self, media: PlayerMedia) -> None:  # noqa: PLR0915
+    async def _run_playback(self, media: PlayerMedia) -> None:
         """Run the actual playback in a background task."""
         audio_source: AsyncGenerator[bytes, None] | None = None
         playback_end_us: int | None = None
         cancelled = False
         errored = False
-        dsp_tasks: list[asyncio.Task[None]] = []
-        dsp_queues: dict[UUID, _DSPQueue] = {}
         try:
             # Define source PCM format for streaming (what MA yields).
-            # aiosendspin converts to per-player formats as needed.
+            # aiosendspin only supports 16-bit PCM for now.
             pcm_format = AudioFormat(
-                content_type=ContentType.PCM_S32LE,
+                content_type=ContentType.PCM_S16LE,
                 sample_rate=48000,
-                bit_depth=32,
+                bit_depth=16,
                 channels=2,
             )
 
@@ -783,231 +536,24 @@ class SendspinPlayer(Player):
                 channels=pcm_format.channels,
             )
 
-            # Create channel resolver that computes mappings on-the-fly.
-            # This automatically handles late joiners without needing mutable state.
-            def channel_resolver(player_id: str) -> UUID:
-                return _get_player_channel(self.mass, player_id)
-
-            self._push_stream = self.api.group.start_stream(
-                channel_resolver=channel_resolver,
-            )
-
-            # Set up per-player DSP processing channels
-            dsp_queues, dsp_tasks = self._setup_dsp_channels(self._push_stream, pcm_format)
-
-            # Track known group members for late-joiner detection
-            known_members = set(self._attr_group_members)
-            known_members.add(self.player_id)
-
-            bytes_per_second = (
-                pcm_format.sample_rate * pcm_format.channels * (pcm_format.bit_depth // 8)
-            )
+            # Main-channel-only playback.
+            self._push_stream = self.api.group.start_stream()
 
             # Get raw audio source from Music Assistant (no DSP applied at source level)
             audio_source = self.mass.streams.get_stream(media, pcm_format)
 
-            loop = asyncio.get_running_loop()
-            pending_batches: deque[_PendingDSPBatch] = deque()
-            results_event = asyncio.Event()
-            max_pending_batches = 8
-            max_pending_age_s = 8.0
-
-            async def _commit_batch(
-                batch: _PendingDSPBatch, *, force_missing_silence: bool = False
-            ) -> None:
-                nonlocal playback_end_us
+            # Push audio chunks to connected players
+            async for chunk in audio_source:
                 if self._push_stream is None or self._push_stream.is_stopped:
-                    return
-
-                # Always prepare main channel for this batch.
-                self._push_stream.prepare_audio(batch.main_chunk, sendspin_source_format)
-                silence_chunk = b"\x00" * len(batch.main_chunk)
-
-                # Keep all channels aligned per batch. Missing/failed DSP outputs
-                # are replaced with silence when we are forced to commit.
-                for channel_id, future in batch.dsp_results:
-                    if not future.done():
-                        if force_missing_silence:
-                            future.cancel()
-                            self._push_stream.prepare_audio(
-                                silence_chunk,
-                                sendspin_source_format,
-                                channel_id=channel_id,
-                            )
-                        continue
-
-                    result: bytes | None = None
-                    try:
-                        result = future.result()
-                    except Exception as err:
-                        self.logger.warning(
-                            "DSP channel %s failed for current chunk: %s",
-                            channel_id,
-                            err,
-                        )
-
-                    if not result or len(result) != len(batch.main_chunk):
-                        self._push_stream.prepare_audio(
-                            silence_chunk,
-                            sendspin_source_format,
-                            channel_id=channel_id,
-                        )
-                        continue
-
-                    self._push_stream.prepare_audio(
-                        result, sendspin_source_format, channel_id=channel_id
-                    )
-
-                # Check for new group members with unique DSP configs
-                await self._check_for_new_dsp_channels(
-                    known_members,
-                    dsp_queues,
-                    dsp_tasks,
-                    self._push_stream,
-                    pcm_format,
-                )
-
-                play_start_us = await self._push_stream.commit_audio()
-
-                # Track playback end for graceful stop at end-of-stream
-                playback_end_us = play_start_us + int(
-                    len(batch.main_chunk) * 1_000_000 / bytes_per_second
-                )
-
-                await self._push_stream.sleep_to_limit_buffer(30_000_000)
-
-            async def _drain_ready_batches() -> None:
-                while pending_batches:
-                    batch = pending_batches[0]
-                    ready = all(future.done() for _channel_id, future in batch.dsp_results)
-                    if ready:
-                        pending_batches.popleft()
-                        await _commit_batch(batch)
-                        continue
-
-                    head_age_s = loop.time() - batch.created_monotonic
-                    over_capacity = len(pending_batches) > max_pending_batches
-                    over_age = head_age_s > max_pending_age_s
-                    if not over_capacity and not over_age:
-                        break
-
-                    pending_batches.popleft()
-                    self.logger.warning(
-                        "DSP pending exceeded thresholds (pending=%d age=%.2fs); "
-                        "forcing synced fallback for %d channel(s)",
-                        len(pending_batches) + 1,
-                        head_age_s,
-                        sum(1 for _channel_id, future in batch.dsp_results if not future.done()),
-                    )
-                    await _commit_batch(batch, force_missing_silence=True)
-
-            def _head_is_ready() -> bool:
-                if not pending_batches:
-                    return False
-                return all(future.done() for _channel_id, future in pending_batches[0].dsp_results)
-
-            def _head_exceeded_threshold() -> bool:
-                if not pending_batches:
-                    return False
-                head = pending_batches[0]
-                head_age_s = loop.time() - head.created_monotonic
-                return len(pending_batches) > max_pending_batches or head_age_s > max_pending_age_s
-
-            batch_queue: asyncio.Queue[_PendingDSPBatch | None] = asyncio.Queue(
-                maxsize=max_pending_batches * 2
-            )
-
-            async def _produce_batches() -> None:
-                try:
-                    async for chunk in audio_source:
-                        if self._push_stream is None or self._push_stream.is_stopped:
-                            break
-
-                        dsp_results: list[tuple[UUID, asyncio.Future[bytes]]] = []
-                        if dsp_queues:
-                            queue_writes = []
-                            for channel_id, queue in dsp_queues.items():
-                                result_future: asyncio.Future[bytes] = loop.create_future()
-                                result_future.add_done_callback(lambda _future: results_event.set())
-                                dsp_results.append((channel_id, result_future))
-                                queue_writes.append(queue.put((chunk, result_future)))
-                            await asyncio.gather(*queue_writes)
-
-                        await batch_queue.put(
-                            _PendingDSPBatch(
-                                main_chunk=chunk,
-                                dsp_results=dsp_results,
-                                created_monotonic=loop.time(),
-                            )
-                        )
-                finally:
-                    await batch_queue.put(None)
-
-            producer_task = asyncio.create_task(_produce_batches())
-            producer_done = False
-
-            async def _consume_one_from_queue() -> None:
-                nonlocal producer_done
-                item = await batch_queue.get()
-                if item is None:
-                    producer_done = True
-                    return
-                pending_batches.append(item)
-
-            def _drain_queue_nowait() -> None:
-                nonlocal producer_done
-                while True:
-                    try:
-                        item = batch_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-                    if item is None:
-                        producer_done = True
-                        continue
-                    pending_batches.append(item)
-
-            while True:
-                _drain_queue_nowait()
-                await _drain_ready_batches()
-
-                if producer_done and not pending_batches:
                     break
 
-                # If head is waiting (but not yet over threshold), wait for DSP
-                # completion or producer input, whichever arrives first.
-                if pending_batches and not _head_is_ready() and not _head_exceeded_threshold():
-                    if results_event.is_set():
-                        results_event.clear()
-                    dsp_wait = asyncio.create_task(results_event.wait())
-                    queue_wait: asyncio.Task[None] | None = None
-                    if not producer_done:
-                        queue_wait = asyncio.create_task(_consume_one_from_queue())
+                # Send raw PCM to the group stream.
+                self._push_stream.prepare_audio(chunk, sendspin_source_format)
 
-                    wait_tasks: list[asyncio.Task[Any]] = [dsp_wait]
-                    if queue_wait is not None:
-                        wait_tasks.append(queue_wait)
-
-                    _done, pending_waiters = await asyncio.wait(
-                        wait_tasks,
-                        timeout=0.05,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    for task in pending_waiters:
-                        task.cancel()
-
-                    if results_event.is_set():
-                        results_event.clear()
-
-                    # Ensure producer exceptions surface quickly.
-                    if producer_task.done():
-                        await producer_task
-                    continue
-
-                if not pending_batches and not producer_done:
-                    await _consume_one_from_queue()
-                    continue
-
-            await producer_task
+                play_start_us = await self._push_stream.commit_audio()
+                playback_end_us = await self._throttle_playback(
+                    len(chunk), pcm_format, play_start_us
+                )
 
         except asyncio.CancelledError:
             cancelled = True
@@ -1018,215 +564,26 @@ class SendspinPlayer(Player):
             self.logger.exception("Error during playback for player %s", self.display_name)
             raise
         finally:
-            await self._cleanup_playback(
-                dsp_queues,
-                dsp_tasks,
-                audio_source,
-                cancelled=cancelled,
-                errored=errored,
-                playback_end_us=playback_end_us,
-            )
+            # Ensure the source generator is closed to avoid leaking ffmpeg processes.
+            if audio_source is not None:
+                with suppress(Exception):
+                    await audio_source.aclose()
 
-    async def _cleanup_playback(
-        self,
-        dsp_queues: dict[UUID, _DSPQueue],
-        dsp_tasks: list[asyncio.Task[None]],
-        audio_source: AsyncGenerator[bytes, None] | None,
-        *,
-        cancelled: bool,
-        errored: bool,
-        playback_end_us: int | None,
-    ) -> None:
-        """Clean up playback resources after stream ends.
-
-        :param dsp_queues: Active DSP queues to drain.
-        :param dsp_tasks: Active DSP tasks to await.
-        :param audio_source: Audio source generator to close.
-        :param cancelled: Whether playback was cancelled.
-        :param errored: Whether playback errored.
-        :param playback_end_us: Scheduled end timestamp for graceful stop.
-        """
-        # Signal DSP tasks to stop by sending sentinel values
-        for queue in dsp_queues.values():
-            with suppress(Exception):
-                await queue.put(None)
-        if dsp_tasks:
-            await asyncio.gather(*dsp_tasks, return_exceptions=True)
-
-        # Ensure the source generator is closed to avoid leaking ffmpeg processes.
-        if audio_source is not None:
-            with suppress(Exception):
-                await audio_source.aclose()
-
-        # If we reached end-of-stream normally, schedule stop at the actual end time
-        # so clients can play the queued audio. On cancel/error: stop immediately.
-        if (
-            not cancelled
-            and not errored
-            and playback_end_us is not None
-            and self._push_stream is not None
-            and not self._push_stream.is_stopped
-        ):
-            with suppress(Exception):
-                await self.api.group.stop(stop_time_us=playback_end_us)
-        else:
-            with suppress(Exception):
-                self.api.group.stop_stream()
-        self._push_stream = None
-
-    async def _check_for_new_dsp_channels(
-        self,
-        known_members: set[str],
-        dsp_queues: dict[UUID, _DSPQueue],
-        dsp_tasks: list[asyncio.Task[None]],
-        push_stream: PushStream,
-        pcm_format: AudioFormat,
-    ) -> None:
-        """Detect new group members and bootstrap DSP channels if needed.
-
-        :param known_members: Set of player IDs already known.
-        :param dsp_queues: Active DSP queues (updated in-place).
-        :param dsp_tasks: Active DSP tasks (updated in-place).
-        :param push_stream: Active PushStream instance.
-        :param pcm_format: PCM audio format.
-        """
-        current_members = {self.player_id, *self._attr_group_members}
-        new_members = current_members - known_members
-        if not new_members:
-            return
-
-        for new_player_id in new_members:
-            known_members.add(new_player_id)
-
-            # Compute channel for this player on-the-fly
-            channel_id = _get_player_channel(self.mass, new_player_id)
-
-            if channel_id == MAIN_CHANNEL or channel_id in dsp_queues:
-                # No DSP needed or channel already exists
-                continue
-
-            # New unique DSP config: bootstrap the channel
-            self.logger.info(
-                "Bootstrapping new DSP channel %s for late-joining player %s",
-                channel_id,
-                new_player_id,
-            )
-            try:
-                queue, task = await self._bootstrap_new_dsp_channel(
-                    channel_id,
-                    new_player_id,
-                    push_stream,
-                    pcm_format,
-                )
-                dsp_queues[channel_id] = queue
-                dsp_tasks.append(task)
-            except Exception:
-                self.logger.exception(
-                    "Failed to bootstrap DSP channel for player %s",
-                    new_player_id,
-                )
-
-    async def _channel_dsp_processor(  # noqa: PLR0915
-        self,
-        channel_id: UUID,
-        player_id: str,
-        raw_queue: _DSPQueue,
-        push_stream: PushStream,
-        pcm_format: AudioFormat,
-    ) -> None:
-        """Process a single DSP channel by piping raw PCM through ffmpeg.
-
-        Reads raw PCM chunks from the queue, pipes them through an ffmpeg process
-        with the player's DSP filter chain, and feeds the processed output to
-        the push stream on the assigned channel.
-
-        :param channel_id: The channel UUID to push processed audio to.
-        :param player_id: Player ID used to derive DSP filter parameters.
-        :param raw_queue: Queue receiving raw PCM chunks (None = end of stream).
-        :param push_stream: The PushStream to push processed audio to.
-        :param pcm_format: The PCM audio format for input and output.
-        """
-        filter_params = _dsp_config_to_filter_params(self.mass, player_id, pcm_format)
-        pending_requests: deque[_DSPChunkRequest] = deque()
-        output_buffer = bytearray()
-
-        def _fail_pending(exc: Exception) -> None:
-            while pending_requests:
-                pending = pending_requests.popleft()
-                if not pending.future.done():
-                    pending.future.set_exception(exc)
-            while True:
-                try:
-                    queued_item = raw_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                if queued_item is None:
-                    continue
-                _pcm, queued_future = queued_item
-                if not queued_future.done():
-                    queued_future.set_exception(exc)
-
-        if not filter_params:
-            # No active filters; just pass through to channel
-            while True:
-                queued_item = await raw_queue.get()
-                if queued_item is None:
-                    break
-                pcm, result_future = queued_item
-                if push_stream.is_stopped:
-                    if not result_future.done():
-                        result_future.set_exception(
-                            RuntimeError(f"PushStream stopped for DSP channel {channel_id}")
-                        )
-                    continue
-                if not result_future.done():
-                    result_future.set_result(pcm)
-            return
-
-        async def _queue_to_generator() -> AsyncGenerator[bytes, None]:
-            """Convert the raw queue into an async generator for ffmpeg input."""
-            while True:
-                queued_item = await raw_queue.get()
-                if queued_item is None:
-                    return
-                pcm, result_future = queued_item
-                pending_requests.append(
-                    _DSPChunkRequest(
-                        future=result_future,
-                        expected_bytes=len(pcm),
-                        buffer=bytearray(),
-                    )
-                )
-                _resolve_ready_dsp_requests(output_buffer, pending_requests)
-                yield pcm
-
-        try:
-            output_chunk_size = max(1, get_chunksize(pcm_format, 0.02))
-            async for processed_chunk in get_ffmpeg_stream(
-                audio_input=_queue_to_generator(),
-                input_format=pcm_format,
-                output_format=pcm_format,
-                filter_params=filter_params,
-                chunk_size=output_chunk_size,
+            # If we reached end-of-stream normally, schedule stop at the actual end time
+            # so clients can play the queued audio. On cancel/error: stop immediately.
+            if (
+                not cancelled
+                and not errored
+                and playback_end_us is not None
+                and self._push_stream is not None
+                and not self._push_stream.is_stopped
             ):
-                if push_stream.is_stopped:
-                    break
-                output_buffer.extend(processed_chunk)
-                _resolve_ready_dsp_requests(output_buffer, pending_requests)
-
-            _resolve_ready_dsp_requests(output_buffer, pending_requests)
-            if pending_requests:
-                _fail_pending(
-                    RuntimeError(
-                        f"DSP processor ended with {len(pending_requests)} unresolved request(s) "
-                        f"for channel {channel_id}"
-                    )
-                )
-        except Exception as err:
-            self.logger.exception(
-                "DSP processor error for channel %s (player %s)", channel_id, player_id
-            )
-            _fail_pending(err)
+                with suppress(Exception):
+                    await self.api.group.stop(stop_time_us=playback_end_us)
+            else:
+                with suppress(Exception):
+                    self.api.group.stop_stream()
+            self._push_stream = None
 
     async def set_members(
         self,
