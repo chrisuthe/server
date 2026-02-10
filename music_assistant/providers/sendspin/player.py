@@ -162,6 +162,7 @@ def _get_player_channel(mass: MusicAssistant, player_id: str) -> UUID:
     :param player_id: The player ID to compute channel for.
     :return: Channel UUID (MAIN_CHANNEL or a per-player custom channel).
     """
+    return MAIN_CHANNEL  # TODO: just use MAIN_CHANNEL for now to test basic playback without DSP
     dsp_config = mass.config.get_player_dsp_config(player_id)
     output_channels = mass.config.get_raw_player_config_value(
         player_id, CONF_OUTPUT_CHANNELS, "stereo"
@@ -708,17 +709,29 @@ class SendspinPlayer(Player):
         cached_chunks = push_stream.get_cached_pcm_chunks(MAIN_CHANNEL)
         if cached_chunks:
             try:
+                join_target_ts = push_stream.get_late_join_target_timestamp_us()
+                eligible_chunks = [
+                    chunk
+                    for chunk in cached_chunks
+                    if chunk.timestamp_us + chunk.duration_us > join_target_ts
+                ]
+                if not eligible_chunks:
+                    eligible_chunks = cached_chunks
+
                 processed = await self._process_cached_audio_through_dsp(
-                    cached_chunks, player_id, pcm_format
+                    eligible_chunks, player_id, pcm_format
                 )
                 sendspin_fmt = SendspinAudioFormat(
                     sample_rate=pcm_format.sample_rate,
                     bit_depth=pcm_format.bit_depth,
                     channels=pcm_format.channels,
                 )
-                for chunk_pcm in processed:
+                for idx, chunk_pcm in enumerate(processed):
                     push_stream.prepare_historical_audio(
-                        chunk_pcm, sendspin_fmt, channel_id=channel_id
+                        chunk_pcm,
+                        sendspin_fmt,
+                        channel_id=channel_id,
+                        start_time_us=eligible_chunks[0].timestamp_us if idx == 0 else None,
                     )
             except Exception:
                 self.logger.exception(
@@ -845,8 +858,6 @@ class SendspinPlayer(Player):
                         result, sendspin_source_format, channel_id=channel_id
                     )
 
-                play_start_us = await self._push_stream.commit_audio()
-
                 # Check for new group members with unique DSP configs
                 await self._check_for_new_dsp_channels(
                     known_members,
@@ -855,6 +866,8 @@ class SendspinPlayer(Player):
                     self._push_stream,
                     pcm_format,
                 )
+
+                play_start_us = await self._push_stream.commit_audio()
 
                 # Track playback end for graceful stop at end-of-stream
                 playback_end_us = play_start_us + int(
