@@ -13,6 +13,7 @@ from music_assistant_models.errors import (
     ProviderUnavailableError,
 )
 from music_assistant_models.media_items import (
+    Album,
     Playlist,
     Track,
 )
@@ -547,6 +548,38 @@ class PlaylistController(MediaControllerBase[Playlist]):
             # simply iterate all tracks with force_refresh=True to refresh the cache
             async for _ in self.tracks(playlist.item_id, playlist.provider, force_refresh=True):
                 pass
+            # recalculate genres from the refreshed tracks
+            await self._update_playlist_genres(playlist)
 
         task_id = f"refresh_playlist_tracks_{playlist.item_id}"
         self.mass.call_later(5, _refresh, playlist, task_id=task_id)  # debounce multiple calls
+
+    async def _update_playlist_genres(self, playlist: Playlist) -> None:
+        """Recalculate playlist genres from the current track list.
+
+        This is a lightweight operation that only reads cached track data
+        to update the genre metadata, without triggering collage image generation
+        or other expensive metadata operations.
+
+        :param playlist: The playlist to update genres for.
+        """
+        playlist_genres: dict[str, int] = {}
+        async for track in self.tracks(playlist.item_id, playlist.provider):
+            if track.metadata.genres:
+                genres = track.metadata.genres
+            elif (
+                isinstance(track, Track)
+                and track.album
+                and isinstance(track.album, Album)
+                and track.album.metadata.genres
+            ):
+                genres = track.album.metadata.genres
+            else:
+                genres = set()
+            for genre in genres:
+                if genre not in playlist_genres:
+                    playlist_genres[genre] = 0
+                playlist_genres[genre] += 1
+        playlist_genres_filtered = {genre for genre, count in playlist_genres.items() if count > 5}
+        playlist.metadata.genres = set(list(playlist_genres_filtered)[:8])
+        await self.update_item_in_library(playlist.item_id, playlist)
