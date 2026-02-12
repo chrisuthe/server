@@ -305,8 +305,9 @@ class SendspinPlayer(Player):
                         self._attr_playback_state = PlaybackState.IDLE
                         self._attr_elapsed_time = 0
                         self._attr_elapsed_time_last_updated = time.time()
-                        if self._playback_task and not self._playback_task.done():
-                            self._playback_task.cancel()
+                        # TODO:
+                        # if self._playback_task and not self._playback_task.done():
+                        #     self._playback_task.cancel()
                 # Update in case this is a newly created group
                 # GroupMemberAddedEvent or GroupMemberRemovedEvent will be fired before this
                 # so group members are already up to date at this point
@@ -339,8 +340,9 @@ class SendspinPlayer(Player):
                         self._attr_playback_state = PlaybackState.IDLE
                         self._attr_elapsed_time = 0
                         self._attr_elapsed_time_last_updated = time.time()
-                        if self._playback_task and not self._playback_task.done():
-                            self._playback_task.cancel()
+                        # TODO:
+                        # if self._playback_task and not self._playback_task.done():
+                        #     self._playback_task.cancel()
                 self.update_state()
             case GroupMemberAddedEvent(client_id=client_id):
                 self.logger.debug("Group member added: %s", client_id)

@@ -552,7 +552,7 @@ async def run_playback(player: SendspinPlayer, media: PlayerMedia) -> None:  # n
     audio_source: AsyncGenerator[bytes, None] | None = None
     prepared_queue: asyncio.Queue[_PreparedCommitFrame | None] | None = None
     prepare_task: asyncio.Task[None] | None = None
-    commit_count = 0
+    commit_count = 3  # TODO
     stream_position_us = 0
     first_main_start_us: int | None = None
     try:
@@ -614,7 +614,7 @@ async def run_playback(player: SendspinPlayer, media: PlayerMedia) -> None:  # n
                 duration_us=prepared.main_duration_us,
                 pcm_data=prepared.main_pcm,
             )
-            commit_count += 1
+            # commit_count += 1 # TODO: disable for now
             if commit_count % 10 == 0 and first_main_start_us is not None:
                 channel_debug = [
                     f"main(start_rel={main_start_us - first_main_start_us}us,"
