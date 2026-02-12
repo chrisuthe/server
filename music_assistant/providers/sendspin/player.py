@@ -154,6 +154,8 @@ if TYPE_CHECKING:
 
 # Namespace for generating deterministic DSP channel UUIDs from filter params
 _DSP_CHANNEL_NAMESPACE = UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+
+
 @dataclass
 class _DSPChannel:
     """A DSP processing channel backed by an ffmpeg process."""
