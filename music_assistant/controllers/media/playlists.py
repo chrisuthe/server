@@ -512,7 +512,10 @@ class PlaylistController(MediaControllerBase[Playlist]):
             # Builtin provider overrides to return list[PlaylistPlayableItem],
             # others return list[Track]. Since Track is part of PlaylistPlayableItem union,
             # this is safe at runtime. Type ignore needed because list is invariant.
-            return await provider.get_playlist_tracks(item_id, page=page)  # type: ignore[return-value]
+            result = await provider.get_playlist_tracks(item_id, page=page)  # type: ignore[return-value]
+        if force_refresh:
+            self._schedule_playlist_genre_update(item_id, provider_instance_id_or_domain)
+        return result
 
     async def radio_mode_base_tracks(
         self,
@@ -542,17 +545,35 @@ class PlaylistController(MediaControllerBase[Playlist]):
             await self.add_provider_mappings(db_item.item_id, db_item.provider_mappings)
 
     def _refresh_playlist_tracks(self, playlist: Playlist) -> None:
-        """Refresh playlist tracks by forcing a cache refresh."""
+        """Refresh playlist tracks by forcing a cache refresh.
+
+        Genre update is triggered automatically by _get_provider_playlist_tracks
+        when force_refresh=True.
+        """
 
         async def _refresh(playlist: Playlist) -> None:
-            # simply iterate all tracks with force_refresh=True to refresh the cache
             async for _ in self.tracks(playlist.item_id, playlist.provider, force_refresh=True):
                 pass
-            # recalculate genres from the refreshed tracks
-            await self._update_playlist_genres(playlist)
 
         task_id = f"refresh_playlist_tracks_{playlist.item_id}"
         self.mass.call_later(5, _refresh, playlist, task_id=task_id)  # debounce multiple calls
+
+    def _schedule_playlist_genre_update(self, prov_item_id: str, provider_instance_id: str) -> None:
+        """Schedule a debounced genre update for a playlist after tracks refresh.
+
+        :param prov_item_id: The provider-specific playlist item ID.
+        :param provider_instance_id: The provider instance ID.
+        """
+
+        async def _do_update() -> None:
+            library_item = await self.get_library_item_by_prov_id(
+                prov_item_id, provider_instance_id
+            )
+            if library_item:
+                await self._update_playlist_genres(library_item)
+
+        task_id = f"genre_update_{prov_item_id}_{provider_instance_id}"
+        self.mass.call_later(2, _do_update, task_id=task_id)
 
     async def _update_playlist_genres(self, playlist: Playlist) -> None:
         """Recalculate playlist genres from the current track list.
@@ -580,9 +601,21 @@ class PlaylistController(MediaControllerBase[Playlist]):
                 if genre not in playlist_genres:
                     playlist_genres[genre] = 0
                 playlist_genres[genre] += 1
-        playlist_genres_filtered = {genre for genre, count in playlist_genres.items() if count > 5}
+        # for small playlists keep all genres, for larger ones filter to significant ones
+        total_tracks = sum(playlist_genres.values()) if playlist_genres else 0
+        if total_tracks <= 20:
+            playlist_genres_filtered = set(playlist_genres.keys())
+        else:
+            min_count = min(5, total_tracks // 10)
+            playlist_genres_filtered = {
+                genre for genre, count in playlist_genres.items() if count > min_count
+            }
+        # sort by occurrence count and limit to 8
+        sorted_genres = sorted(
+            playlist_genres_filtered, key=lambda g: playlist_genres.get(g, 0), reverse=True
+        )
         # fetch fresh library item and update its genres directly
         cur_item = await self.get_library_item(int(playlist.item_id))
-        cur_item.metadata.genres = set(list(playlist_genres_filtered)[:8])
+        cur_item.metadata.genres = set(sorted_genres[:8])
         # use overwrite=True so genres are replaced, not merged
         await self.update_item_in_library(cur_item.item_id, cur_item, overwrite=True)

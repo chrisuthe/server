@@ -767,9 +767,20 @@ class MetaDataController(CoreController):
                 playlist_genres[genre] += 1
             await asyncio.sleep(0)  # yield to eventloop
 
-        playlist_genres_filtered = {genre for genre, count in playlist_genres.items() if count > 5}
-        playlist_genres_filtered = set(list(playlist_genres_filtered)[:8])
-        playlist.metadata.genres = playlist_genres_filtered
+        # for small playlists keep all genres, for larger ones filter to significant ones
+        total_tracks = sum(playlist_genres.values()) if playlist_genres else 0
+        if total_tracks <= 20:
+            playlist_genres_filtered = set(playlist_genres.keys())
+        else:
+            min_count = min(5, total_tracks // 10)
+            playlist_genres_filtered = {
+                genre for genre, count in playlist_genres.items() if count > min_count
+            }
+        # sort by occurrence count and limit to 8
+        sorted_genres = sorted(
+            playlist_genres_filtered, key=lambda g: playlist_genres.get(g, 0), reverse=True
+        )
+        playlist.metadata.genres = set(sorted_genres[:8])
         # create collage images
         cur_images: list[MediaItemImage] = playlist.metadata.images or []
         new_images = []
