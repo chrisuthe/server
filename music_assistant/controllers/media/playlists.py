@@ -547,19 +547,25 @@ class PlaylistController(MediaControllerBase[Playlist]):
     def _refresh_playlist_tracks(self, playlist: Playlist) -> None:
         """Refresh playlist tracks by forcing a cache refresh.
 
-        Genre update is triggered automatically by _get_provider_playlist_tracks
-        when force_refresh=True.
+        Collects genres in the same iteration to avoid a redundant second pass.
         """
 
         async def _refresh(playlist: Playlist) -> None:
-            async for _ in self.tracks(playlist.item_id, playlist.provider, force_refresh=True):
-                pass
+            genre_counts: dict[str, int] = {}
+            async for track in self.tracks(playlist.item_id, playlist.provider, force_refresh=True):
+                for genre in self._get_track_genres(track):
+                    genre_counts[genre] = genre_counts.get(genre, 0) + 1
+            await self._save_playlist_genres(playlist, genre_counts)
 
         task_id = f"refresh_playlist_tracks_{playlist.item_id}"
         self.mass.call_later(5, _refresh, playlist, task_id=task_id)  # debounce multiple calls
 
     def _schedule_playlist_genre_update(self, prov_item_id: str, provider_instance_id: str) -> None:
         """Schedule a debounced genre update for a playlist after tracks refresh.
+
+        Fallback for callers that refresh tracks directly via tracks()
+        rather than through _refresh_playlist_tracks. Re-iterates tracks from
+        cache since it doesn't have access to the iteration.
 
         :param prov_item_id: The provider-specific playlist item ID.
         :param provider_instance_id: The provider instance ID.
@@ -570,52 +576,46 @@ class PlaylistController(MediaControllerBase[Playlist]):
                 prov_item_id, provider_instance_id
             )
             if library_item:
-                await self._update_playlist_genres(library_item)
+                genre_counts: dict[str, int] = {}
+                async for track in self.tracks(library_item.item_id, library_item.provider):
+                    for genre in self._get_track_genres(track):
+                        genre_counts[genre] = genre_counts.get(genre, 0) + 1
+                await self._save_playlist_genres(library_item, genre_counts)
 
         task_id = f"genre_update_{prov_item_id}_{provider_instance_id}"
         self.mass.call_later(2, _do_update, task_id=task_id)
 
-    async def _update_playlist_genres(self, playlist: Playlist) -> None:
-        """Recalculate playlist genres from the current track list.
+    @staticmethod
+    def _get_track_genres(track: PlaylistPlayableItem) -> set[str]:
+        """Extract genres from a track, falling back to album genres.
 
-        This is a lightweight operation that only reads cached track data
-        to update the genre metadata, without triggering collage image generation
-        or other expensive metadata operations.
-
-        :param playlist: The playlist to update genres for.
+        :param track: The track to extract genres from.
         """
-        playlist_genres: dict[str, int] = {}
-        async for track in self.tracks(playlist.item_id, playlist.provider):
-            if track.metadata.genres:
-                genres = track.metadata.genres
-            elif (
-                isinstance(track, Track)
-                and track.album
-                and isinstance(track.album, Album)
-                and track.album.metadata.genres
-            ):
-                genres = track.album.metadata.genres
-            else:
-                genres = set()
-            for genre in genres:
-                if genre not in playlist_genres:
-                    playlist_genres[genre] = 0
-                playlist_genres[genre] += 1
+        if track.metadata.genres:
+            return track.metadata.genres
+        if (
+            isinstance(track, Track)
+            and track.album
+            and isinstance(track.album, Album)
+            and track.album.metadata.genres
+        ):
+            return track.album.metadata.genres
+        return set()
+
+    async def _save_playlist_genres(self, playlist: Playlist, genre_counts: dict[str, int]) -> None:
+        """Filter, sort, and persist playlist genres from pre-computed counts.
+
+        :param playlist: The playlist to update.
+        :param genre_counts: Mapping of genre name to occurrence count.
+        """
         # for small playlists keep all genres, for larger ones filter to significant ones
-        total_tracks = sum(playlist_genres.values()) if playlist_genres else 0
+        total_tracks = sum(genre_counts.values()) if genre_counts else 0
         if total_tracks <= 20:
-            playlist_genres_filtered = set(playlist_genres.keys())
+            filtered = set(genre_counts.keys())
         else:
             min_count = min(5, total_tracks // 10)
-            playlist_genres_filtered = {
-                genre for genre, count in playlist_genres.items() if count > min_count
-            }
-        # sort by occurrence count and limit to 8
-        sorted_genres = sorted(
-            playlist_genres_filtered, key=lambda g: playlist_genres.get(g, 0), reverse=True
-        )
-        # fetch fresh library item and update its genres directly
+            filtered = {genre for genre, count in genre_counts.items() if count > min_count}
+        sorted_genres = sorted(filtered, key=lambda g: genre_counts.get(g, 0), reverse=True)
         cur_item = await self.get_library_item(int(playlist.item_id))
         cur_item.metadata.genres = set(sorted_genres[:8])
-        # use overwrite=True so genres are replaced, not merged
         await self.update_item_in_library(cur_item.item_id, cur_item, overwrite=True)
