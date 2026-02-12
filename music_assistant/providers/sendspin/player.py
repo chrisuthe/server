@@ -150,9 +150,14 @@ if TYPE_CHECKING:
 
 # Namespace for generating deterministic DSP channel UUIDs from filter params
 _DSP_CHANNEL_NAMESPACE = UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
-_FRAME_DURATION_US = 100_000
+# Use a frame size that matches ffmpeg's typical internal audio frame granularity
+# (4096 samples at 48kHz => 16384 bytes for stereo s16le). This avoids startup
+# "short read" behavior that can otherwise cause a permanent offset between the
+# main and DSP channels when a DSP channel is (re)created mid-stream.
+_FRAME_SAMPLES = 4096
 _MAX_BUFFER_AHEAD_US = 5_000_000
 _MAIN_PCM_CACHE_RETENTION_US = 10_000_000
+_ENABLE_HISTORICAL_DSP_INJECTION = False
 
 
 @dataclass
@@ -173,6 +178,8 @@ class _DSPChannel:
     delivered_output_bytes_total: int = 0
     delivered_output_us_total: int = 0
     pending_peak_bytes: int = 0
+    pending_condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+    stdout_reader_task: asyncio.Task[None] | None = None
 
 
 @dataclass
@@ -653,32 +660,51 @@ class SendspinPlayer(Player):
             filter_params=filter_params,
         )
         await ffmpeg.start()
-        return _DSPChannel(
+        dsp = _DSPChannel(
             channel_id=channel_id,
             filter_params=filter_params,
             ffmpeg=ffmpeg,
             output_channels=output_channels,
         )
+        dsp.stdout_reader_task = asyncio.create_task(
+            self._read_dsp_stdout(dsp),
+            name=f"sendspin-dsp-stdout-{dsp.channel_id}",
+        )
+        return dsp
 
     async def _close_dsp_channel(self, dsp: _DSPChannel) -> None:
         """Close a DSP channel and release ffmpeg resources."""
+        if dsp.stdout_reader_task is not None:
+            dsp.stdout_reader_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await dsp.stdout_reader_task
         with suppress(Exception):
             await dsp.ffmpeg.close()
 
-    async def _drain_stdout(self, dsp: _DSPChannel, target: int) -> None:
-        """Read ffmpeg stdout into the pending buffer until target bytes or timeout.
+    async def _read_dsp_stdout(self, dsp: _DSPChannel) -> None:
+        """Continuously read ffmpeg stdout into dsp.pending.
 
-        :param dsp: DSP channel to drain.
-        :param target: Target number of bytes to accumulate.
+        We need to drain stdout continuously; otherwise ffmpeg can block on its stdout
+        pipe and/or our per-chunk reads can artificially lag behind real output.
         """
-        while len(dsp.pending) < target:
-            try:
-                data = await asyncio.wait_for(dsp.ffmpeg.read(target), timeout=0.01)
+        try:
+            while True:
+                data = await dsp.ffmpeg.read(65536)
                 if not data:
-                    break
+                    return
                 dsp.pending.extend(data)
-            except TimeoutError:
-                break
+                dsp.pending_peak_bytes = max(dsp.pending_peak_bytes, len(dsp.pending))
+                async with dsp.pending_condition:
+                    dsp.pending_condition.notify_all()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger.debug(
+                "DSP stdout reader failed for channel %s", dsp.channel_id, exc_info=True
+            )
+        finally:
+            async with dsp.pending_condition:
+                dsp.pending_condition.notify_all()
 
     async def _process_dsp_chunk(
         self, dsp: _DSPChannel, chunk: bytes, pcm_format: AudioFormat
@@ -706,13 +732,7 @@ class SendspinPlayer(Player):
         dsp.input_bytes_total += len(chunk)
         dsp.input_us_total += input_duration_us
         try:
-            await asyncio.wait_for(
-                asyncio.gather(
-                    dsp.ffmpeg.write(chunk),
-                    self._drain_stdout(dsp, expected),
-                ),
-                timeout=5.0,
-            )
+            await asyncio.wait_for(dsp.ffmpeg.write(chunk), timeout=5.0)
         except Exception:
             dsp.chunks_failed += 1
             dsp.delivered_output_bytes_total += expected
@@ -720,8 +740,22 @@ class SendspinPlayer(Player):
             self.logger.warning("DSP failed for channel %s", dsp.channel_id, exc_info=True)
             # Keep timeline continuity by filling this chunk with silence.
             return b"\x00" * expected
-        dsp.pending_peak_bytes = max(dsp.pending_peak_bytes, len(dsp.pending))
+
+        deadline = time.monotonic() + 2.0
+        while len(dsp.pending) < expected:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            async with dsp.pending_condition:
+                if len(dsp.pending) >= expected:
+                    break
+                if dsp.stdout_reader_task is not None and dsp.stdout_reader_task.done():
+                    break
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(dsp.pending_condition.wait(), timeout=remaining)
+
         raw_consumed_bytes = min(expected, len(dsp.pending))
+        raw_consumed_us = 0
         if raw_consumed_bytes:
             raw_consumed_us = self._pcm_duration_us(
                 raw_consumed_bytes,
@@ -733,13 +767,22 @@ class SendspinPlayer(Player):
             dsp.raw_output_us_total += raw_consumed_us
         dsp.delivered_output_bytes_total += expected
         dsp.delivered_output_us_total += output_duration_us
-        if len(dsp.pending) >= expected:
+        if raw_consumed_bytes >= expected:
             result = bytes(dsp.pending[:expected])
             del dsp.pending[:expected]
             return result
-        # First chunk: limiter withheld ~960 bytes (5ms lookahead). Pad with silence.
+
+        # Still short: output silence for the missing tail to keep stream moving,
+        # but record the fact that ffmpeg is lagging behind.
         result = bytes(dsp.pending) + b"\x00" * (expected - len(dsp.pending))
         dsp.pending.clear()
+        self.logger.debug(
+            "DSP short read channel=%s expected=%s got=%s lag_us=%s",
+            dsp.channel_id,
+            expected,
+            raw_consumed_bytes,
+            max(0, dsp.input_us_total - dsp.raw_output_us_total),
+        )
         return result
 
     async def _release_player_channel(self, player_id: str) -> None:
@@ -798,11 +841,19 @@ class SendspinPlayer(Player):
     async def _iter_pcm_frames(
         self, audio_source: AsyncGenerator[bytes, None], pcm_format: AudioFormat
     ) -> AsyncGenerator[bytes, None]:
-        """Split source PCM into 100ms frames."""
-        bytes_per_second = (
-            pcm_format.sample_rate * pcm_format.channels * (pcm_format.bit_depth // 8)
-        )
-        frame_size = int(bytes_per_second * _FRAME_DURATION_US / 1_000_000)
+        """Split source PCM into fixed-size sample frames.
+
+        This keeps the DSP (ffmpeg) pipeline in sync and avoids startup padding.
+        """
+        bytes_per_sample = pcm_format.bit_depth // 8
+        frame_stride = bytes_per_sample * pcm_format.channels
+        if frame_stride <= 0:
+            async for chunk in audio_source:
+                if chunk:
+                    yield chunk
+            return
+
+        frame_size = _FRAME_SAMPLES * frame_stride
         pending = bytearray()
 
         async for chunk in audio_source:
@@ -880,15 +931,25 @@ class SendspinPlayer(Player):
                 del self._pending_historical_injections[filter_key]
                 continue
             try:
-                discarded_chunks = len(injection.chunks)
-                discarded_bytes = sum(len(chunk) for chunk in injection.chunks)
-                self.logger.debug(
-                    "Discarded historical DSP audio for channel %s: chunks=%s bytes=%s",
-                    injection.channel_id,
-                    discarded_chunks,
-                    discarded_bytes,
-                )
-            except ValueError:
+                if not _ENABLE_HISTORICAL_DSP_INJECTION:
+                    discarded_chunks = len(injection.chunks)
+                    discarded_bytes = sum(len(chunk) for chunk in injection.chunks)
+                    self.logger.debug(
+                        "Discarded historical DSP audio for channel %s: chunks=%s bytes=%s",
+                        injection.channel_id,
+                        discarded_chunks,
+                        discarded_bytes,
+                    )
+                    continue
+
+                for chunk in injection.chunks:
+                    self._push_stream.prepare_historical_audio(
+                        chunk,
+                        injection.audio_format,
+                        channel_id=injection.channel_id,
+                    )
+                injected = True
+            except Exception:
                 self.logger.warning(
                     "Failed to inject historical DSP audio for channel %s",
                     injection.channel_id,
@@ -937,6 +998,10 @@ class SendspinPlayer(Player):
 
         dsp = await self._create_dsp_channel(filter_key, pcm_format)
         self._dsp_channels[filter_key] = dsp
+
+        if not _ENABLE_HISTORICAL_DSP_INJECTION:
+            # Debug mode: do not attempt to backfill with historical audio.
+            return filter_key
 
         target_us = self._push_stream.get_late_join_target_timestamp_us()
         historical_source = [
