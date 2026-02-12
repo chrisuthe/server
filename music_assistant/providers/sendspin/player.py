@@ -167,6 +167,8 @@ def _needs_dsp_channel(
     mass: MusicAssistant, player_id: str, pcm_format: AudioFormat
 ) -> tuple[str, ...] | None:
     """Return filter_key if player needs DSP, else None."""
+    # AI: look how we decide if a player needs a DSP channel like in the dev branch,
+    # so if DSP settings are enabled or a non stereo output format is configured
     filter_params = get_player_filter_params(mass, player_id, pcm_format, pcm_format)
     return tuple(filter_params) if filter_params else None
 
@@ -905,6 +907,7 @@ class SendspinPlayer(Player):
                 channels=pcm_format.channels,
             )
 
+            # AI: no! only look into if a dsp channel is needed when running channel_resolver!
             # Set up per-player DSP channels
             await self._setup_dsp_channels(pcm_format)
 
@@ -912,11 +915,22 @@ class SendspinPlayer(Player):
                 return self._player_channel_map.get(player_id, MAIN_CHANNEL)
 
             self._push_stream = self.api.group.start_stream(channel_resolver=channel_resolver)
+            # AI: no! dont enable pcm cache!
             for dsp in self._dsp_channels.values():
                 self._push_stream.enable_pcm_cache_for_channel(dsp.channel_id)
 
             audio_source = self.mass.streams.get_stream(media, pcm_format)
 
+            # AI: we need to split it in two loops, one thats gathering chunks, caching them (until
+            # that audio is truely played (compare with timestamp of commit_audio in the other task)), and sending them to
+            # ffmpeg for processing,
+            # and a second task that is waiting for processed chunks to be ready for all channels and commit them in one go - be very careful that all the chunks in prepare_audio start at exactly the same timestamp
+            #
+            # read /var/home/maximr/projects/music-assistant/sendspin-refactor/aiosendspin/docs/audio-streaming-timing.md
+            # for newly joined clients, we need to create the ffmpeg instance, pump it with cached audio (you may need to discard a portion of audio so alignment is correct)
+            # do not prepare audio for it untill the pre-processing is done, but once its done use prepare_historical_audio() to push audio with timestamps
+            # before the last commit_audio timestamp + duration, we need to be very careful that all prepare_audio chunks are the same duration and
+            # start at exactly!!! the same timestamp, otherwise it will be out of sync
             async for chunk in audio_source:
                 if self._push_stream is None or self._push_stream.is_stopped:
                     break
