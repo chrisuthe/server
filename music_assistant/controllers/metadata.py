@@ -429,7 +429,7 @@ class MetaDataController(CoreController):
             image_format = "png" if path.lower().endswith(".png") else "jpg"
         if provider == "builtin" and path.startswith("/collage/"):
             # special case for collage images
-            collage_rel = path.split("/collage/")[-1]
+            collage_rel = path.rsplit("/collage/", maxsplit=1)[-1]
             if not is_safe_path(collage_rel):
                 raise FileNotFoundError("Invalid collage path")
             path = os.path.join(self._collage_images_dir, collage_rel)
@@ -736,7 +736,6 @@ class MetaDataController(CoreController):
         if not (force_refresh or needs_refresh):
             return
         self.logger.debug("Updating metadata for Playlist %s", playlist.name)
-        playlist.metadata.genres = set()
         all_playlist_tracks_images: list[MediaItemImage] = []
         playlist_genres: dict[str, int] = {}
         # retrieve metadata for the playlist from the tracks (such as genres etc.)
@@ -770,7 +769,7 @@ class MetaDataController(CoreController):
 
         playlist_genres_filtered = {genre for genre, count in playlist_genres.items() if count > 5}
         playlist_genres_filtered = set(list(playlist_genres_filtered)[:8])
-        playlist.metadata.genres.update(playlist_genres_filtered)
+        playlist.metadata.genres = playlist_genres_filtered
         # create collage images
         cur_images: list[MediaItemImage] = playlist.metadata.images or []
         new_images = []
