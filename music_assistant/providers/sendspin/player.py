@@ -43,7 +43,6 @@ from aiosendspin.server.roles import (
     ControllerShuffleEvent,
     ControllerStopEvent,
     MetadataGroupRole,
-    PlayerGroupRole,
 )
 from aiosendspin.server.roles.metadata.state import Metadata
 from aiosendspin.server.roles.player.types import PlayerRoleProtocol
@@ -153,7 +152,7 @@ if TYPE_CHECKING:
     from .provider import SendspinProvider
 
 # Namespace for generating deterministic DSP channel UUIDs from filter params
-_DSP_CHANNEL_NAMESPACE = UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+_DSP_CHANNEL_NAMESPACE = UUID("53a13179-d35a-4c6e-86ce-594654184df5")
 
 
 @dataclass
@@ -226,7 +225,8 @@ class SendspinPlayer(Player):
         self.api.disconnect_behaviour = DisconnectBehaviour.STOP
         self.unsub_event_cb = sendspin_client.add_event_listener(self.event_cb)
         self.unsub_group_event_cb = sendspin_client.group.add_event_listener(self.group_event_cb)
-        self._set_supported_commands_for_group(sendspin_client.group)
+        if controller_role := self._controller_role:
+            controller_role.set_supported_commands(SUPPORTED_GROUP_COMMANDS)
 
         self._dsp_channels = {}
         self._active_dsp_filter_keys = set()
@@ -292,14 +292,6 @@ class SendspinPlayer(Player):
         return None
 
     @property
-    def _player_group_role(self) -> PlayerGroupRole | None:
-        """Get the PlayerGroupRole for this player's group."""
-        role = self.api.group.group_role("player")
-        if isinstance(role, PlayerGroupRole):
-            return role
-        return None
-
-    @property
     def _controller_role(self) -> ControllerGroupRole | None:
         """Get the ControllerGroupRole for this player's group."""
         role = self.api.group.group_role("controller")
@@ -307,11 +299,14 @@ class SendspinPlayer(Player):
             return role
         return None
 
-    def _set_supported_commands_for_group(self, group: SendspinGroup) -> None:
-        """Set supported controller commands on the group's ControllerGroupRole."""
-        controller_role = group.group_role("controller")
-        if isinstance(controller_role, ControllerGroupRole):
-            controller_role.set_supported_commands(SUPPORTED_GROUP_COMMANDS)
+    @property
+    def _player_role(self) -> PlayerRoleProtocol | None:
+        """Get the player role for this client (not group role)."""
+        for role in self.api.roles_by_family("player"):
+            if isinstance(role, PlayerRoleProtocol):
+                return role
+        return None
+
 
     async def _handle_controller_event(self, event: ControllerEvent) -> None:
         """Handle a controller event from the ControllerGroupRole."""
@@ -349,7 +344,8 @@ class SendspinPlayer(Player):
             case ClientGroupChangedEvent(new_group=new_group):
                 self.unsub_group_event_cb()
                 self.unsub_group_event_cb = new_group.add_event_listener(self.group_event_cb)
-                self._set_supported_commands_for_group(new_group)
+                if controller_role := self._controller_role:
+                    controller_role.set_supported_commands(SUPPORTED_GROUP_COMMANDS)
                 # Sync playback state from the new group
                 match new_group.state:
                     case PlaybackStateType.PLAYING:
@@ -358,6 +354,10 @@ class SendspinPlayer(Player):
                         self._attr_playback_state = PlaybackState.PAUSED
                     case PlaybackStateType.STOPPED:
                         self._attr_playback_state = PlaybackState.IDLE
+                        self._attr_elapsed_time = 0
+                        self._attr_elapsed_time_last_updated = time.time()
+                        if self._playback_task and not self._playback_task.done():
+                            self._playback_task.cancel()
                 # Update in case this is a newly created group
                 # GroupMemberAddedEvent or GroupMemberRemovedEvent will be fired before this
                 # so group members are already up to date at this point
@@ -390,6 +390,8 @@ class SendspinPlayer(Player):
                         self._attr_playback_state = PlaybackState.IDLE
                         self._attr_elapsed_time = 0
                         self._attr_elapsed_time_last_updated = time.time()
+                        if self._playback_task and not self._playback_task.done():
+                            self._playback_task.cancel()
                 self.update_state()
             case GroupMemberAddedEvent(client_id=client_id):
                 self.logger.debug("Group member added: %s", client_id)
@@ -487,12 +489,6 @@ class SendspinPlayer(Player):
         self._playback_task = asyncio.create_task(self._run_playback(media))
         self.update_state()
 
-    def _get_player_role(self) -> PlayerRoleProtocol | None:
-        """Get the player role for this client (not group role)."""
-        for role in self.api.roles_by_family("player"):
-            if isinstance(role, PlayerRoleProtocol):
-                return role
-        return None
 
     async def on_config_updated(self) -> None:
         """Apply preferred format when config changes."""
@@ -500,7 +496,7 @@ class SendspinPlayer(Player):
 
     async def _apply_preferred_format(self) -> None:
         """Read config and call set_preferred_format() if not automatic."""
-        player_role = self._get_player_role()
+        player_role = self._player_role
         if player_role is None:
             return
 
@@ -523,15 +519,7 @@ class SendspinPlayer(Player):
             return
 
         codec, audio_format = parsed
-        success = player_role.set_preferred_format(audio_format, codec)
-        if success:
-            self.logger.debug(
-                "Set preferred audio format to %s %s for player %s",
-                codec.name,
-                audio_format,
-                self.display_name,
-            )
-        else:
+        if not player_role.set_preferred_format(audio_format, codec):
             self.logger.warning(
                 "Failed to set preferred audio format %s %s for player %s",
                 codec.name,
@@ -898,7 +886,7 @@ class SendspinPlayer(Player):
         ]
 
         # Build dynamic format options from player's supported formats
-        player_role = self._get_player_role()
+        player_role = self._player_role
         if player_role is not None:
             supported_formats = player_role.get_supported_formats()
             if supported_formats:
