@@ -581,5 +581,8 @@ class PlaylistController(MediaControllerBase[Playlist]):
                     playlist_genres[genre] = 0
                 playlist_genres[genre] += 1
         playlist_genres_filtered = {genre for genre, count in playlist_genres.items() if count > 5}
-        playlist.metadata.genres = set(list(playlist_genres_filtered)[:8])
-        await self.update_item_in_library(playlist.item_id, playlist)
+        # fetch fresh library item and update its genres directly
+        cur_item = await self.get_library_item(int(playlist.item_id))
+        cur_item.metadata.genres = set(list(playlist_genres_filtered)[:8])
+        # use overwrite=True so genres are replaced, not merged
+        await self.update_item_in_library(cur_item.item_id, cur_item, overwrite=True)

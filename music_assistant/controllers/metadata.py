@@ -799,7 +799,10 @@ class MetaDataController(CoreController):
         # set timestamp, used to determine when this function was last called
         playlist.metadata.last_refresh = int(time())
         # update final item in library database
-        await self.mass.music.playlists.update_item_in_library(playlist.item_id, playlist)
+        # use overwrite=True so genres (and other set fields) are replaced, not merged
+        await self.mass.music.playlists.update_item_in_library(
+            playlist.item_id, playlist, overwrite=True
+        )
 
     async def _update_audiobook_metadata(
         self, audiobook: Audiobook, force_refresh: bool = False
