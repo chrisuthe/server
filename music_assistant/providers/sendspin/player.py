@@ -596,9 +596,7 @@ class SendspinPlayer(Player):
             )
 
     @staticmethod
-    def _pcm_duration_us(
-        byte_count: int, sample_rate: int, bit_depth: int, channels: int
-    ) -> int:
+    def _pcm_duration_us(byte_count: int, sample_rate: int, bit_depth: int, channels: int) -> int:
         """Calculate PCM duration from byte count and format."""
         frame_stride = (bit_depth // 8) * channels
         sample_count = byte_count // frame_stride if frame_stride else 0
