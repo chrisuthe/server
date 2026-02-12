@@ -151,7 +151,7 @@ if TYPE_CHECKING:
 # Namespace for generating deterministic DSP channel UUIDs from filter params
 _DSP_CHANNEL_NAMESPACE = UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
 _FRAME_DURATION_US = 100_000
-_MAX_BUFFER_AHEAD_US = 6_000_000
+_MAX_BUFFER_AHEAD_US = 5_000_000
 _MAIN_PCM_CACHE_RETENTION_US = 10_000_000
 
 
@@ -164,6 +164,15 @@ class _DSPChannel:
     ffmpeg: FFMpeg
     output_channels: int  # 1 for mono (left/right mode), 2 for stereo
     pending: bytearray = field(default_factory=bytearray)
+    chunks_processed: int = 0
+    chunks_failed: int = 0
+    input_bytes_total: int = 0
+    input_us_total: int = 0
+    raw_output_bytes_total: int = 0
+    raw_output_us_total: int = 0
+    delivered_output_bytes_total: int = 0
+    delivered_output_us_total: int = 0
+    pending_peak_bytes: int = 0
 
 
 @dataclass
@@ -191,7 +200,7 @@ class _HistoricalInjection:
 
     channel_id: UUID
     audio_format: SendspinAudioFormat
-    chunks: list[tuple[bytes, int, int]]  # (pcm, timestamp_us, duration_us)
+    chunks: list[bytes]
 
 
 def _get_filter_key_if_dsp_needed(
@@ -486,6 +495,11 @@ class SendspinPlayer(Player):
     async def stop(self) -> None:
         """Stop command."""
         self.logger.debug("Received STOP command on player %s", self.display_name)
+        self.mark_stop_called()
+        self._attr_playback_state = PlaybackState.IDLE
+        self._attr_elapsed_time = 0
+        self._attr_elapsed_time_last_updated = time.time()
+        self.update_state()
         if self._playback_task and not self._playback_task.done():
             self._playback_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -495,6 +509,9 @@ class SendspinPlayer(Player):
         # Clear the playback task reference (group.stop() handles stopping the stream)
         self._playback_task = None
         self._attr_current_media = None
+        self._attr_playback_state = PlaybackState.IDLE
+        self._attr_elapsed_time = 0
+        self._attr_elapsed_time_last_updated = time.time()
         self.update_state()
 
     async def play_media(self, media: PlayerMedia) -> None:
@@ -673,6 +690,21 @@ class SendspinPlayer(Player):
         :param pcm_format: Input PCM format (used to calculate expected output size).
         """
         expected = len(chunk) // 2 if dsp.output_channels == 1 else len(chunk)
+        input_duration_us = self._pcm_duration_us(
+            len(chunk),
+            pcm_format.sample_rate,
+            pcm_format.bit_depth,
+            pcm_format.channels,
+        )
+        output_duration_us = self._pcm_duration_us(
+            expected,
+            pcm_format.sample_rate,
+            pcm_format.bit_depth,
+            dsp.output_channels,
+        )
+        dsp.chunks_processed += 1
+        dsp.input_bytes_total += len(chunk)
+        dsp.input_us_total += input_duration_us
         try:
             await asyncio.wait_for(
                 asyncio.gather(
@@ -682,9 +714,25 @@ class SendspinPlayer(Player):
                 timeout=5.0,
             )
         except Exception:
+            dsp.chunks_failed += 1
+            dsp.delivered_output_bytes_total += expected
+            dsp.delivered_output_us_total += output_duration_us
             self.logger.warning("DSP failed for channel %s", dsp.channel_id, exc_info=True)
             # Keep timeline continuity by filling this chunk with silence.
             return b"\x00" * expected
+        dsp.pending_peak_bytes = max(dsp.pending_peak_bytes, len(dsp.pending))
+        raw_consumed_bytes = min(expected, len(dsp.pending))
+        if raw_consumed_bytes:
+            raw_consumed_us = self._pcm_duration_us(
+                raw_consumed_bytes,
+                pcm_format.sample_rate,
+                pcm_format.bit_depth,
+                dsp.output_channels,
+            )
+            dsp.raw_output_bytes_total += raw_consumed_bytes
+            dsp.raw_output_us_total += raw_consumed_us
+        dsp.delivered_output_bytes_total += expected
+        dsp.delivered_output_us_total += output_duration_us
         if len(dsp.pending) >= expected:
             result = bytes(dsp.pending[:expected])
             del dsp.pending[:expected]
@@ -713,7 +761,11 @@ class SendspinPlayer(Player):
         """Sync active DSP channels with current group members."""
         current_members = {self.player_id, *self._attr_group_members}
         for member_id in current_members:
-            self._resolve_channel_for_player(member_id, pcm_format)
+            if (
+                member_id not in self._player_channel_map
+                or member_id not in self._player_filter_key_map
+            ):
+                self._resolve_channel_for_player(member_id, pcm_format)
 
         departed_members = (
             set(self._player_channel_map) - current_members - self._pending_join_members
@@ -828,20 +880,13 @@ class SendspinPlayer(Player):
                 del self._pending_historical_injections[filter_key]
                 continue
             try:
-                first = True
-                for pcm_data, timestamp_us, _duration_us in injection.chunks:
-                    self._push_stream.prepare_historical_audio(
-                        pcm_data,
-                        injection.audio_format,
-                        channel_id=injection.channel_id,
-                        start_time_us=timestamp_us if first else None,
-                    )
-                    first = False
-                injected = True
+                discarded_chunks = len(injection.chunks)
+                discarded_bytes = sum(len(chunk) for chunk in injection.chunks)
                 self.logger.debug(
-                    "Injected historical DSP audio for channel %s: chunks=%s",
+                    "Discarded historical DSP audio for channel %s: chunks=%s bytes=%s",
                     injection.channel_id,
-                    len(injection.chunks),
+                    discarded_chunks,
+                    discarded_bytes,
                 )
             except ValueError:
                 self.logger.warning(
@@ -866,12 +911,6 @@ class SendspinPlayer(Player):
         if self._push_stream is None:
             self._main_pcm_cache.clear()
             return
-        played_until_us = self._push_stream.get_late_join_target_timestamp_us(min_lead_us=0)
-        while self._main_pcm_cache:
-            first = self._main_pcm_cache[0]
-            if first.timestamp_us + first.duration_us > played_until_us:
-                break
-            self._main_pcm_cache.popleft()
         while len(self._main_pcm_cache) > 1:
             oldest = self._main_pcm_cache[0]
             newest = self._main_pcm_cache[-1]
@@ -907,13 +946,16 @@ class SendspinPlayer(Player):
         ]
         if not historical_source:
             return filter_key
+        first_chunk = historical_source[0]
+        if first_chunk.timestamp_us > target_us + 200_000:
+            return filter_key
 
         dsp_fmt = SendspinAudioFormat(
             sample_rate=pcm_format.sample_rate,
             bit_depth=pcm_format.bit_depth,
             channels=dsp.output_channels,
         )
-        processed_chunks: list[tuple[bytes, int, int]] = []
+        processed_chunks: list[bytes] = []
         for chunk in historical_source:
             processed = await self._process_dsp_chunk(dsp, chunk.pcm_data, pcm_format)
             expected_size = self._expected_dsp_bytes(
@@ -923,7 +965,7 @@ class SendspinPlayer(Player):
                 dsp.output_channels,
             )
             normalized = self._normalize_pcm_size(processed, expected_size)
-            processed_chunks.append((normalized, chunk.timestamp_us, chunk.duration_us))
+            processed_chunks.append(normalized)
 
         if processed_chunks:
             self._pending_historical_injections[filter_key] = _HistoricalInjection(
@@ -945,9 +987,11 @@ class SendspinPlayer(Player):
         playback_end_us: int | None = None
         prepared_queue: asyncio.Queue[_PreparedCommitFrame | None] | None = None
         prepare_task: asyncio.Task[None] | None = None
-        next_main_start_us: int | None = None
         cancelled = False
         errored = False
+        commit_count = 0
+        stream_position_us = 0
+        first_main_start_us: int | None = None
         try:
             pcm_format = AudioFormat(
                 content_type=ContentType.PCM_S16LE,
@@ -971,6 +1015,8 @@ class SendspinPlayer(Player):
             def channel_resolver(player_id: str) -> UUID:
                 if self._pcm_format is None:
                     return MAIN_CHANNEL
+                if cached_channel_id := self._player_channel_map.get(player_id):
+                    return cached_channel_id
                 return self._resolve_channel_for_player(player_id, self._pcm_format)
 
             self._push_stream = self.api.group.start_stream(channel_resolver=channel_resolver)
@@ -986,24 +1032,69 @@ class SendspinPlayer(Player):
                 if self._push_stream is None or self._push_stream.is_stopped:
                     break
 
-                historical_injected = self._inject_pending_historical_audio()
+                stream_rel_start_us = stream_position_us
+                stream_position_us += prepared.main_duration_us
+                self._inject_pending_historical_audio()
                 self._push_stream.prepare_audio(prepared.main_pcm, sendspin_fmt)
                 for channel_id, (processed_pcm, dsp_fmt) in prepared.dsp_pcm.items():
                     self._push_stream.prepare_audio(processed_pcm, dsp_fmt, channel_id=channel_id)
 
                 commit_start_us = await self._push_stream.commit_audio()
-                main_start_us = (
-                    next_main_start_us
-                    if historical_injected and next_main_start_us is not None
-                    else commit_start_us
-                )
-                next_main_start_us = main_start_us + prepared.main_duration_us
-                playback_end_us = next_main_start_us
+                if self._main_pcm_cache:
+                    last_chunk = self._main_pcm_cache[-1]
+                    main_start_us = last_chunk.timestamp_us + last_chunk.duration_us
+                else:
+                    main_start_us = commit_start_us
+                if first_main_start_us is None:
+                    first_main_start_us = main_start_us
+                playback_end_us = main_start_us + prepared.main_duration_us
                 self._append_main_pcm_cache(
                     timestamp_us=main_start_us,
                     duration_us=prepared.main_duration_us,
                     pcm_data=prepared.main_pcm,
                 )
+                commit_count += 1
+                if commit_count % 10 == 0 and first_main_start_us is not None:
+                    channel_debug = [
+                        f"main(start_rel={main_start_us - first_main_start_us}us,"
+                        f"dur={prepared.main_duration_us}us,bytes={len(prepared.main_pcm)})"
+                    ]
+                    for channel_id, (processed_pcm, dsp_fmt) in sorted(
+                        prepared.dsp_pcm.items(), key=lambda item: str(item[0])
+                    ):
+                        dsp_duration_us = self._pcm_duration_us(
+                            len(processed_pcm),
+                            dsp_fmt.sample_rate,
+                            dsp_fmt.bit_depth,
+                            dsp_fmt.channels,
+                        )
+                        channel_debug.append(
+                            f"{channel_id}(start_rel={main_start_us - first_main_start_us}us,"
+                            f"dur={dsp_duration_us}us,bytes={len(processed_pcm)})"
+                        )
+                    dsp_debug = []
+                    sorted_dsps = sorted(
+                        self._dsp_channels.values(),
+                        key=lambda item: str(item.channel_id),
+                    )
+                    for dsp in sorted_dsps:
+                        buffered_lag_us = max(0, dsp.input_us_total - dsp.raw_output_us_total)
+                        dsp_debug.append(
+                            f"{dsp.channel_id}(in={dsp.input_us_total}us/{dsp.input_bytes_total}B,"
+                            f"raw_out={dsp.raw_output_us_total}us/{dsp.raw_output_bytes_total}B,"
+                            f"deliv_out={dsp.delivered_output_us_total}us/"
+                            f"{dsp.delivered_output_bytes_total}B,lag={buffered_lag_us}us,"
+                            f"pending={len(dsp.pending)}B,peak={dsp.pending_peak_bytes}B,"
+                            f"chunks={dsp.chunks_processed},fail={dsp.chunks_failed})"
+                        )
+                    self.logger.debug(
+                        "Commit %s stream_rel=%sus commit_start_rel=%sus %s ffmpeg=%s",
+                        commit_count,
+                        stream_rel_start_us,
+                        main_start_us - first_main_start_us,
+                        " ".join(channel_debug),
+                        " ".join(dsp_debug) if dsp_debug else "none",
+                    )
                 self._prune_main_pcm_cache()
                 await self._push_stream.sleep_to_limit_buffer(_MAX_BUFFER_AHEAD_US)
 
@@ -1019,19 +1110,12 @@ class SendspinPlayer(Player):
             self.logger.exception("Error during playback for player %s", self.display_name)
             raise
         finally:
-            # Stop the stream FIRST so clients stop immediately
-            if (
-                not cancelled
-                and not errored
-                and playback_end_us is not None
-                and self._push_stream is not None
-                and not self._push_stream.is_stopped
-            ):
+            if self._push_stream is not None and not self._push_stream.is_stopped:
                 with suppress(Exception):
-                    await self.api.group.stop(stop_time_us=playback_end_us)
-            else:
-                with suppress(Exception):
-                    self.api.group.stop_stream()
+                    if not cancelled and not errored and playback_end_us is not None:
+                        await self.api.group.stop(stop_time_us=playback_end_us)
+                    else:
+                        await self.api.group.stop()
             if prepare_task is not None and not prepare_task.done():
                 prepare_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -1052,6 +1136,13 @@ class SendspinPlayer(Player):
             self._pending_join_members.clear()
             self._pending_historical_injections.clear()
             self._main_pcm_cache.clear()
+            if self._playback_task is asyncio.current_task():
+                self._playback_task = None
+            self._attr_playback_state = PlaybackState.IDLE
+            self._attr_elapsed_time = 0
+            self._attr_elapsed_time_last_updated = time.time()
+            self._attr_current_media = None
+            self.update_state()
 
     async def set_members(
         self,
