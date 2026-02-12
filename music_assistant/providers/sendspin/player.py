@@ -51,7 +51,6 @@ from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.constants import PLAYER_CONTROL_NONE
 from music_assistant_models.enums import (
     ConfigEntryType,
-    ContentType,
     ImageType,
     PlaybackState,
     PlayerFeature,
@@ -72,6 +71,13 @@ from music_assistant.constants import (
 from music_assistant.helpers.audio import get_player_filter_params
 from music_assistant.helpers.ffmpeg import FFMpeg
 from music_assistant.models.player import Player, PlayerMedia
+from music_assistant.providers.sendspin.playback import (
+    _HistoricalInjection,
+    _MainPCMCacheChunk,
+    pcm_duration_us,
+    prepare_dsp_for_join,
+    run_playback,
+)
 
 # Supported group commands for Sendspin players
 SUPPORTED_GROUP_COMMANDS = [
@@ -135,8 +141,6 @@ def format_to_display_string(fmt: SupportedAudioFormat) -> str:
 
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
-
     from aiosendspin.models.player import SupportedAudioFormat
     from aiosendspin.server.client import SendspinClient
     from aiosendspin.server.push_stream import PushStream
@@ -150,16 +154,6 @@ if TYPE_CHECKING:
 
 # Namespace for generating deterministic DSP channel UUIDs from filter params
 _DSP_CHANNEL_NAMESPACE = UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
-# Use a frame size that matches ffmpeg's typical internal audio frame granularity
-# (4096 samples at 48kHz => 16384 bytes for stereo s16le). This avoids startup
-# "short read" behavior that can otherwise cause a permanent offset between the
-# main and DSP channels when a DSP channel is (re)created mid-stream.
-_FRAME_SAMPLES = 4096
-_MAX_BUFFER_AHEAD_US = 5_000_000
-_MAIN_PCM_CACHE_RETENTION_US = 10_000_000
-_ENABLE_HISTORICAL_DSP_INJECTION = True
-
-
 @dataclass
 class _DSPChannel:
     """A DSP processing channel backed by an ffmpeg process."""
@@ -180,34 +174,6 @@ class _DSPChannel:
     pending_peak_bytes: int = 0
     pending_condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     stdout_reader_task: asyncio.Task[None] | None = None
-
-
-@dataclass
-class _PreparedCommitFrame:
-    """Prepared audio frame for a single commit."""
-
-    seq: int
-    main_pcm: bytes
-    main_duration_us: int
-    dsp_pcm: dict[UUID, tuple[bytes, SendspinAudioFormat]]
-
-
-@dataclass
-class _MainPCMCacheChunk:
-    """Main channel chunk kept for late-join DSP preprocessing."""
-
-    timestamp_us: int
-    duration_us: int
-    pcm_data: bytes
-
-
-@dataclass
-class _HistoricalInjection:
-    """Historical DSP audio to inject on next commit."""
-
-    channel_id: UUID
-    audio_format: SendspinAudioFormat
-    chunks: list[bytes]
 
 
 def _get_filter_key_if_dsp_needed(
@@ -595,32 +561,6 @@ class SendspinPlayer(Player):
                 self.display_name,
             )
 
-    @staticmethod
-    def _pcm_duration_us(byte_count: int, sample_rate: int, bit_depth: int, channels: int) -> int:
-        """Calculate PCM duration from byte count and format."""
-        frame_stride = (bit_depth // 8) * channels
-        sample_count = byte_count // frame_stride if frame_stride else 0
-        return int(sample_count * 1_000_000 / sample_rate) if sample_rate else 0
-
-    @staticmethod
-    def _expected_dsp_bytes(
-        input_pcm: bytes, bit_depth: int, input_channels: int, output_channels: int
-    ) -> int:
-        """Calculate expected DSP PCM byte length for preserved sample count."""
-        bytes_per_sample = bit_depth // 8
-        input_frame_stride = bytes_per_sample * input_channels
-        sample_count = len(input_pcm) // input_frame_stride if input_frame_stride else 0
-        return sample_count * bytes_per_sample * output_channels
-
-    @staticmethod
-    def _normalize_pcm_size(pcm_data: bytes, expected_size: int) -> bytes:
-        """Trim/pad PCM data to expected size."""
-        if len(pcm_data) == expected_size:
-            return pcm_data
-        if len(pcm_data) > expected_size:
-            return pcm_data[:expected_size]
-        return pcm_data + (b"\x00" * (expected_size - len(pcm_data)))
-
     def _resolve_channel_for_player(self, player_id: str, pcm_format: AudioFormat) -> UUID:
         """Resolve channel ID for a player and update local maps."""
         filter_key = _get_filter_key_if_dsp_needed(self.mass, player_id, pcm_format)
@@ -714,13 +654,13 @@ class SendspinPlayer(Player):
         :param pcm_format: Input PCM format (used to calculate expected output size).
         """
         expected = len(chunk) // 2 if dsp.output_channels == 1 else len(chunk)
-        input_duration_us = self._pcm_duration_us(
+        input_duration_us = pcm_duration_us(
             len(chunk),
             pcm_format.sample_rate,
             pcm_format.bit_depth,
             pcm_format.channels,
         )
-        output_duration_us = self._pcm_duration_us(
+        output_duration_us = pcm_duration_us(
             expected,
             pcm_format.sample_rate,
             pcm_format.bit_depth,
@@ -755,7 +695,7 @@ class SendspinPlayer(Player):
         raw_consumed_bytes = min(expected, len(dsp.pending))
         raw_consumed_us = 0
         if raw_consumed_bytes:
-            raw_consumed_us = self._pcm_duration_us(
+            raw_consumed_us = pcm_duration_us(
                 raw_consumed_bytes,
                 pcm_format.sample_rate,
                 pcm_format.bit_depth,
@@ -798,434 +738,9 @@ class SendspinPlayer(Player):
         if dsp is not None:
             await self._close_dsp_channel(dsp)
 
-    async def _sync_live_dsp_channels(self, pcm_format: AudioFormat) -> None:
-        """Sync active DSP channels with current group members."""
-        # Include pending joiners so we don't "drop" their DSP channel between the
-        # set_members() call and the moment group membership state is updated.
-        current_members = {self.player_id, *self._attr_group_members, *self._pending_join_members}
-        for member_id in current_members:
-            if (
-                member_id not in self._player_channel_map
-                or member_id not in self._player_filter_key_map
-            ):
-                self._resolve_channel_for_player(member_id, pcm_format)
-
-        departed_members = (
-            set(self._player_channel_map) - current_members - self._pending_join_members
-        )
-        for member_id in departed_members:
-            await self._release_player_channel(member_id)
-
-        required_filter_keys = {
-            filter_key
-            for member_id in current_members
-            if (filter_key := self._player_filter_key_map.get(member_id)) is not None
-        }
-        for filter_key in required_filter_keys:
-            if filter_key not in self._dsp_channels:
-                self._dsp_channels[filter_key] = await self._create_dsp_channel(
-                    filter_key, pcm_format
-                )
-        self._active_dsp_filter_keys = required_filter_keys
-
-        for filter_key in list(self._dsp_channels):
-            if filter_key in required_filter_keys:
-                continue
-            if filter_key in self._pending_historical_injections:
-                continue
-            if any(key == filter_key for key in self._player_filter_key_map.values()):
-                continue
-            dsp = self._dsp_channels.pop(filter_key)
-            await self._close_dsp_channel(dsp)
-
-    async def _iter_pcm_frames(
-        self, audio_source: AsyncGenerator[bytes, None], pcm_format: AudioFormat
-    ) -> AsyncGenerator[bytes, None]:
-        """Split source PCM into fixed-size sample frames.
-
-        This keeps the DSP (ffmpeg) pipeline in sync and avoids startup padding.
-        """
-        bytes_per_sample = pcm_format.bit_depth // 8
-        frame_stride = bytes_per_sample * pcm_format.channels
-        if frame_stride <= 0:
-            async for chunk in audio_source:
-                if chunk:
-                    yield chunk
-            return
-
-        frame_size = _FRAME_SAMPLES * frame_stride
-        pending = bytearray()
-
-        async for chunk in audio_source:
-            if not chunk:
-                continue
-            pending.extend(chunk)
-            while len(pending) >= frame_size:
-                frame = bytes(pending[:frame_size])
-                del pending[:frame_size]
-                yield frame
-        if pending:
-            yield bytes(pending)
-
-    async def _prepare_commit_frames(
-        self,
-        audio_source: AsyncGenerator[bytes, None],
-        pcm_format: AudioFormat,
-        prepared_queue: asyncio.Queue[_PreparedCommitFrame | None],
-    ) -> None:
-        """Read source PCM, process DSP channels, and queue commit-ready frames."""
-        seq = 0
-        try:
-            async for frame in self._iter_pcm_frames(audio_source, pcm_format):
-                if self._push_stream is None or self._push_stream.is_stopped:
-                    break
-                await self._sync_live_dsp_channels(pcm_format)
-
-                active_dsps = [
-                    self._dsp_channels[key]
-                    for key in self._active_dsp_filter_keys
-                    if key in self._dsp_channels
-                ]
-                processed_by_channel: dict[UUID, tuple[bytes, SendspinAudioFormat]] = {}
-                if active_dsps:
-                    processed_frames = await asyncio.gather(
-                        *(self._process_dsp_chunk(dsp, frame, pcm_format) for dsp in active_dsps)
-                    )
-                    for dsp, processed in zip(active_dsps, processed_frames, strict=True):
-                        expected_size = self._expected_dsp_bytes(
-                            frame, pcm_format.bit_depth, pcm_format.channels, dsp.output_channels
-                        )
-                        normalized = self._normalize_pcm_size(processed, expected_size)
-                        dsp_fmt = SendspinAudioFormat(
-                            sample_rate=pcm_format.sample_rate,
-                            bit_depth=pcm_format.bit_depth,
-                            channels=dsp.output_channels,
-                        )
-                        processed_by_channel[dsp.channel_id] = (normalized, dsp_fmt)
-
-                main_duration_us = self._pcm_duration_us(
-                    len(frame),
-                    pcm_format.sample_rate,
-                    pcm_format.bit_depth,
-                    pcm_format.channels,
-                )
-                await prepared_queue.put(
-                    _PreparedCommitFrame(
-                        seq=seq,
-                        main_pcm=frame,
-                        main_duration_us=main_duration_us,
-                        dsp_pcm=processed_by_channel,
-                    )
-                )
-                seq += 1
-        finally:
-            await prepared_queue.put(None)
-
-    def _inject_pending_historical_audio(self) -> bool:
-        """Queue pending historical DSP audio into PushStream before live prepare_audio."""
-        if self._push_stream is None:
-            return False
-        injected = False
-        for filter_key, injection in list(self._pending_historical_injections.items()):
-            if not injection.chunks:
-                del self._pending_historical_injections[filter_key]
-                continue
-            try:
-                if not _ENABLE_HISTORICAL_DSP_INJECTION:
-                    discarded_chunks = len(injection.chunks)
-                    discarded_bytes = sum(len(chunk) for chunk in injection.chunks)
-                    self.logger.debug(
-                        "Discarded historical DSP audio for channel %s: chunks=%s bytes=%s",
-                        injection.channel_id,
-                        discarded_chunks,
-                        discarded_bytes,
-                    )
-                    continue
-
-                for chunk in injection.chunks:
-                    self._push_stream.prepare_historical_audio(
-                        chunk,
-                        injection.audio_format,
-                        channel_id=injection.channel_id,
-                    )
-                injected = True
-                self.logger.debug(
-                    "Injected historical DSP audio for channel %s: chunks=%s bytes=%s",
-                    injection.channel_id,
-                    len(injection.chunks),
-                    sum(len(chunk) for chunk in injection.chunks),
-                )
-            except Exception:
-                self.logger.warning(
-                    "Failed to inject historical DSP audio for channel %s",
-                    injection.channel_id,
-                    exc_info=True,
-                )
-            finally:
-                del self._pending_historical_injections[filter_key]
-        return injected
-
-    def _append_main_pcm_cache(self, timestamp_us: int, duration_us: int, pcm_data: bytes) -> None:
-        """Store committed main-channel PCM for late-join DSP preprocessing."""
-        self._main_pcm_cache.append(
-            _MainPCMCacheChunk(
-                timestamp_us=timestamp_us, duration_us=duration_us, pcm_data=pcm_data
-            )
-        )
-
-    def _prune_main_pcm_cache(self) -> None:
-        """Prune played/old main-channel PCM cache entries."""
-        if self._push_stream is None:
-            self._main_pcm_cache.clear()
-            return
-        while len(self._main_pcm_cache) > 1:
-            oldest = self._main_pcm_cache[0]
-            newest = self._main_pcm_cache[-1]
-            window_us = (newest.timestamp_us + newest.duration_us) - oldest.timestamp_us
-            if window_us <= _MAIN_PCM_CACHE_RETENTION_US:
-                break
-            self._main_pcm_cache.popleft()
-
-    async def _prepare_dsp_for_join(self, player_id: str) -> tuple[str, ...] | None:
-        """Preprocess historical PCM for a joining player's new DSP channel."""
-        if self._push_stream is None or self._pcm_format is None:
-            return None
-        pcm_format = self._pcm_format
-        filter_key = _get_filter_key_if_dsp_needed(self.mass, player_id, pcm_format)
-        self._player_filter_key_map[player_id] = filter_key
-        if filter_key is None:
-            self._player_channel_map[player_id] = MAIN_CHANNEL
-            return None
-
-        channel_id = uuid5(_DSP_CHANNEL_NAMESPACE, str(filter_key))
-        self._player_channel_map[player_id] = channel_id
-        if filter_key in self._dsp_channels:
-            self.logger.debug(
-                "DSP channel already active for %s: channel=%s", player_id, channel_id
-            )
-            return filter_key
-
-        dsp = await self._create_dsp_channel(filter_key, pcm_format)
-        self._dsp_channels[filter_key] = dsp
-
-        if not _ENABLE_HISTORICAL_DSP_INJECTION:
-            # Debug mode: do not attempt to backfill with historical audio.
-            return filter_key
-
-        target_us = self._push_stream.get_late_join_target_timestamp_us()
-        historical_source = [
-            chunk
-            for chunk in self._main_pcm_cache
-            if chunk.timestamp_us + chunk.duration_us > target_us
-        ]
-        if not historical_source:
-            self.logger.debug(
-                "No main PCM cache to backfill for %s (target=%sus)", player_id, target_us
-            )
-            return filter_key
-        first_chunk = historical_source[0]
-        if first_chunk.timestamp_us > target_us + 200_000:
-            self.logger.debug(
-                "Skipping historical DSP backfill for %s: first_chunk=%sus target=%sus",
-                player_id,
-                first_chunk.timestamp_us,
-                target_us,
-            )
-            return filter_key
-
-        dsp_fmt = SendspinAudioFormat(
-            sample_rate=pcm_format.sample_rate,
-            bit_depth=pcm_format.bit_depth,
-            channels=dsp.output_channels,
-        )
-        processed_chunks: list[bytes] = []
-        for chunk in historical_source:
-            processed = await self._process_dsp_chunk(dsp, chunk.pcm_data, pcm_format)
-            expected_size = self._expected_dsp_bytes(
-                chunk.pcm_data,
-                pcm_format.bit_depth,
-                pcm_format.channels,
-                dsp.output_channels,
-            )
-            normalized = self._normalize_pcm_size(processed, expected_size)
-            processed_chunks.append(normalized)
-
-        if processed_chunks:
-            self._pending_historical_injections[filter_key] = _HistoricalInjection(
-                channel_id=dsp.channel_id,
-                audio_format=dsp_fmt,
-                chunks=processed_chunks,
-            )
-            self.logger.debug(
-                "Prepared historical DSP audio for %s: channel=%s chunks=%s",
-                player_id,
-                dsp.channel_id,
-                len(processed_chunks),
-            )
-        return filter_key
-
-    async def _run_playback(self, media: PlayerMedia) -> None:  # noqa: PLR0915
+    async def _run_playback(self, media: PlayerMedia) -> None:
         """Run the actual playback in a background task."""
-        audio_source: AsyncGenerator[bytes, None] | None = None
-        playback_end_us: int | None = None
-        prepared_queue: asyncio.Queue[_PreparedCommitFrame | None] | None = None
-        prepare_task: asyncio.Task[None] | None = None
-        cancelled = False
-        errored = False
-        commit_count = 0
-        stream_position_us = 0
-        first_main_start_us: int | None = None
-        try:
-            pcm_format = AudioFormat(
-                content_type=ContentType.PCM_S16LE,
-                sample_rate=48000,
-                bit_depth=16,
-                channels=2,
-            )
-            self._pcm_format = pcm_format
-            sendspin_fmt = SendspinAudioFormat(
-                sample_rate=pcm_format.sample_rate,
-                bit_depth=pcm_format.bit_depth,
-                channels=pcm_format.channels,
-            )
-
-            self._player_channel_map.clear()
-            self._player_filter_key_map.clear()
-            self._active_dsp_filter_keys.clear()
-            self._pending_historical_injections.clear()
-            self._main_pcm_cache.clear()
-
-            def channel_resolver(player_id: str) -> UUID:
-                if self._pcm_format is None:
-                    return MAIN_CHANNEL
-                if cached_channel_id := self._player_channel_map.get(player_id):
-                    return cached_channel_id
-                return self._resolve_channel_for_player(player_id, self._pcm_format)
-
-            self._push_stream = self.api.group.start_stream(channel_resolver=channel_resolver)
-            audio_source = self.mass.streams.get_stream(media, pcm_format)
-            prepared_queue = asyncio.Queue(maxsize=4)
-            prepare_task = asyncio.create_task(
-                self._prepare_commit_frames(audio_source, pcm_format, prepared_queue)
-            )
-            while True:
-                prepared = await prepared_queue.get()
-                if prepared is None:
-                    break
-                if self._push_stream is None or self._push_stream.is_stopped:
-                    break
-
-                stream_rel_start_us = stream_position_us
-                stream_position_us += prepared.main_duration_us
-                self._inject_pending_historical_audio()
-                self._push_stream.prepare_audio(prepared.main_pcm, sendspin_fmt)
-                for channel_id, (processed_pcm, dsp_fmt) in prepared.dsp_pcm.items():
-                    self._push_stream.prepare_audio(processed_pcm, dsp_fmt, channel_id=channel_id)
-
-                commit_start_us = await self._push_stream.commit_audio()
-                if self._main_pcm_cache:
-                    last_chunk = self._main_pcm_cache[-1]
-                    main_start_us = last_chunk.timestamp_us + last_chunk.duration_us
-                else:
-                    main_start_us = commit_start_us
-                if first_main_start_us is None:
-                    first_main_start_us = main_start_us
-                playback_end_us = main_start_us + prepared.main_duration_us
-                self._append_main_pcm_cache(
-                    timestamp_us=main_start_us,
-                    duration_us=prepared.main_duration_us,
-                    pcm_data=prepared.main_pcm,
-                )
-                commit_count += 1
-                if commit_count % 10 == 0 and first_main_start_us is not None:
-                    channel_debug = [
-                        f"main(start_rel={main_start_us - first_main_start_us}us,"
-                        f"dur={prepared.main_duration_us}us,bytes={len(prepared.main_pcm)})"
-                    ]
-                    for channel_id, (processed_pcm, dsp_fmt) in sorted(
-                        prepared.dsp_pcm.items(), key=lambda item: str(item[0])
-                    ):
-                        dsp_duration_us = self._pcm_duration_us(
-                            len(processed_pcm),
-                            dsp_fmt.sample_rate,
-                            dsp_fmt.bit_depth,
-                            dsp_fmt.channels,
-                        )
-                        channel_debug.append(
-                            f"{channel_id}(start_rel={main_start_us - first_main_start_us}us,"
-                            f"dur={dsp_duration_us}us,bytes={len(processed_pcm)})"
-                        )
-                    dsp_debug = []
-                    sorted_dsps = sorted(
-                        self._dsp_channels.values(),
-                        key=lambda item: str(item.channel_id),
-                    )
-                    for dsp in sorted_dsps:
-                        buffered_lag_us = max(0, dsp.input_us_total - dsp.raw_output_us_total)
-                        dsp_debug.append(
-                            f"{dsp.channel_id}(in={dsp.input_us_total}us/{dsp.input_bytes_total}B,"
-                            f"raw_out={dsp.raw_output_us_total}us/{dsp.raw_output_bytes_total}B,"
-                            f"deliv_out={dsp.delivered_output_us_total}us/"
-                            f"{dsp.delivered_output_bytes_total}B,lag={buffered_lag_us}us,"
-                            f"pending={len(dsp.pending)}B,peak={dsp.pending_peak_bytes}B,"
-                            f"chunks={dsp.chunks_processed},fail={dsp.chunks_failed})"
-                        )
-                    self.logger.debug(
-                        "Commit %s stream_rel=%sus commit_start_rel=%sus %s ffmpeg=%s",
-                        commit_count,
-                        stream_rel_start_us,
-                        main_start_us - first_main_start_us,
-                        " ".join(channel_debug),
-                        " ".join(dsp_debug) if dsp_debug else "none",
-                    )
-                self._prune_main_pcm_cache()
-                await self._push_stream.sleep_to_limit_buffer(_MAX_BUFFER_AHEAD_US)
-
-            if prepare_task is not None:
-                await prepare_task
-
-        except asyncio.CancelledError:
-            cancelled = True
-            self.logger.debug("Playback cancelled for player %s", self.display_name)
-            raise
-        except Exception:
-            errored = True
-            self.logger.exception("Error during playback for player %s", self.display_name)
-            raise
-        finally:
-            if self._push_stream is not None and not self._push_stream.is_stopped:
-                with suppress(Exception):
-                    if not cancelled and not errored and playback_end_us is not None:
-                        await self.api.group.stop(stop_time_us=playback_end_us)
-                    else:
-                        await self.api.group.stop()
-            if prepare_task is not None and not prepare_task.done():
-                prepare_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await prepare_task
-            self._push_stream = None
-            self._pcm_format = None
-            # Then clean up audio source and DSP processes
-            if audio_source is not None:
-                with suppress(Exception):
-                    await audio_source.aclose()
-            for dsp in self._dsp_channels.values():
-                with suppress(Exception):
-                    await dsp.ffmpeg.close()
-            self._dsp_channels.clear()
-            self._active_dsp_filter_keys.clear()
-            self._player_channel_map.clear()
-            self._player_filter_key_map.clear()
-            self._pending_join_members.clear()
-            self._pending_historical_injections.clear()
-            self._main_pcm_cache.clear()
-            if self._playback_task is asyncio.current_task():
-                self._playback_task = None
-            self._attr_playback_state = PlaybackState.IDLE
-            self._attr_elapsed_time = 0
-            self._attr_elapsed_time_last_updated = time.time()
-            self._attr_current_media = None
-            self.update_state()
+        await run_playback(self, media)
 
     async def set_members(
         self,
@@ -1247,7 +762,7 @@ class SendspinPlayer(Player):
             filter_key: tuple[str, ...] | None = None
             try:
                 if self._pcm_format is not None and self._push_stream is not None:
-                    filter_key = await self._prepare_dsp_for_join(player_id)
+                    filter_key = await prepare_dsp_for_join(self, player_id)
                 player = self.mass.players.get(player_id, True)
                 player = cast("SendspinPlayer", player)  # For type checking
                 await self.api.group.add_client(player.api)
