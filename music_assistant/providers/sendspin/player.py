@@ -10,7 +10,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from io import BytesIO
 from typing import TYPE_CHECKING, cast
-from uuid import UUID, uuid5
+from uuid import UUID, uuid4
 
 from aiosendspin.models import AudioCodec, MediaCommand
 from aiosendspin.models.types import PlaybackStateType
@@ -151,9 +151,6 @@ if TYPE_CHECKING:
 
     from .provider import SendspinProvider
 
-# Namespace for generating deterministic DSP channel UUIDs from filter params
-_DSP_CHANNEL_NAMESPACE = UUID("53a13179-d35a-4c6e-86ce-594654184df5")
-
 
 @dataclass
 class _DSPChannel:
@@ -177,10 +174,10 @@ class _DSPChannel:
     stdout_reader_task: asyncio.Task[None] | None = None
 
 
-def _get_filter_key_if_dsp_needed(
+def _get_dsp_filter_params(
     mass: MusicAssistant, player_id: str, pcm_format: AudioFormat
-) -> tuple[str, ...] | None:
-    """Return filter_key if player needs DSP, else None."""
+) -> list[str] | None:
+    """Return ffmpeg filter params if player needs DSP, else None."""
     dsp_enabled = mass.config.get_player_dsp_config(player_id).enabled
     output_channels = mass.config.get_raw_player_config_value(
         player_id, CONF_OUTPUT_CHANNELS, "stereo"
@@ -188,7 +185,7 @@ def _get_filter_key_if_dsp_needed(
     if not dsp_enabled and output_channels == "stereo":
         return None
     filter_params = get_player_filter_params(mass, player_id, pcm_format, pcm_format)
-    return tuple(filter_params) if filter_params else None
+    return filter_params if filter_params else None
 
 
 class SendspinPlayer(Player):
@@ -201,12 +198,10 @@ class SendspinPlayer(Player):
     last_sent_artist_artwork_url: str | None = None
     _playback_task: asyncio.Task[None] | None = None
     _push_stream: PushStream | None = None
-    _dsp_channels: dict[tuple[str, ...], _DSPChannel]
-    _active_dsp_filter_keys: set[tuple[str, ...]]
+    _dsp_channels: dict[str, _DSPChannel]
     _player_channel_map: dict[str, UUID]
-    _player_filter_key_map: dict[str, tuple[str, ...] | None]
     _pending_join_members: set[str]
-    _pending_historical_injections: dict[tuple[str, ...], _HistoricalInjection]
+    _pending_historical_injections: dict[str, _HistoricalInjection]
     _main_pcm_cache: deque[_MainPCMCacheChunk]
     _pcm_format: AudioFormat | None = None
     is_web_player: bool = False
@@ -229,9 +224,7 @@ class SendspinPlayer(Player):
             controller_role.set_supported_commands(SUPPORTED_GROUP_COMMANDS)
 
         self._dsp_channels = {}
-        self._active_dsp_filter_keys = set()
         self._player_channel_map = {}
-        self._player_filter_key_map = {}
         self._pending_join_members = set()
         self._pending_historical_injections = {}
         self._main_pcm_cache = deque()
@@ -306,7 +299,6 @@ class SendspinPlayer(Player):
             if isinstance(role, PlayerRoleProtocol):
                 return role
         return None
-
 
     async def _handle_controller_event(self, event: ControllerEvent) -> None:
         """Handle a controller event from the ControllerGroupRole."""
@@ -489,7 +481,6 @@ class SendspinPlayer(Player):
         self._playback_task = asyncio.create_task(self._run_playback(media))
         self.update_state()
 
-
     async def on_config_updated(self) -> None:
         """Apply preferred format when config changes."""
         await self._apply_preferred_format()
@@ -529,26 +520,25 @@ class SendspinPlayer(Player):
 
     def _resolve_channel_for_player(self, player_id: str, pcm_format: AudioFormat) -> UUID:
         """Resolve channel ID for a player and update local maps."""
-        filter_key = _get_filter_key_if_dsp_needed(self.mass, player_id, pcm_format)
-        self._player_filter_key_map[player_id] = filter_key
-        if filter_key is None:
+        filter_params = _get_dsp_filter_params(self.mass, player_id, pcm_format)
+        if filter_params is None:
             self._player_channel_map[player_id] = MAIN_CHANNEL
             return MAIN_CHANNEL
-        channel_id = uuid5(_DSP_CHANNEL_NAMESPACE, str(filter_key))
+        channel_id = uuid4()
         self._player_channel_map[player_id] = channel_id
         return channel_id
 
     async def _create_dsp_channel(
         self,
-        filter_key: tuple[str, ...],
+        player_id: str,
         pcm_format: AudioFormat,
     ) -> _DSPChannel:
         """Create a new DSP channel with an ffmpeg process.
 
-        :param filter_key: Tuple of ffmpeg filter parameters.
+        :param player_id: Player ID this DSP channel belongs to.
         :param pcm_format: Input PCM audio format.
         """
-        filter_params = list(filter_key)
+        filter_params = _get_dsp_filter_params(self.mass, player_id, pcm_format) or []
         output_channels = 1 if any("pan=mono" in p for p in filter_params) else 2
         output_format = AudioFormat(
             content_type=pcm_format.content_type,
@@ -556,7 +546,7 @@ class SendspinPlayer(Player):
             bit_depth=pcm_format.bit_depth,
             channels=output_channels,
         )
-        channel_id = uuid5(_DSP_CHANNEL_NAMESPACE, str(filter_key))
+        channel_id = self._player_channel_map[player_id]
         ffmpeg = FFMpeg(
             audio_input="-",
             input_format=pcm_format,
@@ -690,17 +680,10 @@ class SendspinPlayer(Player):
         return result
 
     async def _release_player_channel(self, player_id: str) -> None:
-        """Release channel bookkeeping for a player and close unused DSP channels."""
+        """Release channel bookkeeping for a player and close its DSP channel."""
         self._player_channel_map.pop(player_id, None)
-        filter_key = self._player_filter_key_map.pop(player_id, None)
-        if filter_key is None:
-            return
-        if filter_key in self._pending_historical_injections:
-            return
-        if any(key == filter_key for key in self._player_filter_key_map.values()):
-            return
-        dsp = self._dsp_channels.pop(filter_key, None)
-        self._active_dsp_filter_keys.discard(filter_key)
+        self._pending_historical_injections.pop(player_id, None)
+        dsp = self._dsp_channels.pop(player_id, None)
         if dsp is not None:
             await self._close_dsp_channel(dsp)
 
@@ -725,15 +708,12 @@ class SendspinPlayer(Player):
         for player_id in player_ids_to_add or []:
             self._pending_join_members.add(player_id)
             join_started = time.perf_counter()
-            filter_key: tuple[str, ...] | None = None
             try:
                 if self._pcm_format is not None and self._push_stream is not None:
-                    filter_key = await prepare_dsp_for_join(self, player_id)
+                    await prepare_dsp_for_join(self, player_id)
                 player = self.mass.players.get(player_id, True)
                 player = cast("SendspinPlayer", player)  # For type checking
                 await self.api.group.add_client(player.api)
-                if filter_key is not None:
-                    self._active_dsp_filter_keys.add(filter_key)
                 join_elapsed_ms = round((time.perf_counter() - join_started) * 1000, 1)
                 self.logger.debug("Joined player %s in %sms", player_id, join_elapsed_ms)
             except Exception:
@@ -850,11 +830,11 @@ class SendspinPlayer(Player):
         metadata = Metadata(
             title=current_media.title,
             artist=current_media.artist,
-            album_artist=None,  # TODO: extract from optional queue item
+            album_artist=None,
             album=current_media.album,
             artwork_url=current_media.image_url,
-            year=None,  # TODO: extract from optional queue item
-            track=None,  # TODO: extract from optional queue item
+            year=None,
+            track=None,
             track_duration=track_duration * 1000 if track_duration is not None else None,
             track_progress=int(current_media.corrected_elapsed_time * 1000)
             if current_media.corrected_elapsed_time

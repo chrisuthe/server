@@ -94,10 +94,7 @@ async def _sync_live_dsp_channels(player: SendspinPlayer, pcm_format: AudioForma
         *player._pending_join_members,
     }
     for member_id in current_members:
-        if (
-            member_id not in player._player_channel_map
-            or member_id not in player._player_filter_key_map
-        ):
+        if member_id not in player._player_channel_map:
             player._resolve_channel_for_player(member_id, pcm_format)
 
     departed_members = (
@@ -106,27 +103,14 @@ async def _sync_live_dsp_channels(player: SendspinPlayer, pcm_format: AudioForma
     for member_id in departed_members:
         await player._release_player_channel(member_id)
 
-    required_filter_keys = {
-        filter_key
-        for member_id in current_members
-        if (filter_key := player._player_filter_key_map.get(member_id)) is not None
-    }
-    for filter_key in required_filter_keys:
-        if filter_key not in player._dsp_channels:
-            player._dsp_channels[filter_key] = await player._create_dsp_channel(
-                filter_key, pcm_format
+    for member_id in current_members:
+        if (
+            member_id not in player._dsp_channels
+            and player._player_channel_map.get(member_id) != MAIN_CHANNEL
+        ):
+            player._dsp_channels[member_id] = await player._create_dsp_channel(
+                member_id, pcm_format
             )
-    player._active_dsp_filter_keys = required_filter_keys
-
-    for filter_key in list(player._dsp_channels):
-        if filter_key in required_filter_keys:
-            continue
-        if filter_key in player._pending_historical_injections:
-            continue
-        if any(key == filter_key for key in player._player_filter_key_map.values()):
-            continue
-        dsp = player._dsp_channels.pop(filter_key)
-        await player._close_dsp_channel(dsp)
 
 
 async def _iter_pcm_frames(
@@ -170,11 +154,7 @@ async def _prepare_commit_frames(
                 break
             await _sync_live_dsp_channels(player, pcm_format)
 
-            active_dsps = [
-                player._dsp_channels[key]
-                for key in player._active_dsp_filter_keys
-                if key in player._dsp_channels
-            ]
+            active_dsps = list(player._dsp_channels.values())
             processed_by_channel: dict[UUID, tuple[bytes, SendspinAudioFormat]] = {}
             if active_dsps:
                 processed_frames = await asyncio.gather(
@@ -216,9 +196,9 @@ def _inject_pending_historical_audio(player: SendspinPlayer) -> bool:
     if player._push_stream is None:
         return False
     injected = False
-    for filter_key, injection in list(player._pending_historical_injections.items()):
+    for member_id, injection in list(player._pending_historical_injections.items()):
         if not injection.chunks:
-            del player._pending_historical_injections[filter_key]
+            del player._pending_historical_injections[member_id]
             continue
         try:
             if not _ENABLE_HISTORICAL_DSP_INJECTION:
@@ -252,7 +232,7 @@ def _inject_pending_historical_audio(player: SendspinPlayer) -> bool:
                 exc_info=True,
             )
         finally:
-            del player._pending_historical_injections[filter_key]
+            del player._pending_historical_injections[member_id]
     return injected
 
 
@@ -279,25 +259,20 @@ def _prune_main_pcm_cache(player: SendspinPlayer) -> None:
         player._main_pcm_cache.popleft()
 
 
-async def prepare_dsp_for_join(player: SendspinPlayer, player_id: str) -> tuple[str, ...] | None:
+async def prepare_dsp_for_join(player: SendspinPlayer, player_id: str) -> None:
     """Preprocess historical PCM for a joining player's new DSP channel."""
     if player._push_stream is None or player._pcm_format is None:
-        return None
+        return
     pcm_format = player._pcm_format
     channel_id = player._resolve_channel_for_player(player_id, pcm_format)
-    filter_key = player._player_filter_key_map.get(player_id)
-    if filter_key is None:
-        return None
+    if channel_id == MAIN_CHANNEL:
+        return
 
-    if filter_key in player._dsp_channels:
-        player.logger.debug("DSP channel already active for %s: channel=%s", player_id, channel_id)
-        return filter_key
-
-    dsp = await player._create_dsp_channel(filter_key, pcm_format)
-    player._dsp_channels[filter_key] = dsp
+    dsp = await player._create_dsp_channel(player_id, pcm_format)
+    player._dsp_channels[player_id] = dsp
 
     if not _ENABLE_HISTORICAL_DSP_INJECTION:
-        return filter_key
+        return
 
     target_us = player._push_stream.get_late_join_target_timestamp_us()
     historical_source = [
@@ -309,7 +284,7 @@ async def prepare_dsp_for_join(player: SendspinPlayer, player_id: str) -> tuple[
         player.logger.debug(
             "No main PCM cache to backfill for %s (target=%sus)", player_id, target_us
         )
-        return filter_key
+        return
 
     first_chunk = historical_source[0]
     if first_chunk.timestamp_us > target_us + 200_000:
@@ -319,7 +294,7 @@ async def prepare_dsp_for_join(player: SendspinPlayer, player_id: str) -> tuple[
             first_chunk.timestamp_us,
             target_us,
         )
-        return filter_key
+        return
 
     dsp_fmt = SendspinAudioFormat(
         sample_rate=pcm_format.sample_rate,
@@ -339,7 +314,7 @@ async def prepare_dsp_for_join(player: SendspinPlayer, player_id: str) -> tuple[
         processed_chunks.append(normalized)
 
     if processed_chunks:
-        player._pending_historical_injections[filter_key] = _HistoricalInjection(
+        player._pending_historical_injections[player_id] = _HistoricalInjection(
             channel_id=dsp.channel_id,
             audio_format=dsp_fmt,
             chunks=processed_chunks,
@@ -350,7 +325,6 @@ async def prepare_dsp_for_join(player: SendspinPlayer, player_id: str) -> tuple[
             dsp.channel_id,
             len(processed_chunks),
         )
-    return filter_key
 
 
 async def run_playback(player: SendspinPlayer, media: PlayerMedia) -> None:  # noqa: PLR0915
@@ -376,8 +350,6 @@ async def run_playback(player: SendspinPlayer, media: PlayerMedia) -> None:  # n
         )
 
         player._player_channel_map.clear()
-        player._player_filter_key_map.clear()
-        player._active_dsp_filter_keys.clear()
         player._pending_historical_injections.clear()
         player._main_pcm_cache.clear()
 
@@ -493,9 +465,7 @@ async def run_playback(player: SendspinPlayer, media: PlayerMedia) -> None:  # n
             with suppress(Exception):
                 await dsp.ffmpeg.close()
         player._dsp_channels.clear()
-        player._active_dsp_filter_keys.clear()
         player._player_channel_map.clear()
-        player._player_filter_key_map.clear()
         player._pending_join_members.clear()
         player._pending_historical_injections.clear()
         player._main_pcm_cache.clear()
