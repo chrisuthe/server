@@ -157,7 +157,7 @@ _DSP_CHANNEL_NAMESPACE = UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
 _FRAME_SAMPLES = 4096
 _MAX_BUFFER_AHEAD_US = 5_000_000
 _MAIN_PCM_CACHE_RETENTION_US = 10_000_000
-_ENABLE_HISTORICAL_DSP_INJECTION = False
+_ENABLE_HISTORICAL_DSP_INJECTION = True
 
 
 @dataclass
@@ -802,7 +802,9 @@ class SendspinPlayer(Player):
 
     async def _sync_live_dsp_channels(self, pcm_format: AudioFormat) -> None:
         """Sync active DSP channels with current group members."""
-        current_members = {self.player_id, *self._attr_group_members}
+        # Include pending joiners so we don't "drop" their DSP channel between the
+        # set_members() call and the moment group membership state is updated.
+        current_members = {self.player_id, *self._attr_group_members, *self._pending_join_members}
         for member_id in current_members:
             if (
                 member_id not in self._player_channel_map
@@ -949,6 +951,12 @@ class SendspinPlayer(Player):
                         channel_id=injection.channel_id,
                     )
                 injected = True
+                self.logger.debug(
+                    "Injected historical DSP audio for channel %s: chunks=%s bytes=%s",
+                    injection.channel_id,
+                    len(injection.chunks),
+                    sum(len(chunk) for chunk in injection.chunks),
+                )
             except Exception:
                 self.logger.warning(
                     "Failed to inject historical DSP audio for channel %s",
@@ -994,6 +1002,9 @@ class SendspinPlayer(Player):
         channel_id = uuid5(_DSP_CHANNEL_NAMESPACE, str(filter_key))
         self._player_channel_map[player_id] = channel_id
         if filter_key in self._dsp_channels:
+            self.logger.debug(
+                "DSP channel already active for %s: channel=%s", player_id, channel_id
+            )
             return filter_key
 
         dsp = await self._create_dsp_channel(filter_key, pcm_format)
@@ -1010,9 +1021,18 @@ class SendspinPlayer(Player):
             if chunk.timestamp_us + chunk.duration_us > target_us
         ]
         if not historical_source:
+            self.logger.debug(
+                "No main PCM cache to backfill for %s (target=%sus)", player_id, target_us
+            )
             return filter_key
         first_chunk = historical_source[0]
         if first_chunk.timestamp_us > target_us + 200_000:
+            self.logger.debug(
+                "Skipping historical DSP backfill for %s: first_chunk=%sus target=%sus",
+                player_id,
+                first_chunk.timestamp_us,
+                target_us,
+            )
             return filter_key
 
         dsp_fmt = SendspinAudioFormat(
