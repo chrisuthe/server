@@ -356,11 +356,8 @@ async def prepare_dsp_for_join(player: SendspinPlayer, player_id: str) -> tuple[
 async def run_playback(player: SendspinPlayer, media: PlayerMedia) -> None:  # noqa: PLR0915
     """Run Sendspin playback in a background task."""
     audio_source: AsyncGenerator[bytes, None] | None = None
-    playback_end_us: int | None = None
     prepared_queue: asyncio.Queue[_PreparedCommitFrame | None] | None = None
     prepare_task: asyncio.Task[None] | None = None
-    cancelled = False
-    errored = False
     commit_count = 0
     stream_position_us = 0
     first_main_start_us: int | None = None
@@ -419,7 +416,6 @@ async def run_playback(player: SendspinPlayer, media: PlayerMedia) -> None:  # n
                 main_start_us = commit_start_us
             if first_main_start_us is None:
                 first_main_start_us = main_start_us
-            playback_end_us = main_start_us + prepared.main_duration_us
             _append_main_pcm_cache(
                 player,
                 timestamp_us=main_start_us,
@@ -475,20 +471,15 @@ async def run_playback(player: SendspinPlayer, media: PlayerMedia) -> None:  # n
             await prepare_task
 
     except asyncio.CancelledError:
-        cancelled = True
         player.logger.debug("Playback cancelled for player %s", player.display_name)
         raise
     except Exception:
-        errored = True
         player.logger.exception("Error during playback for player %s", player.display_name)
         raise
     finally:
         if player._push_stream is not None and not player._push_stream.is_stopped:
             with suppress(Exception):
-                if not cancelled and not errored and playback_end_us is not None:
-                    await player.api.group.stop(stop_time_us=playback_end_us)
-                else:
-                    await player.api.group.stop()
+                await player.api.group.stop()
         if prepare_task is not None and not prepare_task.done():
             prepare_task.cancel()
             with suppress(asyncio.CancelledError):

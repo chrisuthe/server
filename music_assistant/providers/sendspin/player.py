@@ -18,18 +18,18 @@ from aiosendspin.models.types import RepeatMode as SendspinRepeatMode
 from aiosendspin.server import (
     ClientEvent,
     GroupEvent,
-    GroupStateChangedEvent,
     SendspinGroup,
     VolumeChangedEvent,
 )
 from aiosendspin.server.audio import AudioFormat as SendspinAudioFormat
 from aiosendspin.server.channels import MAIN_CHANNEL
 from aiosendspin.server.client import DisconnectBehaviour
-from aiosendspin.server.events import ClientGroupChangedEvent
-from aiosendspin.server.group import (
+from aiosendspin.server.events import (
+    ClientGroupChangedEvent,
     GroupDeletedEvent,
     GroupMemberAddedEvent,
     GroupMemberRemovedEvent,
+    GroupStateChangedEvent,
 )
 from aiosendspin.server.roles import (
     ArtworkGroupRole,
@@ -198,7 +198,6 @@ class SendspinPlayer(Player):
     api: SendspinClient
     unsub_event_cb: Callable[[], None]
     unsub_group_event_cb: Callable[[], None]
-    unsub_controller_event_cb: Callable[[], None] | None = None
     last_sent_artwork_url: str | None = None
     last_sent_artist_artwork_url: str | None = None
     _playback_task: asyncio.Task[None] | None = None
@@ -227,8 +226,7 @@ class SendspinPlayer(Player):
         self.api.disconnect_behaviour = DisconnectBehaviour.STOP
         self.unsub_event_cb = sendspin_client.add_event_listener(self.event_cb)
         self.unsub_group_event_cb = sendspin_client.group.add_event_listener(self.group_event_cb)
-        self._subscribe_to_controller_events(sendspin_client.group)
-        sendspin_client.group.set_supported_commands(SUPPORTED_GROUP_COMMANDS)
+        self._set_supported_commands_for_group(sendspin_client.group)
 
         self._dsp_channels = {}
         self._active_dsp_filter_keys = set()
@@ -309,34 +307,11 @@ class SendspinPlayer(Player):
             return role
         return None
 
-    def _subscribe_to_controller_events(self, group: SendspinGroup) -> None:
-        """Subscribe to controller events from the group's ControllerGroupRole."""
-        if self.unsub_controller_event_cb is not None:
-            self.unsub_controller_event_cb()
-            self.unsub_controller_event_cb = None
+    def _set_supported_commands_for_group(self, group: SendspinGroup) -> None:
+        """Set supported controller commands on the group's ControllerGroupRole."""
         controller_role = group.group_role("controller")
-        self.logger.debug(
-            "Subscribing to controller events: group=%s, controller_role=%s",
-            group.group_id,
-            controller_role,
-        )
         if isinstance(controller_role, ControllerGroupRole):
-            self.unsub_controller_event_cb = controller_role.add_event_listener(
-                self.controller_event_cb
-            )
-
-    def controller_event_cb(self, event: ControllerEvent) -> None:
-        """Event callback registered to the ControllerGroupRole."""
-        self.logger.debug(
-            "Received ControllerEvent: %s, synced_to=%s, player_id=%s",
-            event,
-            self.synced_to,
-            self.player_id,
-        )
-        if self.synced_to is not None:
-            # Only leader handles controller events
-            return
-        self.mass.create_task(self._handle_controller_event(event))
+            controller_role.set_supported_commands(SUPPORTED_GROUP_COMMANDS)
 
     async def _handle_controller_event(self, event: ControllerEvent) -> None:
         """Handle a controller event from the ControllerGroupRole."""
@@ -374,8 +349,7 @@ class SendspinPlayer(Player):
             case ClientGroupChangedEvent(new_group=new_group):
                 self.unsub_group_event_cb()
                 self.unsub_group_event_cb = new_group.add_event_listener(self.group_event_cb)
-                # Re-subscribe to controller events for the new group
-                self._subscribe_to_controller_events(new_group)
+                self._set_supported_commands_for_group(new_group)
                 # Sync playback state from the new group
                 match new_group.state:
                     case PlaybackStateType.PLAYING:
@@ -385,7 +359,6 @@ class SendspinPlayer(Player):
                     case PlaybackStateType.STOPPED:
                         self._attr_playback_state = PlaybackState.IDLE
                 # Update in case this is a newly created group
-                new_group.set_supported_commands(SUPPORTED_GROUP_COMMANDS)
                 # GroupMemberAddedEvent or GroupMemberRemovedEvent will be fired before this
                 # so group members are already up to date at this point
                 if self.synced_to is None:
@@ -428,6 +401,9 @@ class SendspinPlayer(Player):
                 self.mass.create_task(self._handle_group_member_removed(group, client_id))
             case GroupDeletedEvent():
                 pass
+            case ControllerEvent() as controller_event:
+                if self.synced_to is None:
+                    self.mass.create_task(self._handle_controller_event(controller_event))
 
     async def _handle_group_member_removed(self, group: SendspinGroup, client_id: str) -> None:
         """Handle a group member being removed asynchronously."""
@@ -958,5 +934,3 @@ class SendspinPlayer(Player):
         await super().on_unload()
         self.unsub_event_cb()
         self.unsub_group_event_cb()
-        if self.unsub_controller_event_cb is not None:
-            self.unsub_controller_event_cb()
