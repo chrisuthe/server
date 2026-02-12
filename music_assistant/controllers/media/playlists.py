@@ -92,24 +92,36 @@ class PlaylistController(MediaControllerBase[Playlist]):
         force_refresh: bool = False,
     ) -> AsyncGenerator[PlaylistPlayableItem, None]:
         """Return playlist tracks for the given provider playlist id."""
+        prov_item_id = item_id
+        prov_instance = provider_instance_id_or_domain
         if provider_instance_id_or_domain == "library":
             library_item = await self.get_library_item(item_id)
-            provider_instance_id_or_domain, item_id = self._select_provider_id(library_item)
+            prov_instance, prov_item_id = self._select_provider_id(library_item)
         # playlist tracks are not stored in the db,
-        # we always fetched them (cached) from the provider
+        # we always fetch them (cached) from the provider.
+        # when force_refresh is set, collect genres in the same pass
+        # to avoid a second iteration of the track list.
+        genre_counts: dict[str, int] | None = {} if force_refresh else None
         page = 0
         while True:
             tracks = await self._get_provider_playlist_tracks(
-                item_id,
-                provider_instance_id_or_domain,
+                prov_item_id,
+                prov_instance,
                 page=page,
                 force_refresh=force_refresh,
             )
             if not tracks:
                 break
             for track in tracks:
+                if genre_counts is not None:
+                    for genre in self._get_track_genres(track):
+                        genre_counts[genre] = genre_counts.get(genre, 0) + 1
                 yield track
             page += 1
+        if genre_counts:
+            db_item = await self.get_library_item_by_prov_id(prov_item_id, prov_instance)
+            if db_item:
+                await self._save_playlist_genres(db_item, genre_counts)
 
     async def create_playlist(
         self, name: str, provider_instance_or_domain: str | None = None
@@ -512,10 +524,7 @@ class PlaylistController(MediaControllerBase[Playlist]):
             # Builtin provider overrides to return list[PlaylistPlayableItem],
             # others return list[Track]. Since Track is part of PlaylistPlayableItem union,
             # this is safe at runtime. Type ignore needed because list is invariant.
-            result = await provider.get_playlist_tracks(item_id, page=page)  # type: ignore[return-value]
-        if force_refresh:
-            self._schedule_playlist_genre_update(item_id, provider_instance_id_or_domain)
-        return result
+            return await provider.get_playlist_tracks(item_id, page=page)  # type: ignore[return-value]
 
     async def radio_mode_base_tracks(
         self,
@@ -545,11 +554,7 @@ class PlaylistController(MediaControllerBase[Playlist]):
             await self.add_provider_mappings(db_item.item_id, db_item.provider_mappings)
 
     def _refresh_playlist_tracks(self, playlist: Playlist) -> None:
-        """Refresh playlist tracks by forcing a cache refresh.
-
-        Genre update is triggered automatically by _get_provider_playlist_tracks
-        when force_refresh=True.
-        """
+        """Refresh playlist tracks by forcing a cache refresh."""
 
         async def _refresh(playlist: Playlist) -> None:
             async for _ in self.tracks(playlist.item_id, playlist.provider, force_refresh=True):
@@ -557,34 +562,6 @@ class PlaylistController(MediaControllerBase[Playlist]):
 
         task_id = f"refresh_playlist_tracks_{playlist.item_id}"
         self.mass.call_later(5, _refresh, playlist, task_id=task_id)  # debounce multiple calls
-
-    def _schedule_playlist_genre_update(self, prov_item_id: str, provider_instance_id: str) -> None:
-        """Schedule a debounced genre update for a playlist after tracks refresh.
-
-        :param prov_item_id: The provider-specific playlist item ID.
-        :param provider_instance_id: The provider instance ID.
-        """
-
-        async def _do_update() -> None:
-            library_item = await self.get_library_item_by_prov_id(
-                prov_item_id, provider_instance_id
-            )
-            if library_item:
-                await self._update_playlist_genres(library_item)
-
-        task_id = f"genre_update_{prov_item_id}_{provider_instance_id}"
-        self.mass.call_later(2, _do_update, task_id=task_id)
-
-    async def _update_playlist_genres(self, playlist: Playlist) -> None:
-        """Recalculate playlist genres from the current track list.
-
-        :param playlist: The playlist to update genres for.
-        """
-        genre_counts: dict[str, int] = {}
-        async for track in self.tracks(playlist.item_id, playlist.provider):
-            for genre in self._get_track_genres(track):
-                genre_counts[genre] = genre_counts.get(genre, 0) + 1
-        await self._save_playlist_genres(playlist, genre_counts)
 
     @staticmethod
     def _get_track_genres(track: PlaylistPlayableItem) -> set[str]:
