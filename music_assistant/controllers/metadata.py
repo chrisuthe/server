@@ -429,7 +429,7 @@ class MetaDataController(CoreController):
             image_format = "png" if path.lower().endswith(".png") else "jpg"
         if provider == "builtin" and path.startswith("/collage/"):
             # special case for collage images
-            collage_rel = path.split("/collage/")[-1]
+            collage_rel = path.rsplit("/collage/", maxsplit=1)[-1]
             if not is_safe_path(collage_rel):
                 raise FileNotFoundError("Invalid collage path")
             path = os.path.join(self._collage_images_dir, collage_rel)
@@ -750,37 +750,13 @@ class MetaDataController(CoreController):
                 )
             ):
                 all_playlist_tracks_images.append(track.image)
-            if track.metadata.genres:
-                genres = track.metadata.genres
-            elif (
-                isinstance(track, Track)
-                and track.album
-                and isinstance(track.album, Album)
-                and track.album.metadata.genres
-            ):
-                genres = track.album.metadata.genres
-            else:
-                genres = set()
-            for genre in genres:
+            for genre in self.mass.music.playlists.get_track_genres(track):
                 if genre not in playlist_genres:
                     playlist_genres[genre] = 0
                 playlist_genres[genre] += 1
             await asyncio.sleep(0)  # yield to eventloop
 
-        # for small playlists keep all genres, for larger ones filter to significant ones
-        total_tracks = sum(playlist_genres.values()) if playlist_genres else 0
-        if total_tracks <= 20:
-            playlist_genres_filtered = set(playlist_genres.keys())
-        else:
-            min_count = min(5, total_tracks // 10)
-            playlist_genres_filtered = {
-                genre for genre, count in playlist_genres.items() if count > min_count
-            }
-        # sort by occurrence count and limit to 8
-        sorted_genres = sorted(
-            playlist_genres_filtered, key=lambda g: playlist_genres.get(g, 0), reverse=True
-        )
-        playlist.metadata.genres = set(sorted_genres[:8])
+        playlist.metadata.genres = self.mass.music.playlists.filter_playlist_genres(playlist_genres)
         # create collage images
         cur_images: list[MediaItemImage] = playlist.metadata.images or []
         new_images = []
