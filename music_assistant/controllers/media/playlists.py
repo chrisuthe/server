@@ -542,10 +542,7 @@ class PlaylistController(MediaControllerBase[Playlist]):
             await self.add_provider_mappings(db_item.item_id, db_item.provider_mappings)
 
     def _refresh_playlist_tracks(self, playlist: Playlist) -> None:
-        """Refresh playlist tracks by forcing a cache refresh.
-
-        Collects genres in the same iteration to avoid a redundant second pass.
-        """
+        """Refresh playlist tracks by forcing a cache refresh."""
 
         async def _refresh(playlist: Playlist) -> None:
             genre_counts: dict[str, int] = {}
