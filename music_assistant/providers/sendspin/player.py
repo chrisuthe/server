@@ -7,10 +7,9 @@ import time
 from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass, field
 from io import BytesIO
 from typing import TYPE_CHECKING, cast
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from aiosendspin.models import AudioCodec, MediaCommand
 from aiosendspin.models.types import PlaybackStateType
@@ -22,7 +21,6 @@ from aiosendspin.server import (
     VolumeChangedEvent,
 )
 from aiosendspin.server.audio import AudioFormat as SendspinAudioFormat
-from aiosendspin.server.channels import MAIN_CHANNEL
 from aiosendspin.server.client import DisconnectBehaviour
 from aiosendspin.server.events import (
     ClientGroupChangedEvent,
@@ -56,24 +54,20 @@ from music_assistant_models.enums import (
     PlayerType,
     RepeatMode,
 )
-from music_assistant_models.media_items import AudioFormat
 from music_assistant_models.player import DeviceInfo
 from PIL import Image
 
 from music_assistant.constants import (
-    CONF_ENTRY_FLOW_MODE,
     CONF_ENTRY_HTTP_PROFILE_HIDDEN,
     CONF_ENTRY_OUTPUT_CODEC_HIDDEN,
     CONF_ENTRY_SAMPLE_RATES,
-    CONF_OUTPUT_CHANNELS,
 )
-from music_assistant.helpers.audio import get_player_filter_params
-from music_assistant.helpers.ffmpeg import FFMpeg
 from music_assistant.models.player import Player, PlayerMedia
 from music_assistant.providers.sendspin.playback import (
+    _DSPChannel,
     _HistoricalInjection,
     _MainPCMCacheChunk,
-    pcm_duration_us,
+    _release_player_channel,
     prepare_dsp_for_join,
     run_playback,
 )
@@ -144,48 +138,11 @@ if TYPE_CHECKING:
     from aiosendspin.server.client import SendspinClient
     from aiosendspin.server.push_stream import PushStream
     from music_assistant_models.config_entries import ConfigValueType
+    from music_assistant_models.media_items import AudioFormat
     from music_assistant_models.player_queue import PlayerQueue
     from music_assistant_models.queue_item import QueueItem
 
-    from music_assistant.mass import MusicAssistant
-
     from .provider import SendspinProvider
-
-
-@dataclass
-class _DSPChannel:
-    """A DSP processing channel backed by an ffmpeg process."""
-
-    channel_id: UUID
-    filter_params: list[str]
-    ffmpeg: FFMpeg
-    output_channels: int  # 1 for mono (left/right mode), 2 for stereo
-    pending: bytearray = field(default_factory=bytearray)
-    chunks_processed: int = 0
-    chunks_failed: int = 0
-    input_bytes_total: int = 0
-    input_us_total: int = 0
-    raw_output_bytes_total: int = 0
-    raw_output_us_total: int = 0
-    delivered_output_bytes_total: int = 0
-    delivered_output_us_total: int = 0
-    pending_peak_bytes: int = 0
-    pending_condition: asyncio.Condition = field(default_factory=asyncio.Condition)
-    stdout_reader_task: asyncio.Task[None] | None = None
-
-
-def _get_dsp_filter_params(
-    mass: MusicAssistant, player_id: str, pcm_format: AudioFormat
-) -> list[str] | None:
-    """Return ffmpeg filter params if player needs DSP, else None."""
-    dsp_enabled = mass.config.get_player_dsp_config(player_id).enabled
-    output_channels = mass.config.get_raw_player_config_value(
-        player_id, CONF_OUTPUT_CHANNELS, "stereo"
-    )
-    if not dsp_enabled and output_channels == "stereo":
-        return None
-    filter_params = get_player_filter_params(mass, player_id, pcm_format, pcm_format)
-    return filter_params if filter_params else None
 
 
 class SendspinPlayer(Player):
@@ -518,175 +475,6 @@ class SendspinPlayer(Player):
                 self.display_name,
             )
 
-    def _resolve_channel_for_player(self, player_id: str, pcm_format: AudioFormat) -> UUID:
-        """Resolve channel ID for a player and update local maps."""
-        filter_params = _get_dsp_filter_params(self.mass, player_id, pcm_format)
-        if filter_params is None:
-            self._player_channel_map[player_id] = MAIN_CHANNEL
-            return MAIN_CHANNEL
-        channel_id = uuid4()
-        self._player_channel_map[player_id] = channel_id
-        return channel_id
-
-    async def _create_dsp_channel(
-        self,
-        player_id: str,
-        pcm_format: AudioFormat,
-    ) -> _DSPChannel:
-        """Create a new DSP channel with an ffmpeg process.
-
-        :param player_id: Player ID this DSP channel belongs to.
-        :param pcm_format: Input PCM audio format.
-        """
-        filter_params = _get_dsp_filter_params(self.mass, player_id, pcm_format) or []
-        output_channels = 1 if any("pan=mono" in p for p in filter_params) else 2
-        output_format = AudioFormat(
-            content_type=pcm_format.content_type,
-            sample_rate=pcm_format.sample_rate,
-            bit_depth=pcm_format.bit_depth,
-            channels=output_channels,
-        )
-        channel_id = self._player_channel_map[player_id]
-        ffmpeg = FFMpeg(
-            audio_input="-",
-            input_format=pcm_format,
-            output_format=output_format,
-            filter_params=filter_params,
-        )
-        await ffmpeg.start()
-        dsp = _DSPChannel(
-            channel_id=channel_id,
-            filter_params=filter_params,
-            ffmpeg=ffmpeg,
-            output_channels=output_channels,
-        )
-        dsp.stdout_reader_task = asyncio.create_task(
-            self._read_dsp_stdout(dsp),
-            name=f"sendspin-dsp-stdout-{dsp.channel_id}",
-        )
-        return dsp
-
-    async def _close_dsp_channel(self, dsp: _DSPChannel) -> None:
-        """Close a DSP channel and release ffmpeg resources."""
-        if dsp.stdout_reader_task is not None:
-            dsp.stdout_reader_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await dsp.stdout_reader_task
-        with suppress(Exception):
-            await dsp.ffmpeg.close()
-
-    async def _read_dsp_stdout(self, dsp: _DSPChannel) -> None:
-        """Continuously read ffmpeg stdout into dsp.pending.
-
-        We need to drain stdout continuously; otherwise ffmpeg can block on its stdout
-        pipe and/or our per-chunk reads can artificially lag behind real output.
-        """
-        try:
-            while True:
-                data = await dsp.ffmpeg.read(65536)
-                if not data:
-                    return
-                dsp.pending.extend(data)
-                dsp.pending_peak_bytes = max(dsp.pending_peak_bytes, len(dsp.pending))
-                async with dsp.pending_condition:
-                    dsp.pending_condition.notify_all()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            self.logger.debug(
-                "DSP stdout reader failed for channel %s", dsp.channel_id, exc_info=True
-            )
-        finally:
-            async with dsp.pending_condition:
-                dsp.pending_condition.notify_all()
-
-    async def _process_dsp_chunk(
-        self, dsp: _DSPChannel, chunk: bytes, pcm_format: AudioFormat
-    ) -> bytes:
-        """Process a PCM chunk through the DSP channel's ffmpeg.
-
-        :param dsp: DSP channel to process through.
-        :param chunk: Raw PCM audio data.
-        :param pcm_format: Input PCM format (used to calculate expected output size).
-        """
-        expected = len(chunk) // 2 if dsp.output_channels == 1 else len(chunk)
-        input_duration_us = pcm_duration_us(
-            len(chunk),
-            pcm_format.sample_rate,
-            pcm_format.bit_depth,
-            pcm_format.channels,
-        )
-        output_duration_us = pcm_duration_us(
-            expected,
-            pcm_format.sample_rate,
-            pcm_format.bit_depth,
-            dsp.output_channels,
-        )
-        dsp.chunks_processed += 1
-        dsp.input_bytes_total += len(chunk)
-        dsp.input_us_total += input_duration_us
-        try:
-            await asyncio.wait_for(dsp.ffmpeg.write(chunk), timeout=5.0)
-        except Exception:
-            dsp.chunks_failed += 1
-            dsp.delivered_output_bytes_total += expected
-            dsp.delivered_output_us_total += output_duration_us
-            self.logger.warning("DSP failed for channel %s", dsp.channel_id, exc_info=True)
-            # Keep timeline continuity by filling this chunk with silence.
-            return b"\x00" * expected
-
-        deadline = time.monotonic() + 2.0
-        while len(dsp.pending) < expected:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            async with dsp.pending_condition:
-                if len(dsp.pending) >= expected:
-                    break
-                if dsp.stdout_reader_task is not None and dsp.stdout_reader_task.done():
-                    break
-                with suppress(TimeoutError):
-                    await asyncio.wait_for(dsp.pending_condition.wait(), timeout=remaining)
-
-        raw_consumed_bytes = min(expected, len(dsp.pending))
-        raw_consumed_us = 0
-        if raw_consumed_bytes:
-            raw_consumed_us = pcm_duration_us(
-                raw_consumed_bytes,
-                pcm_format.sample_rate,
-                pcm_format.bit_depth,
-                dsp.output_channels,
-            )
-            dsp.raw_output_bytes_total += raw_consumed_bytes
-            dsp.raw_output_us_total += raw_consumed_us
-        dsp.delivered_output_bytes_total += expected
-        dsp.delivered_output_us_total += output_duration_us
-        if raw_consumed_bytes >= expected:
-            result = bytes(dsp.pending[:expected])
-            del dsp.pending[:expected]
-            return result
-
-        # Still short: output silence for the missing tail to keep stream moving,
-        # but record the fact that ffmpeg is lagging behind.
-        result = bytes(dsp.pending) + b"\x00" * (expected - len(dsp.pending))
-        dsp.pending.clear()
-        self.logger.debug(
-            "DSP short read channel=%s expected=%s got=%s lag_us=%s",
-            dsp.channel_id,
-            expected,
-            raw_consumed_bytes,
-            max(0, dsp.input_us_total - dsp.raw_output_us_total),
-        )
-        return result
-
-    async def _release_player_channel(self, player_id: str) -> None:
-        """Release channel bookkeeping for a player and close its DSP channel."""
-        self._player_channel_map.pop(player_id, None)
-        self._pending_historical_injections.pop(player_id, None)
-        dsp = self._dsp_channels.pop(player_id, None)
-        if dsp is not None:
-            await self._close_dsp_channel(dsp)
-
     async def _run_playback(self, media: PlayerMedia) -> None:
         """Run the actual playback in a background task."""
         await run_playback(self, media)
@@ -704,7 +492,7 @@ class SendspinPlayer(Player):
             player = self.mass.players.get(player_id, True)
             player = cast("SendspinPlayer", player)  # For type checking
             await self.api.group.remove_client(player.api)
-            await self._release_player_channel(player_id)
+            await _release_player_channel(self, player_id)
         for player_id in player_ids_to_add or []:
             self._pending_join_members.add(player_id)
             join_started = time.perf_counter()
@@ -717,7 +505,7 @@ class SendspinPlayer(Player):
                 join_elapsed_ms = round((time.perf_counter() - join_started) * 1000, 1)
                 self.logger.debug("Joined player %s in %sms", player_id, join_elapsed_ms)
             except Exception:
-                await self._release_player_channel(player_id)
+                await _release_player_channel(self, player_id)
                 raise
             finally:
                 self._pending_join_members.discard(player_id)
@@ -857,9 +645,6 @@ class SendspinPlayer(Player):
         default_entries = await super().get_config_entries(action=action, values=values)
         entries = [
             *default_entries,
-            ConfigEntry.from_dict(
-                {**CONF_ENTRY_FLOW_MODE.to_dict(), "default_value": True, "hidden": True}
-            ),
             CONF_ENTRY_OUTPUT_CODEC_HIDDEN,
             CONF_ENTRY_HTTP_PROFILE_HIDDEN,
             ConfigEntry.from_dict({**CONF_ENTRY_SAMPLE_RATES.to_dict(), "hidden": True}),
@@ -892,6 +677,7 @@ class SendspinPlayer(Player):
                         category="audio",
                         default_value=SENDSPIN_FORMAT_AUTOMATIC,
                         options=format_options,
+                        advanced=True,
                     )
                 )
 

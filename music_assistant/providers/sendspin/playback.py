@@ -6,18 +6,23 @@ import asyncio
 import time
 from collections.abc import AsyncGenerator
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from aiosendspin.server.audio import AudioFormat as SendspinAudioFormat
 from aiosendspin.server.channels import MAIN_CHANNEL
 from music_assistant_models.enums import ContentType, PlaybackState
 from music_assistant_models.media_items import AudioFormat
 
+from music_assistant.constants import CONF_OUTPUT_CHANNELS
+from music_assistant.helpers.audio import get_player_filter_params
+from music_assistant.helpers.ffmpeg import FFMpeg
 from music_assistant.models.player import PlayerMedia
 
 if TYPE_CHECKING:
+    from music_assistant.mass import MusicAssistant
+
     from .player import SendspinPlayer
 
 # Use a frame size that matches ffmpeg's typical internal audio frame granularity
@@ -58,6 +63,28 @@ class _HistoricalInjection:
     chunks: list[bytes]
 
 
+@dataclass
+class _DSPChannel:
+    """A DSP processing channel backed by an ffmpeg process."""
+
+    channel_id: UUID
+    filter_params: list[str]
+    ffmpeg: FFMpeg
+    output_channels: int  # 1 for mono (left/right mode), 2 for stereo
+    pending: bytearray = field(default_factory=bytearray)
+    chunks_processed: int = 0
+    chunks_failed: int = 0
+    input_bytes_total: int = 0
+    input_us_total: int = 0
+    raw_output_bytes_total: int = 0
+    raw_output_us_total: int = 0
+    delivered_output_bytes_total: int = 0
+    delivered_output_us_total: int = 0
+    pending_peak_bytes: int = 0
+    pending_condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+    stdout_reader_task: asyncio.Task[None] | None = None
+
+
 def pcm_duration_us(byte_count: int, sample_rate: int, bit_depth: int, channels: int) -> int:
     """Calculate PCM duration from byte count and format."""
     frame_stride = (bit_depth // 8) * channels
@@ -84,6 +111,199 @@ def _normalize_pcm_size(pcm_data: bytes, expected_size: int) -> bytes:
     return pcm_data + (b"\x00" * (expected_size - len(pcm_data)))
 
 
+def _get_dsp_filter_params(
+    mass: MusicAssistant, player_id: str, pcm_format: AudioFormat
+) -> list[str] | None:
+    """Return ffmpeg filter params if player needs DSP, else None."""
+    dsp_enabled = mass.config.get_player_dsp_config(player_id).enabled
+    output_channels = mass.config.get_raw_player_config_value(
+        player_id, CONF_OUTPUT_CHANNELS, "stereo"
+    )
+    if not dsp_enabled and output_channels == "stereo":
+        return None
+    filter_params = get_player_filter_params(mass, player_id, pcm_format, pcm_format)
+    return filter_params if filter_params else None
+
+
+async def _close_dsp_channel(dsp: _DSPChannel) -> None:
+    """Close a DSP channel and release ffmpeg resources."""
+    if dsp.stdout_reader_task is not None:
+        dsp.stdout_reader_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await dsp.stdout_reader_task
+    with suppress(Exception):
+        await dsp.ffmpeg.close()
+
+
+async def _read_dsp_stdout(player: SendspinPlayer, dsp: _DSPChannel) -> None:
+    """Continuously read ffmpeg stdout into dsp.pending.
+
+    We need to drain stdout continuously; otherwise ffmpeg can block on its stdout
+    pipe and/or our per-chunk reads can artificially lag behind real output.
+    """
+    try:
+        while True:
+            data = await dsp.ffmpeg.read(65536)
+            if not data:
+                return
+            dsp.pending.extend(data)
+            dsp.pending_peak_bytes = max(dsp.pending_peak_bytes, len(dsp.pending))
+            async with dsp.pending_condition:
+                dsp.pending_condition.notify_all()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        player.logger.debug(
+            "DSP stdout reader failed for channel %s", dsp.channel_id, exc_info=True
+        )
+    finally:
+        async with dsp.pending_condition:
+            dsp.pending_condition.notify_all()
+
+
+async def _process_dsp_chunk(
+    player: SendspinPlayer, dsp: _DSPChannel, chunk: bytes, pcm_format: AudioFormat
+) -> bytes:
+    """Process a PCM chunk through the DSP channel's ffmpeg.
+
+    :param player: The player owning this DSP channel.
+    :param dsp: DSP channel to process through.
+    :param chunk: Raw PCM audio data.
+    :param pcm_format: Input PCM format (used to calculate expected output size).
+    """
+    expected = len(chunk) // 2 if dsp.output_channels == 1 else len(chunk)
+    input_duration_us = pcm_duration_us(
+        len(chunk),
+        pcm_format.sample_rate,
+        pcm_format.bit_depth,
+        pcm_format.channels,
+    )
+    output_duration_us = pcm_duration_us(
+        expected,
+        pcm_format.sample_rate,
+        pcm_format.bit_depth,
+        dsp.output_channels,
+    )
+    dsp.chunks_processed += 1
+    dsp.input_bytes_total += len(chunk)
+    dsp.input_us_total += input_duration_us
+    try:
+        await asyncio.wait_for(dsp.ffmpeg.write(chunk), timeout=5.0)
+    except Exception:
+        dsp.chunks_failed += 1
+        dsp.delivered_output_bytes_total += expected
+        dsp.delivered_output_us_total += output_duration_us
+        player.logger.warning("DSP failed for channel %s", dsp.channel_id, exc_info=True)
+        # Keep timeline continuity by filling this chunk with silence.
+        return b"\x00" * expected
+
+    deadline = time.monotonic() + 2.0
+    while len(dsp.pending) < expected:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        async with dsp.pending_condition:
+            if len(dsp.pending) >= expected:
+                break
+            if dsp.stdout_reader_task is not None and dsp.stdout_reader_task.done():
+                break
+            with suppress(TimeoutError):
+                await asyncio.wait_for(dsp.pending_condition.wait(), timeout=remaining)
+
+    raw_consumed_bytes = min(expected, len(dsp.pending))
+    raw_consumed_us = 0
+    if raw_consumed_bytes:
+        raw_consumed_us = pcm_duration_us(
+            raw_consumed_bytes,
+            pcm_format.sample_rate,
+            pcm_format.bit_depth,
+            dsp.output_channels,
+        )
+        dsp.raw_output_bytes_total += raw_consumed_bytes
+        dsp.raw_output_us_total += raw_consumed_us
+    dsp.delivered_output_bytes_total += expected
+    dsp.delivered_output_us_total += output_duration_us
+    if raw_consumed_bytes >= expected:
+        result = bytes(dsp.pending[:expected])
+        del dsp.pending[:expected]
+        return result
+
+    # Still short: output silence for the missing tail to keep stream moving,
+    # but record the fact that ffmpeg is lagging behind.
+    result = bytes(dsp.pending) + b"\x00" * (expected - len(dsp.pending))
+    dsp.pending.clear()
+    player.logger.debug(
+        "DSP short read channel=%s expected=%s got=%s lag_us=%s",
+        dsp.channel_id,
+        expected,
+        raw_consumed_bytes,
+        max(0, dsp.input_us_total - dsp.raw_output_us_total),
+    )
+    return result
+
+
+async def _create_dsp_channel(
+    player: SendspinPlayer,
+    player_id: str,
+    pcm_format: AudioFormat,
+) -> _DSPChannel:
+    """Create a new DSP channel with an ffmpeg process.
+
+    :param player: The leader player owning the DSP channels.
+    :param player_id: Player ID this DSP channel belongs to.
+    :param pcm_format: Input PCM audio format.
+    """
+    filter_params = _get_dsp_filter_params(player.mass, player_id, pcm_format) or []
+    output_channels = 1 if any("pan=mono" in p for p in filter_params) else 2
+    output_format = AudioFormat(
+        content_type=pcm_format.content_type,
+        sample_rate=pcm_format.sample_rate,
+        bit_depth=pcm_format.bit_depth,
+        channels=output_channels,
+    )
+    channel_id = player._player_channel_map[player_id]
+    ffmpeg = FFMpeg(
+        audio_input="-",
+        input_format=pcm_format,
+        output_format=output_format,
+        filter_params=filter_params,
+    )
+    await ffmpeg.start()
+    dsp = _DSPChannel(
+        channel_id=channel_id,
+        filter_params=filter_params,
+        ffmpeg=ffmpeg,
+        output_channels=output_channels,
+    )
+    dsp.stdout_reader_task = asyncio.create_task(
+        _read_dsp_stdout(player, dsp),
+        name=f"sendspin-dsp-stdout-{dsp.channel_id}",
+    )
+    return dsp
+
+
+def _resolve_channel_for_player(
+    player: SendspinPlayer, player_id: str, pcm_format: AudioFormat
+) -> UUID:
+    """Resolve channel ID for a player and update local maps."""
+    filter_params = _get_dsp_filter_params(player.mass, player_id, pcm_format)
+    if filter_params is None:
+        player._player_channel_map[player_id] = MAIN_CHANNEL
+        return MAIN_CHANNEL
+    channel_id = uuid4()
+    player._player_channel_map[player_id] = channel_id
+    return channel_id
+
+
+async def _release_player_channel(player: SendspinPlayer, player_id: str) -> None:
+    """Release channel bookkeeping for a player and close its DSP channel."""
+    player._player_channel_map.pop(player_id, None)
+    player._pending_historical_injections.pop(player_id, None)
+    dsp = player._dsp_channels.pop(player_id, None)
+    if dsp is not None:
+        await _close_dsp_channel(dsp)
+
+
 async def _sync_live_dsp_channels(player: SendspinPlayer, pcm_format: AudioFormat) -> None:
     """Sync active DSP channels with current group members."""
     # Include pending joiners so we don't "drop" their DSP channel between the
@@ -95,21 +315,21 @@ async def _sync_live_dsp_channels(player: SendspinPlayer, pcm_format: AudioForma
     }
     for member_id in current_members:
         if member_id not in player._player_channel_map:
-            player._resolve_channel_for_player(member_id, pcm_format)
+            _resolve_channel_for_player(player, member_id, pcm_format)
 
     departed_members = (
         set(player._player_channel_map) - current_members - player._pending_join_members
     )
     for member_id in departed_members:
-        await player._release_player_channel(member_id)
+        await _release_player_channel(player, member_id)
 
     for member_id in current_members:
         if (
             member_id not in player._dsp_channels
             and player._player_channel_map.get(member_id) != MAIN_CHANNEL
         ):
-            player._dsp_channels[member_id] = await player._create_dsp_channel(
-                member_id, pcm_format
+            player._dsp_channels[member_id] = await _create_dsp_channel(
+                player, member_id, pcm_format
             )
 
 
@@ -158,7 +378,7 @@ async def _prepare_commit_frames(
             processed_by_channel: dict[UUID, tuple[bytes, SendspinAudioFormat]] = {}
             if active_dsps:
                 processed_frames = await asyncio.gather(
-                    *(player._process_dsp_chunk(dsp, frame, pcm_format) for dsp in active_dsps)
+                    *(_process_dsp_chunk(player, dsp, frame, pcm_format) for dsp in active_dsps)
                 )
                 for dsp, processed in zip(active_dsps, processed_frames, strict=True):
                     expected_size = _expected_dsp_bytes(
@@ -264,11 +484,11 @@ async def prepare_dsp_for_join(player: SendspinPlayer, player_id: str) -> None:
     if player._push_stream is None or player._pcm_format is None:
         return
     pcm_format = player._pcm_format
-    channel_id = player._resolve_channel_for_player(player_id, pcm_format)
+    channel_id = _resolve_channel_for_player(player, player_id, pcm_format)
     if channel_id == MAIN_CHANNEL:
         return
 
-    dsp = await player._create_dsp_channel(player_id, pcm_format)
+    dsp = await _create_dsp_channel(player, player_id, pcm_format)
     player._dsp_channels[player_id] = dsp
 
     if not _ENABLE_HISTORICAL_DSP_INJECTION:
@@ -303,7 +523,7 @@ async def prepare_dsp_for_join(player: SendspinPlayer, player_id: str) -> None:
     )
     processed_chunks: list[bytes] = []
     for chunk in historical_source:
-        processed = await player._process_dsp_chunk(dsp, chunk.pcm_data, pcm_format)
+        processed = await _process_dsp_chunk(player, dsp, chunk.pcm_data, pcm_format)
         expected_size = _expected_dsp_bytes(
             chunk.pcm_data,
             pcm_format.bit_depth,
@@ -358,7 +578,7 @@ async def run_playback(player: SendspinPlayer, media: PlayerMedia) -> None:  # n
                 return MAIN_CHANNEL
             if cached_channel_id := player._player_channel_map.get(player_id):
                 return cached_channel_id
-            return player._resolve_channel_for_player(player_id, player._pcm_format)
+            return _resolve_channel_for_player(player, player_id, player._pcm_format)
 
         player._push_stream = player.api.group.start_stream(channel_resolver=channel_resolver)
         audio_source = player.mass.streams.get_stream(media, pcm_format)
