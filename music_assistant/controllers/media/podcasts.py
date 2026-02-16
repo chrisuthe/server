@@ -93,13 +93,14 @@ class PodcastsController(MediaControllerBase[Podcast]):
         self,
         item_id: str,
         provider_instance_id_or_domain: str,
-        sort_order: str = "desc",
+        sort_order: str | None = None,
     ) -> AsyncGenerator[PodcastEpisode, None]:
         """Return podcast episodes for the given provider podcast id.
 
         :param item_id: The podcast item ID.
         :param provider_instance_id_or_domain: Provider instance ID or domain.
-        :param sort_order: Sort order for episodes - "desc" (newest first) or "asc" (oldest first).
+        :param sort_order: Optional sort order - "desc" (newest first) or "asc" (oldest first).
+            When not provided, episodes are returned in provider order.
         """
         # always check if we have a library item for this podcast
         if provider_instance_id_or_domain == "library":
@@ -109,19 +110,26 @@ class PodcastsController(MediaControllerBase[Podcast]):
             provider_instance_id_or_domain, item_id = self._select_provider_id(library_podcast)
         # podcast episodes are not stored in the db/library
         # so we always need to fetch them from the provider
-        # collect all episodes so we can sort by release date
-        all_episodes: list[PodcastEpisode] = [
-            episode
+        if sort_order is None:
+            # no sort requested - stream episodes in provider order
             async for episode in self._get_provider_podcast_episodes(
                 item_id, provider_instance_id_or_domain
+            ):
+                yield episode
+        else:
+            # collect all episodes so we can sort by release date
+            all_episodes: list[PodcastEpisode] = [
+                episode
+                async for episode in self._get_provider_podcast_episodes(
+                    item_id, provider_instance_id_or_domain
+                )
+            ]
+            all_episodes.sort(
+                key=lambda ep: ep.metadata.release_date or datetime.min.replace(tzinfo=UTC),
+                reverse=sort_order.lower() == "desc",
             )
-        ]
-        all_episodes.sort(
-            key=lambda ep: ep.metadata.release_date or datetime.min.replace(tzinfo=UTC),
-            reverse=sort_order.lower() == "desc",
-        )
-        for episode in all_episodes:
-            yield episode
+            for episode in all_episodes:
+                yield episode
 
     async def episode(
         self,
