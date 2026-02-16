@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.enums import MediaType, ProviderFeature
@@ -92,8 +93,14 @@ class PodcastsController(MediaControllerBase[Podcast]):
         self,
         item_id: str,
         provider_instance_id_or_domain: str,
+        sort_order: str = "desc",
     ) -> AsyncGenerator[PodcastEpisode, None]:
-        """Return podcast episodes for the given provider podcast id."""
+        """Return podcast episodes for the given provider podcast id.
+
+        :param item_id: The podcast item ID.
+        :param provider_instance_id_or_domain: Provider instance ID or domain.
+        :param sort_order: Sort order for episodes - "desc" (newest first) or "asc" (oldest first).
+        """
         # always check if we have a library item for this podcast
         if provider_instance_id_or_domain == "library":
             library_podcast = await self.get_library_item(item_id)
@@ -102,9 +109,18 @@ class PodcastsController(MediaControllerBase[Podcast]):
             provider_instance_id_or_domain, item_id = self._select_provider_id(library_podcast)
         # podcast episodes are not stored in the db/library
         # so we always need to fetch them from the provider
-        async for episode in self._get_provider_podcast_episodes(
-            item_id, provider_instance_id_or_domain
-        ):
+        # collect all episodes so we can sort by release date
+        all_episodes: list[PodcastEpisode] = [
+            episode
+            async for episode in self._get_provider_podcast_episodes(
+                item_id, provider_instance_id_or_domain
+            )
+        ]
+        all_episodes.sort(
+            key=lambda ep: ep.metadata.release_date or datetime.min.replace(tzinfo=UTC),
+            reverse=sort_order.lower() == "desc",
+        )
+        for episode in all_episodes:
             yield episode
 
     async def episode(
