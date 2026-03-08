@@ -18,7 +18,6 @@ aiosqlite==0.22.1
 aiovban>=0.6.3
 alexapy==1.29.17
 async-upnp-client==0.46.2
-async-upnp-client>=0.46.2
 audible==0.10.0
 auntie-sounds==1.1.7
 av==16.1.0
@@ -64,7 +63,7 @@ pylast==7.0.2
 python-fullykiosk==0.0.14
 python-slugify==8.0.4
 pytz==2025.2
-pywam==0.2
+pywam==0.1.0rc6
 pywidevine==1.9.0
 radios==0.3.2
 rokuecp==0.19.5
