@@ -18,6 +18,7 @@ from music_assistant.models.audio_analysis import AudioAnalysisData
 
 PITCH_CLASS_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
+# Required fields — must be non-None for a valid vector
 VECTOR_FIELDS = [
     "bpm",
     "energy",
@@ -30,15 +31,26 @@ VECTOR_FIELDS = [
     "rhythmic_regularity",
 ]
 
-VECTOR_DIMENSIONS = 14  # 9 scalars + 2 key encoding + 1 mode + 2 time-series variance
+# Optional ML fields — use neutral default (0.5) when absent
+OPTIONAL_FIELDS = [
+    "instrumentalness",
+    "valence",
+    "arousal",
+    "acousticness",
+]
+OPTIONAL_DEFAULT = 0.5
+
+# 9 required + 4 optional ML + 2 key encoding + 1 mode + 2 time-series variance = 18
+VECTOR_DIMENSIONS = 18
 
 FEATURE_GROUPS = {
-    "rhythm": (0, 3),  # bpm, energy, danceability
-    "loudness": (3, 5),  # loudness_integrated, loudness_range
-    "timbre": (5, 8),  # brightness, harmonic_complexity, roughness
-    "regularity": (8, 9),  # rhythmic_regularity
-    "tonal": (9, 12),  # key_sin, key_cos, mode
-    "dynamics": (12, 14),  # rms_variance, centroid_variance
+    "rhythm": (0, 3),       # bpm, energy, danceability
+    "loudness": (3, 5),     # loudness_integrated, loudness_range
+    "timbre": (5, 8),       # brightness, harmonic_complexity, roughness
+    "regularity": (8, 9),   # rhythmic_regularity
+    "mood": (9, 13),        # instrumentalness, valence, arousal, acousticness
+    "tonal": (13, 16),      # key_sin, key_cos, mode
+    "dynamics": (16, 18),   # rms_variance, centroid_variance
 }
 
 
@@ -58,34 +70,54 @@ def encode_key_mode(key: str, mode: str) -> tuple[float, float, float]:
 
 
 def assemble_vector(analysis: AudioAnalysisData) -> list[float] | None:
-    """Assemble a 14-dimensional feature vector from an AudioAnalysisData instance.
+    """Assemble a 17-dimensional feature vector from an AudioAnalysisData instance.
 
-    Returns None if any required field (all VECTOR_FIELDS, key, or mode) is None.
-    Time-series variance dimensions default to 0.0 when the array is absent or has
-    length <= 1.
+    Returns None if any required field (VECTOR_FIELDS, key, or mode) is None or
+    NaN — treating NaN values as unusable input so they cannot propagate into
+    distance calculations and produce null values in JSON responses.
+    Optional ML fields (instrumentalness, valence, acousticness) use a neutral
+    default of 0.5 when absent, so tracks without ML analysis still get valid
+    vectors that don't skew similarity in any direction.
 
     :param analysis: Source audio analysis data.
-    :returns: 14-element list of floats, or None if required fields are missing.
+    :returns: 17-element list of floats, or None if required fields are missing.
     """
-    # Validate all required scalar fields are present
+    # Validate all required scalar fields are present and finite
     for field in VECTOR_FIELDS:
-        if getattr(analysis, field) is None:
+        val = getattr(analysis, field)
+        if val is None or math.isnan(float(val)):
             return None
     if analysis.key is None or analysis.mode is None:
         return None
 
-    scalars = [float(getattr(analysis, field)) for field in VECTOR_FIELDS]
+    # 9 required scalars
+    vec: list[float] = [float(getattr(analysis, field)) for field in VECTOR_FIELDS]
 
+    # 3 optional ML scalars (default to 0.5 = neutral when absent or NaN)
+    for field in OPTIONAL_FIELDS:
+        val = getattr(analysis, field, None)
+        vec.append(
+            float(val)
+            if val is not None and not math.isnan(float(val))
+            else OPTIONAL_DEFAULT
+        )
+
+    # 3 key/mode encoding
     key_sin, key_cos, mode_float = encode_key_mode(analysis.key, analysis.mode)
+    vec.extend([key_sin, key_cos, mode_float])
 
-    # Compute time-series variances, defaulting to 0.0 for absent or trivial arrays
+    # 2 time-series variance (NaN-safe: np.var of NaN-containing arrays yields NaN)
     rms = analysis.rms_energy
     rms_var = float(np.var(rms)) if rms is not None and len(rms) > 1 else 0.0
+    vec.append(rms_var if not math.isnan(rms_var) else 0.0)
 
     centroid = analysis.spectral_centroid
-    centroid_var = float(np.var(centroid)) if centroid is not None and len(centroid) > 1 else 0.0
+    centroid_var = (
+        float(np.var(centroid)) if centroid is not None and len(centroid) > 1 else 0.0
+    )
+    vec.append(centroid_var if not math.isnan(centroid_var) else 0.0)
 
-    return [*scalars, key_sin, key_cos, mode_float, rms_var, centroid_var]
+    return vec
 
 
 def normalize_features(
@@ -136,6 +168,31 @@ def compute_corpus_stats(
     return [float(v) for v in means], [float(v) for v in stds]
 
 
+def compute_group_distances(
+    sig_a: list[float],
+    sig_b: list[float],
+    weights: dict[str, float],  # noqa: ARG001
+) -> dict[str, float]:
+    """Compute per-group Euclidean distance between two feature vectors.
+
+    Returns a dict mapping each FEATURE_GROUPS name to its raw (unweighted)
+    normalized distance. Weights are accepted for API symmetry but do not
+    affect the per-group values.
+
+    :param sig_a: First feature vector.
+    :param sig_b: Second feature vector.
+    :param weights: Accepted for API compatibility, not used.
+    """
+    a = np.array(sig_a, dtype=np.float64)
+    b = np.array(sig_b, dtype=np.float64)
+    result: dict[str, float] = {}
+    for group, (start, end) in FEATURE_GROUPS.items():
+        diff = a[start:end] - b[start:end]
+        dim_count = end - start
+        result[group] = math.sqrt(float(np.dot(diff, diff)) / dim_count)
+    return result
+
+
 def compute_weighted_distance(
     sig_a: list[float],
     sig_b: list[float],
@@ -143,30 +200,19 @@ def compute_weighted_distance(
 ) -> float:
     """Compute per-group weighted Euclidean distance between two feature vectors.
 
-    Each feature group (defined in FEATURE_GROUPS) contributes a weighted squared
-    distance. Missing group weights default to 1.0. The result is normalized by
-    the total weighted dimension count so distances are comparable across weight
-    configurations.
-
     :param sig_a: First feature vector.
     :param sig_b: Second feature vector.
     :param weights: Per-group weight overrides keyed by FEATURE_GROUPS name.
     :returns: Weighted normalized distance as a float.
     """
-    a = np.array(sig_a, dtype=np.float64)
-    b = np.array(sig_b, dtype=np.float64)
-
+    group_dists = compute_group_distances(sig_a, sig_b, weights)
     weighted_sq_sum = 0.0
     total_weighted_dims = 0.0
-
     for group, (start, end) in FEATURE_GROUPS.items():
         w = weights.get(group, 1.0)
-        diff = a[start:end] - b[start:end]
         dim_count = end - start
-        weighted_sq_sum += w * float(np.dot(diff, diff))
+        weighted_sq_sum += w * (group_dists[group] ** 2) * dim_count
         total_weighted_dims += w * dim_count
-
     if total_weighted_dims == 0.0:
         return 0.0
-
     return math.sqrt(weighted_sq_sum / total_weighted_dims)
