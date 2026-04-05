@@ -40,8 +40,9 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
 
-USEARCH_INDEX_FILENAME = "sonic_signatures.usearch"
+USEARCH_INDEX_FILENAME_TPL = "sonic_signatures_{domain}.usearch"
 CONF_MAX_CONCURRENT = "max_concurrent_analyses"
+CONF_AA_PROVIDER = "aa_provider_domain"
 
 SIMILARITY_PRESETS: dict[str, dict[str, float]] = {
     "balanced": {
@@ -49,6 +50,7 @@ SIMILARITY_PRESETS: dict[str, dict[str, float]] = {
         "loudness": 1.0,
         "timbre": 1.0,
         "regularity": 1.0,
+        "mood": 1.0,
         "tonal": 1.0,
         "dynamics": 1.0,
     },
@@ -57,6 +59,7 @@ SIMILARITY_PRESETS: dict[str, dict[str, float]] = {
         "loudness": 0.5,
         "timbre": 1.0,
         "regularity": 0.3,
+        "mood": 1.0,
         "tonal": 0.5,
         "dynamics": 0.8,
     },
@@ -65,6 +68,7 @@ SIMILARITY_PRESETS: dict[str, dict[str, float]] = {
         "loudness": 0.5,
         "timbre": 0.3,
         "regularity": 0.8,
+        "mood": 0.5,
         "tonal": 0.2,
         "dynamics": 0.3,
     },
@@ -73,6 +77,7 @@ SIMILARITY_PRESETS: dict[str, dict[str, float]] = {
         "loudness": 0.5,
         "timbre": 0.5,
         "regularity": 0.5,
+        "mood": 0.8,
         "tonal": 0.8,
         "dynamics": 0.5,
     },
@@ -81,6 +86,7 @@ SIMILARITY_PRESETS: dict[str, dict[str, float]] = {
         "loudness": 0.7,
         "timbre": 1.0,
         "regularity": 0.5,
+        "mood": 0.8,
         "tonal": 0.8,
         "dynamics": 0.7,
     },
@@ -227,6 +233,14 @@ async def get_config_entries(
             "Higher values speed up backfill but use more CPU and memory.",
             range=(1, 8),
         ),
+        ConfigEntry(
+            key=CONF_AA_PROVIDER,
+            type=ConfigEntryType.STRING,
+            default_value="sonic_analysis",
+            label="Analysis Provider",
+            description="Which audio analysis provider's data to use for similarity vectors. "
+            "Options: sonic_analysis (librosa), essentia_analysis (sidecar).",
+        ),
     )
 
 
@@ -241,6 +255,9 @@ class SonicSimilarityPlugin(PluginProvider):
     ) -> None:
         """Initialize the Sonic Similarity plugin."""
         super().__init__(mass, manifest, config)
+        self._aa_domain: str = "sonic_analysis"
+        self._indexes: dict[str, Any] = {}
+        self._corpus_stats: dict[str, tuple[list[float], list[float]]] = {}
         self._label_map: dict[int, tuple[str, str]] = {}
         self._reverse_label_map: dict[tuple[str, str], int] = {}
         self._next_label: int = 1
@@ -277,8 +294,37 @@ class SonicSimilarityPlugin(PluginProvider):
         self._unregister_handles.append(
             self.mass.register_api_command("sonic_analysis/clear_all", self._handle_clear_all)
         )
+        self._unregister_handles.append(
+            self.mass.register_api_command(
+                "sonic_analysis/export_analysis", self._handle_export_analysis
+            )
+        )
+        self._unregister_handles.append(
+            self.mass.register_api_command(
+                "sonic_analysis/compare_providers", self._handle_compare_providers
+            )
+        )
+        self._unregister_handles.append(
+            self.mass.register_api_command(
+                "sonic_analysis/aa_providers", self._handle_aa_providers
+            )
+        )
+        self._unregister_handles.append(
+            self.mass.register_api_command(
+                "sonic_analysis/set_aa_config", self._handle_set_aa_config
+            )
+        )
+        self._unregister_handles.append(
+            self.mass.register_api_command(
+                "sonic_analysis/switch_provider", self._handle_switch_provider
+            )
+        )
         self.mass.webserver.register_dynamic_route("/sonic_analysis/debug", self._serve_debug_page)
-        self.logger.info("Sonic Similarity loaded, rebuilding search index from database...")
+        self._aa_domain = str(self.config.get_value(CONF_AA_PROVIDER) or "sonic_analysis")
+        self.logger.info(
+            "Sonic Similarity loaded (aa_provider=%s), rebuilding search index...",
+            self._aa_domain,
+        )
         await self._rebuild_search_index()
         self.logger.info(
             "Search index ready: %d signatures cached, corpus_stats=%s",
@@ -292,7 +338,17 @@ class SonicSimilarityPlugin(PluginProvider):
             unregister()
         self._unregister_handles.clear()
         self.mass.webserver.unregister_dynamic_route("/sonic_analysis/debug")
+        # Save the active index
         await asyncio.to_thread(self._save_search_index)
+        # Save any cached alternate indexes
+        for cached_domain, cached in self._indexes.items():
+            if cached_domain == self._aa_domain:
+                continue
+            old_domain = self._aa_domain
+            self._aa_domain = cached_domain
+            self._search_index = cached["index"]
+            await asyncio.to_thread(self._save_search_index)
+            self._aa_domain = old_domain
         await super().unload(is_removed)
 
     # --- API handlers ---
@@ -320,6 +376,7 @@ class SonicSimilarityPlugin(PluginProvider):
         exclude_track_ids: list[str] | None = None,
         exclude_artists: list[str] | None = None,
         resolve: bool = False,
+        include_group_distances: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Find tracks similar to the given track(s)."""
@@ -472,13 +529,41 @@ class SonicSimilarityPlugin(PluginProvider):
 
         final_items = final_items[: params["limit"]]
 
+        group_distances_map: dict[str, dict[str, float]] = {}
+        if include_group_distances:
+            from music_assistant.providers.sonic_similarity.vectors import (  # noqa: PLC0415
+                compute_group_distances,
+            )
+
+            original_centroid = combine_seeds_centroid(seed_sigs)
+            orig_normalized = normalize_features(original_centroid, corpus_means, corpus_stds)
+            for cid, _prov, _dist, _gen in final_items:
+                cand_features = self._signature_cache.get(cid)
+                if cand_features is not None:
+                    cand_normalized = normalize_features(cand_features, corpus_means, corpus_stds)
+                    group_distances_map[cid] = compute_group_distances(
+                        orig_normalized, cand_normalized, weights
+                    )
+
         if params["resolve"]:
-            items = await self._resolve_results(final_items)
+            items = await self._resolve_results(
+                final_items,
+                group_distances_map if include_group_distances else None,
+            )
         else:
-            items = [
-                {"item_id": cid, "provider": prov, "distance": round(dist, 4), "generation": gen}
-                for cid, prov, dist, gen in final_items
-            ]
+            items = []
+            for cid, prov, dist, gen in final_items:
+                entry: dict[str, Any] = {
+                    "item_id": cid,
+                    "provider": prov,
+                    "distance": round(dist, 4),
+                    "generation": gen,
+                }
+                if include_group_distances and cid in group_distances_map:
+                    entry["group_distances"] = {
+                        k: round(v, 4) for k, v in group_distances_map[cid].items()
+                    }
+                items.append(entry)
 
         return {
             "analyzed": True,
@@ -506,6 +591,7 @@ class SonicSimilarityPlugin(PluginProvider):
             "index_size": index_size,
             "has_corpus_stats": self.corpus_means is not None,
             "cached_signatures": len(self._signature_cache),
+            "aa_provider_domain": self._aa_domain,
         }
 
     async def _handle_rebuild_index(self) -> dict[str, Any]:
@@ -519,7 +605,7 @@ class SonicSimilarityPlugin(PluginProvider):
         assert self.mass.music.database is not None
         await self.mass.music.database.execute(
             "DELETE FROM audio_analysis WHERE aa_provider_domain = :domain",
-            {"domain": "sonic_analysis"},
+            {"domain": self._aa_domain},
         )
         await self.mass.music.database.commit()
         self._label_map.clear()
@@ -528,7 +614,7 @@ class SonicSimilarityPlugin(PluginProvider):
         self._signature_cache.clear()
         self.corpus_means = None
         self.corpus_stds = None
-        index_path = Path(self.mass.storage_path) / USEARCH_INDEX_FILENAME
+        index_path = Path(self.mass.storage_path) / USEARCH_INDEX_FILENAME_TPL.format(domain=self._aa_domain)
         index_path.unlink(missing_ok=True)
         self._search_index = None
         self._init_search_index()
@@ -545,7 +631,7 @@ class SonicSimilarityPlugin(PluginProvider):
         assert self.mass.music.database is not None
         rows = await self.mass.music.database.get_rows(
             "audio_analysis",
-            {"aa_provider_domain": "sonic_analysis"},
+            {"aa_provider_domain": self._aa_domain},
             limit=0,
         )
 
@@ -589,6 +675,327 @@ class SonicSimilarityPlugin(PluginProvider):
 
         return {"total": total, "offset": offset, "limit": limit, "items": page}
 
+    async def _handle_export_analysis(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        random_pick: int = 0,
+    ) -> dict[str, Any]:
+        """Export analyzed tracks with metadata and verifiable analysis fields.
+
+        Returns name, artist, and all scalar analysis fields (bpm, key, mode,
+        energy, etc.) suitable for comparison against external data sources.
+
+        :param limit: Max tracks to return.
+        :param offset: Pagination offset.
+        """
+        assert self.mass.music.database is not None
+        rows = await self.mass.music.database.get_rows(
+            "audio_analysis",
+            {"aa_provider_domain": self._aa_domain},
+            limit=0,
+        )
+
+        # Verifiable scalar fields to include
+        export_fields = [
+            "bpm",
+            "key",
+            "mode",
+            "energy",
+            "danceability",
+            "loudness_integrated",
+            "loudness_range",
+            "true_peak",
+            "brightness",
+            "harmonic_complexity",
+            "roughness",
+            "rhythmic_regularity",
+            "duration",
+            "instrumentalness",
+            "valence",
+            "acousticness",
+        ]
+
+        # Collect unique entries with their analysis data
+        seen: set[tuple[str, str]] = set()
+        all_entries: list[tuple[str, str, dict[str, Any]]] = []
+        for row in rows:
+            key = (row["item_id"], row["provider"])
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                data = AudioAnalysisData.from_dict(json.loads(row["analysis_data"]))
+            except (json.JSONDecodeError, TypeError, KeyError):
+                continue
+            fields: dict[str, Any] = {}
+            for field in export_fields:
+                val = getattr(data, field, None)
+                if val is not None:
+                    fields[field] = round(val, 4) if isinstance(val, float) else val
+            # Include extra_data (moods, genre predictions, etc.)
+            if data.extra_data:
+                fields["extra_data"] = data.extra_data
+            all_entries.append((row["item_id"], row["provider"], fields))
+
+        total = len(all_entries)
+        if random_pick > 0:
+            import random  # noqa: PLC0415
+
+            pick_count = min(random_pick, total)
+            page_entries = random.sample(all_entries, pick_count)
+        else:
+            page_entries = all_entries[offset : offset + limit]
+
+        async def _resolve(item_id: str, provider: str, fields: dict[str, Any]) -> dict[str, Any]:
+            entry: dict[str, Any] = {
+                "item_id": item_id,
+                "name": "(unknown)",
+                "artist": "",
+                "album": "",
+                "mbid": "",
+                "isrc": "",
+            }
+            try:
+                t = await self.mass.music.tracks.get(item_id, provider)
+                entry["name"] = t.name
+                entry["artist"] = ", ".join(a.name for a in getattr(t, "artists", []) or [])
+                if hasattr(t, "album") and t.album:
+                    entry["album"] = t.album.name
+                # Extract MusicBrainz recording ID
+                if t.mbid:
+                    entry["mbid"] = t.mbid
+                # Extract ISRCs from external IDs
+                from music_assistant_models.enums import ExternalID  # noqa: PLC0415
+
+                for ext_id in getattr(t, "external_ids", []):
+                    if ext_id.type == ExternalID.ISRC and ext_id.value:
+                        entry["isrc"] = ext_id.value
+                        break
+            except Exception:  # noqa: S110
+                pass
+            entry.update(fields)
+            return entry
+
+        items = list(
+            await asyncio.gather(
+                *[_resolve(iid, prov, fields) for iid, prov, fields in page_entries]
+            )
+        )
+
+        return {"total": total, "offset": offset, "limit": limit, "items": items}
+
+    async def _handle_compare_providers(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Compare analysis results from different providers for the same tracks.
+
+        :param limit: Max tracks to return.
+        :param offset: Pagination offset.
+        """
+        assert self.mass.music.database is not None
+        # Get ALL analysis rows (not just sonic_analysis)
+        rows = await self.mass.music.database.get_rows("audio_analysis", limit=0)
+
+        compare_fields = [
+            "bpm",
+            "key",
+            "mode",
+            "energy",
+            "danceability",
+            "loudness_integrated",
+            "loudness_range",
+            "true_peak",
+            "brightness",
+            "harmonic_complexity",
+            "roughness",
+            "rhythmic_regularity",
+            "duration",
+            "instrumentalness",
+            "valence",
+            "acousticness",
+        ]
+
+        # Group by (item_id, provider) — each track can have multiple aa_provider rows
+        from collections import defaultdict  # noqa: PLC0415
+
+        track_providers: dict[tuple[str, str], dict[str, dict[str, Any]]] = defaultdict(dict)
+
+        for row in rows:
+            track_key = (row["item_id"], row["provider"])
+            aa_domain = row["aa_provider_domain"]
+            try:
+                data = AudioAnalysisData.from_dict(json.loads(row["analysis_data"]))
+            except (json.JSONDecodeError, TypeError, KeyError):
+                continue
+            fields: dict[str, Any] = {}
+            for field in compare_fields:
+                val = getattr(data, field, None)
+                if val is not None:
+                    fields[field] = round(val, 4) if isinstance(val, float) else val
+            if data.extra_data:
+                fields["extra_data"] = data.extra_data
+            track_providers[track_key][aa_domain] = fields
+
+        # Only keep tracks that have data from multiple providers
+        multi_provider = {k: v for k, v in track_providers.items() if len(v) > 1}
+
+        total = len(multi_provider)
+        page_keys = list(multi_provider.keys())[offset : offset + limit]
+
+        async def _resolve(
+            item_id: str, provider: str, providers_data: dict[str, dict[str, Any]]
+        ) -> dict[str, Any]:
+            entry: dict[str, Any] = {
+                "item_id": item_id,
+                "name": "(unknown)",
+                "artist": "",
+            }
+            try:
+                t = await self.mass.music.tracks.get(item_id, provider)
+                entry["name"] = t.name
+                entry["artist"] = ", ".join(a.name for a in getattr(t, "artists", []) or [])
+            except Exception:  # noqa: S110
+                pass
+            entry["providers"] = providers_data
+
+            # Compute diffs between providers
+            domains = list(providers_data.keys())
+            if len(domains) >= 2:
+                diffs: dict[str, Any] = {}
+                a_data = providers_data[domains[0]]
+                b_data = providers_data[domains[1]]
+                for field in compare_fields:
+                    a_val = a_data.get(field)
+                    b_val = b_data.get(field)
+                    if a_val is None or b_val is None:
+                        diffs[field] = "missing"
+                    elif isinstance(a_val, (int, float)) and isinstance(b_val, (int, float)):
+                        diffs[field] = round(abs(a_val - b_val), 4)
+                    elif a_val == b_val:
+                        diffs[field] = "match"
+                    else:
+                        diffs[field] = f"{a_val} vs {b_val}"
+                entry["diffs"] = diffs
+            return entry
+
+        items = list(
+            await asyncio.gather(
+                *[
+                    _resolve(item_id, provider, multi_provider[(item_id, provider)])
+                    for item_id, provider in page_keys
+                ]
+            )
+        )
+
+        return {"total": total, "offset": offset, "limit": limit, "items": items}
+
+    async def _handle_aa_providers(self) -> dict[str, Any]:
+        """Return status of all audio analysis providers."""
+        from music_assistant_models.enums import ProviderType  # noqa: PLC0415
+
+        providers = []
+        for prov in self.mass.get_providers(ProviderType.AUDIO_ANALYSIS):
+            # Count analysis rows for this provider
+            rows = await self.mass.music.database.get_rows(
+                "audio_analysis",
+                {"aa_provider_domain": prov.domain},
+                limit=0,
+            )
+            config_entries: dict[str, Any] = {}
+            if hasattr(prov, "config") and prov.config:
+                for key in prov.config.values:
+                    config_entries[key] = prov.config.get_value(key)
+
+            providers.append({
+                "domain": prov.domain,
+                "name": prov.name,
+                "instance_id": prov.instance_id,
+                "available": prov.available,
+                "analysis_count": len(rows),
+                "config": config_entries,
+            })
+
+        return {"providers": providers}
+
+    async def _handle_switch_provider(self, domain: str) -> dict[str, Any]:
+        """Switch which AA provider powers the similarity index.
+
+        Caches the current index/stats/labels in memory, then restores
+        (or rebuilds) the target provider's set. Each provider keeps its
+        own index so switching back is instant.
+
+        :param domain: The aa_provider_domain to use (e.g. "sonic_analysis" or "essentia_analysis").
+        """
+        # Save current state before switching
+        if self._search_index is not None:
+            await asyncio.to_thread(self._save_search_index)
+            self._indexes[self._aa_domain] = {
+                "index": self._search_index,
+                "corpus_means": self.corpus_means,
+                "corpus_stds": self.corpus_stds,
+                "label_map": dict(self._label_map),
+                "reverse_label_map": dict(self._reverse_label_map),
+                "next_label": self._next_label,
+                "signature_cache": dict(self._signature_cache),
+            }
+
+        self._aa_domain = domain
+
+        # Persist to config
+        await self.mass.config.save_provider_config(
+            self.domain, {CONF_AA_PROVIDER: domain}, self.instance_id
+        )
+
+        # Restore from memory if we've built this provider's index before
+        source = "rebuilt"
+        if domain in self._indexes:
+            cached = self._indexes[domain]
+            self._search_index = cached["index"]
+            self.corpus_means = cached["corpus_means"]
+            self.corpus_stds = cached["corpus_stds"]
+            self._label_map = cached["label_map"]
+            self._reverse_label_map = cached["reverse_label_map"]
+            self._next_label = cached["next_label"]
+            self._signature_cache = cached["signature_cache"]
+            source = "memory"
+            self.logger.info("Switched to %s (restored from memory)", domain)
+        else:
+            self.logger.info("Building index for %s...", domain)
+            await self._rebuild_search_index()
+
+        index_size = len(self._search_index) if self._search_index is not None else 0
+        return {
+            "status": "ok",
+            "aa_provider_domain": domain,
+            "index_size": index_size,
+            "source": source,
+        }
+
+    async def _handle_set_aa_config(
+        self, domain: str, key: str, value: str
+    ) -> dict[str, Any]:
+        """Update a config value on an audio analysis provider and reload it.
+
+        :param domain: The aa provider domain (e.g. "essentia_analysis").
+        :param key: The config key to update.
+        :param value: The new value.
+        """
+        from music_assistant_models.enums import ProviderType  # noqa: PLC0415
+
+        for prov in self.mass.get_providers(ProviderType.AUDIO_ANALYSIS):
+            if prov.domain == domain:
+                # Use the config controller's save_provider_config with instance_id
+                # to trigger the update path (not the create-new-instance path)
+                await self.mass.config.save_provider_config(
+                    domain, {key: value}, prov.instance_id
+                )
+                return {"status": "ok", "domain": domain, "key": key, "value": value}
+
+        return {"status": "error", "message": f"Provider {domain} not found"}
+
     # --- Index management ---
 
     def _init_search_index(self) -> None:
@@ -599,7 +1006,7 @@ class SonicSimilarityPlugin(PluginProvider):
             ScalarKind,
         )
 
-        index_path = Path(self.mass.storage_path) / USEARCH_INDEX_FILENAME
+        index_path = Path(self.mass.storage_path) / USEARCH_INDEX_FILENAME_TPL.format(domain=self._aa_domain)
         self._search_index = Index(
             ndim=VECTOR_DIMENSIONS,
             metric=MetricKind.Cos,
@@ -635,7 +1042,7 @@ class SonicSimilarityPlugin(PluginProvider):
         """Persist the USearch index to disk."""
         if self._search_index is None:
             return
-        index_path = Path(self.mass.storage_path) / USEARCH_INDEX_FILENAME
+        index_path = Path(self.mass.storage_path) / USEARCH_INDEX_FILENAME_TPL.format(domain=self._aa_domain)
         self._search_index.save(str(index_path))
         self.logger.debug("Saved USearch index to %s", index_path)
 
@@ -648,6 +1055,9 @@ class SonicSimilarityPlugin(PluginProvider):
         if self._search_index is None:
             self._init_search_index()
         vec = np.array(normalized_features, dtype=np.float32)
+        # Remove existing entry if present (handles dimension change rebuilds)
+        if label in self._search_index:
+            self._search_index.remove(label)
         self._search_index.add(label, vec)
 
     def _query_index(self, normalized_features: list[float], k: int) -> list[tuple[int, float]]:
@@ -670,7 +1080,7 @@ class SonicSimilarityPlugin(PluginProvider):
     async def _rebuild_search_index(self) -> None:
         """Rebuild the search index from all stored analysis rows."""
         rows = await self.mass.music.database.get_rows(
-            "audio_analysis", {"aa_provider_domain": "sonic_analysis"}, limit=0
+            "audio_analysis", {"aa_provider_domain": self._aa_domain}, limit=0
         )
         if not rows:
             self.logger.info("No analysis rows found in database, skipping index rebuild")
@@ -713,14 +1123,21 @@ class SonicSimilarityPlugin(PluginProvider):
         self.corpus_means, self.corpus_stds = compute_corpus_stats(all_features)
 
         # Delete old index file and rebuild in a thread to avoid blocking the event loop
-        index_path = Path(self.mass.storage_path) / USEARCH_INDEX_FILENAME
+        index_path = Path(self.mass.storage_path) / USEARCH_INDEX_FILENAME_TPL.format(domain=self._aa_domain)
         index_path.unlink(missing_ok=True)
         self._search_index = None
 
         def _build_and_save() -> None:
             assert self.corpus_means is not None
             assert self.corpus_stds is not None
-            self._init_search_index()
+            # Create a fresh empty index (don't load from disk — file was already deleted)
+            from usearch.index import Index, MetricKind, ScalarKind  # noqa: PLC0415
+
+            self._search_index = Index(
+                ndim=VECTOR_DIMENSIONS,
+                metric=MetricKind.Cos,
+                dtype=ScalarKind.F32,
+            )
             for item_id, provider, features in row_entries:
                 label = self._get_or_assign_label(item_id, provider)
                 normalized = normalize_features(features, self.corpus_means, self.corpus_stds)
@@ -847,8 +1264,13 @@ class SonicSimilarityPlugin(PluginProvider):
     async def _resolve_results(
         self,
         items: list[tuple[str, str, float, int]],
+        group_distances_map: dict[str, dict[str, float]] | None = None,
     ) -> list[dict[str, Any]]:
-        """Resolve track metadata for result items."""
+        """Resolve track metadata for result items.
+
+        :param items: List of (item_id, provider, distance, generation) tuples to resolve.
+        :param group_distances_map: Optional per-group distance breakdown keyed by item_id.
+        """
 
         async def _resolve_one(
             item_id: str,
@@ -870,6 +1292,10 @@ class SonicSimilarityPlugin(PluginProvider):
             except Exception:
                 entry["name"] = "(unknown)"
                 entry["artist"] = ""
+            if group_distances_map and item_id in group_distances_map:
+                entry["group_distances"] = {
+                    k: round(v, 4) for k, v in group_distances_map[item_id].items()
+                }
             return entry
 
         return list(
@@ -879,6 +1305,71 @@ class SonicSimilarityPlugin(PluginProvider):
         )
 
     # --- Backfill ---
+
+    async def _backfill_essentia(
+        self,
+        audio: Any,
+        sample_rate: int,
+        item_id: str,
+        provider_instance: str,
+    ) -> None:
+        """Send audio to the essentia sidecar during backfill if available.
+
+        :param audio: Mono float32 numpy audio array.
+        :param sample_rate: Sample rate in Hz.
+        :param item_id: Provider item ID for the track.
+        :param provider_instance: Provider instance ID.
+        """
+        from music_assistant_models.enums import ProviderType  # noqa: PLC0415
+
+        for prov in self.mass.get_providers(ProviderType.AUDIO_ANALYSIS):
+            if prov.domain != "essentia_analysis" or not prov.available:
+                continue
+            try:
+                import numpy as np  # noqa: PLC0415
+
+                # Convert float32 audio to 16-bit PCM bytes for the sidecar
+                pcm_16 = (audio * 32768.0).clip(-32768, 32767).astype(np.int16).tobytes()
+
+                from aiohttp import ClientSession, ClientTimeout  # noqa: PLC0415
+
+                sidecar_url = str(prov.config.get_value("sidecar_url") or "")
+                if not sidecar_url:
+                    return
+                url = f"{sidecar_url.rstrip('/')}/analyze"
+                timeout = ClientTimeout(total=120)
+                async with (
+                    ClientSession(timeout=timeout) as session,
+                    session.post(
+                        url,
+                        data=pcm_16,
+                        params={
+                            "sample_rate": str(sample_rate),
+                            "bit_depth": "16",
+                            "channels": "1",
+                        },
+                        headers={"Content-Type": "application/octet-stream"},
+                    ) as resp,
+                ):
+                    resp.raise_for_status()
+                    result = await resp.json()
+
+                from music_assistant.models.audio_analysis import (  # noqa: PLC0415
+                    AudioAnalysisData,
+                )
+
+                essentia_analysis = AudioAnalysisData.from_dict(result)
+                await self.mass.streams.audio_analysis.set_audio_analysis(
+                    item_id=item_id,
+                    provider_instance_id_or_domain=provider_instance,
+                    aa_provider_domain="essentia_analysis",
+                    analysis=essentia_analysis,
+                    analysis_version=1,
+                )
+                self.logger.debug("Backfill essentia OK for %s", item_id)
+            except Exception as exc:
+                self.logger.debug("Backfill essentia failed for %s: %s", item_id, exc)
+            return
 
     async def _backfill_library(self) -> None:  # noqa: PLR0915
         """Analyze all library tracks that don't have a signature yet."""
@@ -898,7 +1389,7 @@ class SonicSimilarityPlugin(PluginProvider):
             if mapping is None:
                 continue
             version = await self.mass.streams.audio_analysis.get_audio_analysis_version(
-                mapping.item_id, mapping.provider_instance, "sonic_analysis"
+                mapping.item_id, mapping.provider_instance, self._aa_domain
             )
             if version is not None and version >= 1:
                 continue
@@ -952,6 +1443,12 @@ class SonicSimilarityPlugin(PluginProvider):
                     vec = assemble_vector(analysis)
                     if vec is not None:
                         self._signature_cache[prov_item_id] = vec
+
+                    # Also send to essentia sidecar if available
+                    await self._backfill_essentia(
+                        audio, 22050, prov_item_id, prov_instance
+                    )
+
                     self.logger.debug(
                         "Backfill analyzed %s (%.1fs)",
                         prov_item_id,
@@ -1059,6 +1556,16 @@ _DEBUG_HTML = """\
     <button class="btn-info" id="btnStatus" disabled>Fetch Status</button>
     <div id="statusInfo"></div>
 
+    <h2>Similarity Source</h2>
+    <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;">
+      <select id="aaProviderSelect" disabled style="margin:0;flex:1;">
+        <option value="sonic_analysis">sonic_analysis (librosa)</option>
+        <option value="essentia_analysis">essentia_analysis (sidecar)</option>
+      </select>
+      <button class="btn-primary" id="btnSwitchProvider" disabled>Switch &amp; Rebuild</button>
+    </div>
+    <div id="switchResult" style="font-family:monospace;font-size:0.8em;"></div>
+
     <h2>Actions</h2>
     <button class="btn-warn" id="btnBackfill" disabled>Trigger Backfill</button>
     <button class="btn-warn" id="btnRebuild" disabled>Rebuild Index</button>
@@ -1115,6 +1622,56 @@ _DEBUG_HTML = """\
   <div id="trackPaging" style="margin-top:8px;font-size:0.85em;"></div>
 </div>
 
+<!-- Export Analysis Data -->
+<div class="panel">
+  <h2>Export Analysis Data</h2>
+  <p style="font-size:0.8em;color:#aaa;margin-bottom:8px;">
+    Export track metadata and analysis fields for accuracy verification against external sources.
+  </p>
+  <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;flex-wrap:wrap;">
+    <label style="font-size:0.85em;color:#aaa;margin:0;">Tracks:</label>
+    <input type="number" id="exportLimit" value="50" min="1" max="500"
+           style="width:80px;margin:0;">
+    <button class="btn-success" id="btnExport" disabled>Load Data</button>
+    <span style="color:#555;">|</span>
+    <label style="font-size:0.85em;color:#aaa;margin:0;">Pick random:</label>
+    <input type="number" id="exportRandomPick" value="20" min="1" max="500"
+           style="width:80px;margin:0;">
+    <button class="btn-warn" id="btnExportRandom" disabled>Pick</button>
+    <span style="color:#555;">|</span>
+    <button class="btn-info" id="btnExportCsv" disabled>Download CSV</button>
+  </div>
+  <div id="exportTableWrap" style="max-height:500px;overflow:auto;"></div>
+  <div id="exportPaging" style="margin-top:8px;font-size:0.85em;"></div>
+</div>
+
+<!-- Compare Providers -->
+<div class="panel">
+  <h2>Compare Providers</h2>
+  <p style="font-size:0.8em;color:#aaa;margin-bottom:8px;">
+    Side-by-side comparison of tracks analyzed by multiple providers. Only shows tracks with data from 2+ providers.
+  </p>
+  <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;">
+    <label style="font-size:0.85em;color:#aaa;margin:0;">Tracks:</label>
+    <input type="number" id="compareLimit" value="25" min="1" max="200"
+           style="width:80px;margin:0;">
+    <button class="btn-info" id="btnCompare" disabled>Load Comparison</button>
+  </div>
+  <div id="compareTableWrap" style="max-height:500px;overflow:auto;"></div>
+  <div id="comparePaging" style="margin-top:8px;font-size:0.85em;"></div>
+</div>
+
+<!-- Audio Analysis Providers -->
+<div class="panel">
+  <h2>Audio Analysis Providers</h2>
+  <p style="font-size:0.8em;color:#aaa;margin-bottom:8px;">
+    Shows all registered audio analysis providers and their configuration.
+    Use this to verify the Essentia sidecar connection and check analysis counts.
+  </p>
+  <button class="btn-info" id="btnAAProviders" disabled>Refresh</button>
+  <div id="aaProvidersWrap" style="margin-top:8px;"></div>
+</div>
+
 <!-- Log -->
 <div class="panel">
   <h2>Activity Log</h2>
@@ -1130,28 +1687,28 @@ _DEBUG_HTML = """\
 
   var PRESETS = {
     balanced: {
-      timbre: 100, harmony: 100, texture: 100,
-      rhythm: 100, energy: 100, genre: 0, year: 0
+      rhythm: 100, loudness: 100, timbre: 100,
+      regularity: 100, mood: 100, tonal: 100, dynamics: 100
     },
     vibe: {
-      timbre: 80, harmony: 50, texture: 60,
-      rhythm: 30, energy: 100, genre: 0, year: 0
+      rhythm: 30, loudness: 50, timbre: 100,
+      regularity: 30, mood: 100, tonal: 50, dynamics: 80
     },
     party: {
-      timbre: 30, harmony: 20, texture: 30,
-      rhythm: 100, energy: 80, genre: 0, year: 0
+      rhythm: 100, loudness: 50, timbre: 30,
+      regularity: 80, mood: 50, tonal: 20, dynamics: 30
     },
     genre_era: {
-      timbre: 50, harmony: 50, texture: 50,
-      rhythm: 50, energy: 50, genre: 80, year: 60
+      rhythm: 50, loudness: 50, timbre: 50,
+      regularity: 50, mood: 80, tonal: 80, dynamics: 50
     },
     discover: {
-      timbre: 100, harmony: 80, texture: 70,
-      rhythm: 50, energy: 70, genre: 0, year: 0
+      rhythm: 50, loudness: 70, timbre: 100,
+      regularity: 50, mood: 80, tonal: 80, dynamics: 70
     }
   };
 
-  var WEIGHT_NAMES = ['timbre', 'harmony', 'texture', 'rhythm', 'energy', 'genre', 'year'];
+  var WEIGHT_NAMES = ['rhythm', 'loudness', 'timbre', 'regularity', 'mood', 'tonal', 'dynamics'];
 
   var slidersDiv = document.getElementById('sliders');
   WEIGHT_NAMES.forEach(function(name) {
@@ -1208,7 +1765,8 @@ _DEBUG_HTML = """\
     document.getElementById('btnConnect').disabled = connected;
     document.getElementById('btnDisconnect').disabled = !connected;
     var btns = ['btnStatus', 'btnBackfill', 'btnRebuild', 'btnClearAll',
-      'btnSearch', 'btnLoadTracks'];
+      'btnSearch', 'btnLoadTracks', 'btnExport', 'btnExportRandom', 'btnCompare',
+      'btnAAProviders', 'btnSwitchProvider', 'aaProviderSelect'];
     btns.forEach(function(id) { document.getElementById(id).disabled = !connected; });
   }
 
@@ -1281,9 +1839,14 @@ _DEBUG_HTML = """\
   function fetchStatus() {
     sendCommand('sonic_analysis/status').then(function(result) {
       var el = document.getElementById('statusInfo');
-      el.textContent = 'Index size: ' + (result.index_size || 0) +
-        ' | Has corpus stats: ' + (result.has_corpus_stats || false) +
-        ' | Cached signatures: ' + (result.cached_signatures || 0);
+      var provLabel = result.aa_provider_domain || 'sonic_analysis';
+      el.textContent = 'Source: ' + provLabel +
+        ' | Index: ' + (result.index_size || 0) +
+        ' | Corpus stats: ' + (result.has_corpus_stats || false) +
+        ' | Cached: ' + (result.cached_signatures || 0);
+      // Sync the dropdown
+      var sel = document.getElementById('aaProviderSelect');
+      if (sel) { sel.value = provLabel; }
     }).catch(function(err) {
       document.getElementById('statusInfo').textContent = 'Error: ' + err;
     });
@@ -1475,6 +2038,333 @@ _DEBUG_HTML = """\
   document.getElementById('btnClearLog').addEventListener('click', function() {
     var el = document.getElementById('log');
     while (el.firstChild) { el.removeChild(el.firstChild); }
+  });
+
+  // --- Export Analysis Data ---
+  // NOTE: This debug page is a local-only developer tool, not served to external users.
+  // Data displayed is from the local MA database only.
+  var exportData = [];
+  var EXPORT_COLS = ['name', 'artist', 'album', 'mbid', 'isrc', 'bpm', 'key', 'mode',
+    'energy', 'danceability', 'loudness_integrated', 'loudness_range', 'true_peak',
+    'brightness', 'harmonic_complexity', 'roughness', 'rhythmic_regularity', 'duration',
+    'instrumentalness', 'valence', 'acousticness', 'moods', 'genres'];
+
+  function renderExportTable(items) {
+    var wrap = document.getElementById('exportTableWrap');
+    while (wrap.firstChild) { wrap.removeChild(wrap.firstChild); }
+    if (!items.length) {
+      var p = document.createElement('p');
+      p.style.color = '#aaa';
+      p.textContent = 'No analyzed tracks found.';
+      wrap.appendChild(p);
+      return;
+    }
+    var table = document.createElement('table');
+    var thead = document.createElement('thead');
+    var headerRow = document.createElement('tr');
+    EXPORT_COLS.forEach(function(col) {
+      var th = document.createElement('th');
+      th.textContent = col;
+      headerRow.appendChild(th);
+    });
+    thead.appendChild(headerRow);
+    table.appendChild(thead);
+    var tbody = document.createElement('tbody');
+    function getExportVal(item, col) {
+      // Handle ML fields that live inside extra_data
+      if (col === 'moods' && item.extra_data && item.extra_data.moods) {
+        var m = item.extra_data.moods;
+        return Object.keys(m).map(function(k) {
+          return k.replace('mood_', '') + ':' + Number(m[k]).toFixed(2);
+        }).join(', ');
+      }
+      if (col === 'genres' && item.extra_data && item.extra_data.genre_predictions) {
+        var g = item.extra_data.genre_predictions;
+        return Object.keys(g).map(function(k) {
+          return k + ':' + Number(g[k]).toFixed(2);
+        }).join(', ');
+      }
+      if (col === 'instrumentalness' || col === 'valence' || col === 'acousticness') {
+        return item[col];
+      }
+      return item[col];
+    }
+    items.forEach(function(item) {
+      var tr = document.createElement('tr');
+      EXPORT_COLS.forEach(function(col) {
+        var td = document.createElement('td');
+        var val = getExportVal(item, col);
+        if (val === undefined || val === null) td.textContent = '';
+        else if (typeof val === 'number') td.textContent = String(Number(val.toFixed(4)));
+        else td.textContent = String(val);
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+  }
+
+  function loadExportData(offset, randomPick) {
+    var limit = parseInt(document.getElementById('exportLimit').value) || 50;
+    var args = {limit: limit, offset: offset || 0};
+    if (randomPick) { args.random_pick = randomPick; }
+    sendCommand('sonic_analysis/export_analysis', args)
+      .then(function(res) {
+        exportData = res.items || [];
+        renderExportTable(exportData);
+        document.getElementById('btnExportCsv').disabled = !exportData.length;
+        var paging = document.getElementById('exportPaging');
+        paging.textContent = 'Showing ' + res.offset + '-' + (res.offset + exportData.length)
+          + ' of ' + res.total + ' tracks';
+      })
+      .catch(function(err) { logMsg('Export error: ' + err, 'log-error'); });
+  }
+
+  function downloadCsv() {
+    if (!exportData.length) return;
+    var lines = [EXPORT_COLS.join(',')];
+    exportData.forEach(function(item) {
+      var row = EXPORT_COLS.map(function(col) {
+        var val = item[col];
+        if (val === undefined || val === null) return '';
+        if (typeof val === 'string' && (val.indexOf(',') >= 0 || val.indexOf('"') >= 0)) {
+          return '"' + val.replace(/"/g, '""') + '"';
+        }
+        if (typeof val === 'number') return String(Number(val.toFixed(4)));
+        return String(val);
+      });
+      lines.push(row.join(','));
+    });
+    var blob = new Blob([lines.join(String.fromCharCode(10))], {type: 'text/csv'});
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'sonic_analysis_export.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  document.getElementById('btnExport').addEventListener('click', function() {
+    loadExportData(0);
+  });
+  document.getElementById('btnExportRandom').addEventListener('click', function() {
+    var pick = parseInt(document.getElementById('exportRandomPick').value) || 20;
+    loadExportData(0, pick);
+  });
+  document.getElementById('btnExportCsv').addEventListener('click', downloadCsv);
+
+  // --- Compare Providers ---
+  function loadComparison() {
+    var limit = parseInt(document.getElementById('compareLimit').value) || 25;
+    sendCommand('sonic_analysis/compare_providers', {limit: limit, offset: 0})
+      .then(function(res) {
+        var wrap = document.getElementById('compareTableWrap');
+        while (wrap.firstChild) { wrap.removeChild(wrap.firstChild); }
+        var items = res.items || [];
+        if (!items.length) {
+          var p = document.createElement('p');
+          p.style.color = '#aaa';
+          p.textContent = 'No tracks with multiple providers found. Enable both sonic_analysis and essentia_analysis, then analyze some tracks.';
+          wrap.appendChild(p);
+          return;
+        }
+        items.forEach(function(item) {
+          var card = document.createElement('div');
+          card.style.cssText = 'border:1px solid #2a2a4a;border-radius:4px;padding:10px;margin-bottom:8px;';
+          var title = document.createElement('div');
+          title.style.cssText = 'font-weight:bold;margin-bottom:6px;';
+          title.textContent = item.name + ' — ' + item.artist;
+          card.appendChild(title);
+
+          var table = document.createElement('table');
+          table.style.width = '100%';
+          var thead = document.createElement('thead');
+          var headerRow = document.createElement('tr');
+          var domains = Object.keys(item.providers || {});
+          ['Field'].concat(domains).concat(['Diff']).forEach(function(h) {
+            var th = document.createElement('th');
+            th.textContent = h;
+            headerRow.appendChild(th);
+          });
+          thead.appendChild(headerRow);
+          table.appendChild(thead);
+
+          var tbody = document.createElement('tbody');
+          var fields = ['bpm','key','mode','energy','danceability','loudness_integrated',
+            'loudness_range','true_peak','brightness','harmonic_complexity','roughness',
+            'rhythmic_regularity','duration','instrumentalness','valence','acousticness'];
+          fields.forEach(function(field) {
+            var tr = document.createElement('tr');
+            var tdField = document.createElement('td');
+            tdField.textContent = field;
+            tdField.style.color = '#9b8afb';
+            tr.appendChild(tdField);
+            domains.forEach(function(domain) {
+              var td = document.createElement('td');
+              var val = (item.providers[domain] || {})[field];
+              td.textContent = val === undefined || val === null ? '' : typeof val === 'number' ? Number(val.toFixed(4)).toString() : String(val);
+              tr.appendChild(td);
+            });
+            var tdDiff = document.createElement('td');
+            var diff = (item.diffs || {})[field];
+            if (diff === undefined || diff === null) { diff = ''; }
+            tdDiff.textContent = String(diff);
+            if (typeof diff === 'number' && diff > 5) { tdDiff.style.color = '#e74c3c'; }
+            else if (typeof diff === 'string' && diff !== 'match' && diff !== '' && diff !== 'missing') { tdDiff.style.color = '#e67e22'; }
+            else if (diff === 'match') { tdDiff.style.color = '#2ecc71'; }
+            tr.appendChild(tdDiff);
+            tbody.appendChild(tr);
+          });
+          // Add moods and genres rows from extra_data
+          ['moods', 'genre_predictions'].forEach(function(extraKey) {
+            var hasAny = false;
+            domains.forEach(function(domain) {
+              var ed = (item.providers[domain] || {}).extra_data;
+              if (ed && ed[extraKey]) hasAny = true;
+            });
+            if (!hasAny) return;
+            var tr = document.createElement('tr');
+            var tdField = document.createElement('td');
+            tdField.textContent = extraKey;
+            tdField.style.color = '#f39c12';
+            tr.appendChild(tdField);
+            domains.forEach(function(domain) {
+              var td = document.createElement('td');
+              td.style.fontSize = '0.8em';
+              var ed = (item.providers[domain] || {}).extra_data;
+              if (ed && ed[extraKey]) {
+                var obj = ed[extraKey];
+                td.textContent = Object.keys(obj).map(function(k) {
+                  var label = k.replace('mood_', '');
+                  return label + ':' + Number(obj[k]).toFixed(2);
+                }).join(', ');
+              }
+              tr.appendChild(td);
+            });
+            var tdDiff = document.createElement('td');
+            tdDiff.textContent = '';
+            tr.appendChild(tdDiff);
+            tbody.appendChild(tr);
+          });
+          table.appendChild(tbody);
+          card.appendChild(table);
+          wrap.appendChild(card);
+        });
+        var paging = document.getElementById('comparePaging');
+        paging.textContent = 'Showing ' + items.length + ' of ' + res.total + ' tracks with multiple providers';
+      })
+      .catch(function(err) { logMsg('Compare error: ' + err, 'log-error'); });
+  }
+
+  document.getElementById('btnCompare').addEventListener('click', loadComparison);
+
+  // --- Audio Analysis Providers ---
+  function loadAAProviders() {
+    sendCommand('sonic_analysis/aa_providers', {})
+      .then(function(res) {
+        var wrap = document.getElementById('aaProvidersWrap');
+        while (wrap.firstChild) { wrap.removeChild(wrap.firstChild); }
+        var providers = res.providers || [];
+        if (!providers.length) {
+          var p = document.createElement('p');
+          p.style.color = '#aaa';
+          p.textContent = 'No audio analysis providers found.';
+          wrap.appendChild(p);
+          return;
+        }
+        providers.forEach(function(prov) {
+          var card = document.createElement('div');
+          card.style.cssText = 'border:1px solid #2a2a4a;border-radius:4px;padding:10px;margin-bottom:8px;';
+          var header = document.createElement('div');
+          header.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:6px;';
+          var dot = document.createElement('span');
+          dot.style.cssText = 'display:inline-block;width:8px;height:8px;border-radius:50%;';
+          dot.style.background = prov.available ? '#2ecc71' : '#e74c3c';
+          header.appendChild(dot);
+          var name = document.createElement('strong');
+          name.textContent = prov.name;
+          header.appendChild(name);
+          var domain = document.createElement('span');
+          domain.style.color = '#777';
+          domain.textContent = ' (' + prov.domain + ')';
+          header.appendChild(domain);
+          var count = document.createElement('span');
+          count.style.cssText = 'margin-left:auto;font-size:0.85em;color:#9b8afb;';
+          count.textContent = prov.analysis_count + ' analyses';
+          header.appendChild(count);
+          card.appendChild(header);
+          var config = prov.config || {};
+          var configKeys = Object.keys(config);
+          if (configKeys.length > 0) {
+            var configDiv = document.createElement('div');
+            configDiv.style.cssText = 'font-size:0.85em;margin-top:6px;';
+            configKeys.forEach(function(key) {
+              var row = document.createElement('div');
+              row.style.cssText = 'display:flex;align-items:center;gap:6px;margin-bottom:4px;';
+              var label = document.createElement('label');
+              label.style.cssText = 'color:#aaa;width:120px;flex-shrink:0;';
+              label.textContent = key;
+              var input = document.createElement('input');
+              input.type = 'text';
+              input.value = String(config[key] || '');
+              input.style.cssText = 'flex:1;margin:0;padding:4px 8px;font-size:0.85em;';
+              input.dataset.domain = prov.domain;
+              input.dataset.key = key;
+              var btn = document.createElement('button');
+              btn.className = 'btn-success';
+              btn.textContent = 'Save';
+              btn.style.cssText = 'padding:4px 10px;font-size:0.8em;margin:0;';
+              btn.addEventListener('click', function() {
+                var d = input.dataset.domain;
+                var k = input.dataset.key;
+                var v = input.value;
+                sendCommand('sonic_analysis/set_aa_config', {domain: d, key: k, value: v})
+                  .then(function(res) {
+                    if (res.status === 'ok') {
+                      logMsg('Config saved: ' + d + '.' + k + ' = ' + v, 'log-info');
+                      setTimeout(loadAAProviders, 1000);
+                    } else {
+                      logMsg('Config save failed: ' + (res.message || 'unknown'), 'log-error');
+                    }
+                  })
+                  .catch(function(err) { logMsg('Config save error: ' + err, 'log-error'); });
+              });
+              row.appendChild(label);
+              row.appendChild(input);
+              row.appendChild(btn);
+              configDiv.appendChild(row);
+            });
+            card.appendChild(configDiv);
+          }
+          wrap.appendChild(card);
+        });
+      })
+      .catch(function(err) { logMsg('AA Providers error: ' + err, 'log-error'); });
+  }
+
+  document.getElementById('btnAAProviders').addEventListener('click', loadAAProviders);
+
+  // --- Switch Provider ---
+  document.getElementById('btnSwitchProvider').addEventListener('click', function() {
+    var domain = document.getElementById('aaProviderSelect').value;
+    var resultEl = document.getElementById('switchResult');
+    resultEl.textContent = 'Switching to ' + domain + '...';
+    sendCommand('sonic_analysis/switch_provider', {domain: domain})
+      .then(function(res) {
+        if (res.status === 'ok') {
+          resultEl.textContent = 'Switched to ' + res.aa_provider_domain
+            + ' — index rebuilt with ' + res.index_size + ' vectors';
+          resultEl.style.color = '#2ecc71';
+        } else {
+          resultEl.textContent = 'Error: ' + (res.message || 'unknown');
+          resultEl.style.color = '#e74c3c';
+        }
+      })
+      .catch(function(err) {
+        resultEl.textContent = 'Error: ' + err;
+        resultEl.style.color = '#e74c3c';
+      });
   });
 })();
 </script>
