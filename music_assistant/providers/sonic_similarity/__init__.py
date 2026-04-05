@@ -713,6 +713,7 @@ class SonicSimilarityPlugin(PluginProvider):
             "duration",
             "instrumentalness",
             "valence",
+            "arousal",
             "acousticness",
         ]
 
@@ -815,6 +816,7 @@ class SonicSimilarityPlugin(PluginProvider):
             "duration",
             "instrumentalness",
             "valence",
+            "arousal",
             "acousticness",
         ]
 
@@ -2047,7 +2049,7 @@ _DEBUG_HTML = """\
   var EXPORT_COLS = ['name', 'artist', 'album', 'mbid', 'isrc', 'bpm', 'key', 'mode',
     'energy', 'danceability', 'loudness_integrated', 'loudness_range', 'true_peak',
     'brightness', 'harmonic_complexity', 'roughness', 'rhythmic_regularity', 'duration',
-    'instrumentalness', 'valence', 'acousticness', 'moods', 'genres'];
+    'instrumentalness', 'valence', 'arousal', 'acousticness', 'moods', 'genres'];
 
   function renderExportTable(items) {
     var wrap = document.getElementById('exportTableWrap');
@@ -2193,7 +2195,7 @@ _DEBUG_HTML = """\
           var tbody = document.createElement('tbody');
           var fields = ['bpm','key','mode','energy','danceability','loudness_integrated',
             'loudness_range','true_peak','brightness','harmonic_complexity','roughness',
-            'rhythmic_regularity','duration','instrumentalness','valence','acousticness'];
+            'rhythmic_regularity','duration','instrumentalness','valence','arousal','acousticness'];
           fields.forEach(function(field) {
             var tr = document.createElement('tr');
             var tdField = document.createElement('td');
