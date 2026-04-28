@@ -3,7 +3,7 @@
   "domain": "sonic_similarity",
   "name": "Sonic Similarity",
   "description": "Find similar tracks in your library using audio signature analysis.",
-  "codeowners": ["@chrisuthe"],
+  "codeowners": ["@music-assistant"],
   "requirements": ["usearch"],
   "documentation": "",
   "depends_on": "sonic_analysis"
