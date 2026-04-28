@@ -2,17 +2,16 @@
 
 Provides similarity search and USearch indexing on top of signatures
 produced by audio_analysis-type providers (default: sonic_analysis).
-Two engines:
+Engine:
 
   - 18-dim weighted Euclidean over engineered audio features
     (assembled via vectors.assemble_vector), with preset weights, MMR
     diversity, depth/branch_factor recursive expansion, and optional
     metadata reranking. Surfaced as sonic_similarity/similar.
 
-  - 1024-dim raw cosine over the CLAP audio embeddings stored by the
-    sonic_analysis provider (when its text-search index is enabled).
-    No preset weights -- CLAP's joint embedding space is non-decomposable.
-    Surfaced as sonic_similarity/similar_clap.
+The 1024-dim CLAP-embedding similarity engine lives in the separate
+sonic_clap plugin, which manages the CLAP usearch index and reads the
+persisted embeddings from audio_analysis.extra_data.
 """
 
 from __future__ import annotations
@@ -302,11 +301,6 @@ class SonicSimilarityPlugin(PluginProvider):
             self.mass.register_api_command("sonic_similarity/similar", self._handle_similar)
         )
         self._unregister_handles.append(
-            self.mass.register_api_command(
-                "sonic_similarity/similar_clap", self._handle_similar_clap
-            )
-        )
-        self._unregister_handles.append(
             self.mass.register_api_command("sonic_similarity/status", self._handle_status)
         )
         self._unregister_handles.append(
@@ -572,185 +566,6 @@ class SonicSimilarityPlugin(PluginProvider):
         await self._rebuild_search_index()
         index_size = len(self._search_index) if self._search_index is not None else 0
         return {"status": "rebuilt", "index_size": index_size}
-
-    async def _handle_similar_clap(  # noqa: PLR0913, PLR0915
-        self,
-        item_id: str | None = None,
-        item_ids: list[str] | None = None,
-        limit: int = 25,
-        depth: int = 1,
-        branch_factor: int = 5,
-        blend_mode: str = "centroid",
-        seed_weights: list[float] | None = None,
-        diversity: float = 0.0,
-        candidates: int = 50,
-        filter_genres: list[str] | None = None,
-        filter_providers: list[str] | None = None,
-        exclude_track_ids: list[str] | None = None,
-        exclude_artists: list[str] | None = None,
-        resolve: bool = False,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Find tracks similar to seed(s) via raw 1024-dim CLAP audio embeddings.
-
-        Pure cosine similarity in CLAP's joint embedding space — no preset
-        weights (the space is non-decomposable) and no metadata bonus by
-        design (CLAP already encodes era/genre implicitly).
-        """
-        from music_assistant_models.enums import ProviderType  # noqa: PLC0415
-
-        sa = None
-        for prov in self.mass.get_providers(ProviderType.AUDIO_ANALYSIS):
-            if prov.domain == "sonic_analysis":
-                sa = prov
-                break
-        clap_index = getattr(sa, "_clap_index", None) if sa is not None else None
-        if clap_index is None:
-            return {
-                "analyzed": False,
-                "reason": "clap_index_disabled",
-                "items": [],
-            }
-
-        params = _parse_similar_params(
-            item_id=item_id,
-            item_ids=item_ids,
-            limit=limit,
-            depth=depth,
-            branch_factor=branch_factor,
-            blend_mode=blend_mode,
-            seed_weights=seed_weights,
-            diversity=diversity,
-            candidates=candidates,
-            filter_genres=filter_genres,
-            filter_providers=filter_providers,
-            exclude_track_ids=exclude_track_ids,
-            exclude_artists=exclude_artists,
-            resolve=resolve,
-        )
-
-        seed_embs: list[list[float]] = []
-        valid_seed_ids: list[str] = []
-        for sid in params["item_ids"]:
-            entry = clap_index.get_embedding_by_item_id(sid)
-            if entry is None:
-                self.logger.warning("Seed %s not in CLAP index, skipping", sid)
-                continue
-            _prov, vec = entry
-            seed_embs.append(vec.tolist())
-            valid_seed_ids.append(sid)
-
-        if not seed_embs:
-            return {
-                "analyzed": False,
-                "reason": "seeds_not_in_clap_index",
-                "seed_track_ids": params["item_ids"],
-                "items": [],
-            }
-
-        def _search_generation(
-            seeds: list[list[float]],
-            seen: set[str],
-        ) -> list[tuple[str, str, list[float], float]]:
-            if params["blend_mode"] == "union":
-                all_raw: list[list[tuple[str, str, float]]] = [
-                    clap_index.query_sync(
-                        np.asarray(seed_vec, dtype=np.float32), params["candidates"]
-                    )
-                    for seed_vec in seeds
-                ]
-                neighborhoods = [
-                    [(iid, dist) for _p, iid, dist in raw if iid not in seen] for raw in all_raw
-                ]
-                cand_pairs = merge_union_results(neighborhoods)
-                providers_by_id = {iid: prov for raw in all_raw for prov, iid, _ in raw}
-            else:
-                centroid = combine_seeds_centroid(seeds, params.get("seed_weights"))
-                raw = clap_index.query_sync(
-                    np.asarray(centroid, dtype=np.float32), params["candidates"]
-                )
-                cand_pairs = [(iid, dist) for _p, iid, dist in raw if iid not in seen]
-                providers_by_id = {iid: prov for prov, iid, _ in raw}
-
-            seed_id_set = set(valid_seed_ids)
-            exclude_set = set(params["exclude_track_ids"]) if params["exclude_track_ids"] else None
-            filter_prov_set = (
-                set(params["filter_providers"]) if params["filter_providers"] else None
-            )
-
-            results: list[tuple[str, str, list[float], float]] = []
-            for cand_id, dist in cand_pairs:
-                if cand_id in seed_id_set or cand_id in seen:
-                    continue
-                if exclude_set and cand_id in exclude_set:
-                    continue
-                cand_provider = providers_by_id.get(cand_id, "library")
-                if filter_prov_set and cand_provider not in filter_prov_set:
-                    continue
-                cand_entry = clap_index.get_embedding_by_item_id(cand_id)
-                if cand_entry is None:
-                    continue
-                _p, cand_vec = cand_entry
-                results.append((cand_id, cand_provider, cand_vec.tolist(), dist))
-            return results
-
-        raw_results = expand_recursive(
-            initial_seeds=seed_embs,
-            searcher=_search_generation,
-            depth=params["depth"],
-            branch_factor=params["branch_factor"],
-        )
-
-        if params["filter_genres"] or params["exclude_artists"]:
-            raw_results = await self._apply_metadata_filters(
-                raw_results,
-                filter_genres=params["filter_genres"],
-                exclude_artists=params["exclude_artists"],
-            )
-
-        if params["diversity"] > 0:
-            original_centroid = combine_seeds_centroid(seed_embs)
-            mmr_candidates = [(r[0], r[2], r[3]) for r in raw_results]
-            mmr_result = apply_mmr(
-                mmr_candidates,
-                original_centroid,
-                params["diversity"],
-                params["limit"],
-                weights=None,
-            )
-            result_lookup = {r[0]: r for r in raw_results}
-            final_items: list[tuple[str, str, float, int]] = [
-                (cid, result_lookup[cid][1], dist, result_lookup[cid][4])
-                for cid, dist in mmr_result
-                if cid in result_lookup
-            ]
-        else:
-            raw_results.sort(key=lambda x: x[3])
-            final_items = [(r[0], r[1], r[3], r[4]) for r in raw_results]
-
-        final_items = final_items[: params["limit"]]
-
-        if params["resolve"]:
-            items = await self._resolve_results(final_items, debug_breakdown_map=None)
-        else:
-            items = [
-                {
-                    "item_id": cid,
-                    "provider": prov,
-                    "distance": round(dist, 4),
-                    "generation": gen,
-                }
-                for cid, prov, dist, gen in final_items
-            ]
-
-        return {
-            "analyzed": True,
-            "engine": "clap",
-            "seed_track_ids": valid_seed_ids,
-            "blend_mode": params["blend_mode"],
-            "depth": params["depth"],
-            "items": items,
-        }
 
     def _init_search_index(self) -> None:
         """Create or load a USearch HNSW index."""
