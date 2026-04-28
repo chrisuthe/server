@@ -660,16 +660,11 @@ class SonicSimilarityPlugin(PluginProvider):
             processed in OVERLAY_SOURCES registration order; later entries win
             on field conflicts (no current conflicts).
         """
-        assert self.mass.music.database is not None
         merged: dict[tuple[str, str], dict[str, Any]] = {}
         for source_domain, fields in OVERLAY_SOURCES.items():
             if self._aa_domain == source_domain:
                 continue
-            rows = await self.mass.music.database.get_rows(
-                "audio_analysis",
-                {"aa_provider_domain": source_domain},
-                limit=0,
-            )
+            rows = await self.mass.streams.audio_analysis.get_audio_analysis_rows(source_domain)
             for row in rows:
                 try:
                     data = AudioAnalysisData.from_dict(json.loads(row["analysis_data"]))
@@ -692,9 +687,7 @@ class SonicSimilarityPlugin(PluginProvider):
 
     async def _rebuild_search_index(self) -> None:  # noqa: PLR0915
         """Rebuild the search index from all stored analysis rows."""
-        rows = await self.mass.music.database.get_rows(
-            "audio_analysis", {"aa_provider_domain": self._aa_domain}, limit=0
-        )
+        rows = await self.mass.streams.audio_analysis.get_audio_analysis_rows(self._aa_domain)
         if not rows:
             self.logger.info("No analysis rows found in database, skipping index rebuild")
             return
