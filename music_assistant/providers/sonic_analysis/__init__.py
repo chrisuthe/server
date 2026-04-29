@@ -20,10 +20,10 @@ file independently — wasteful double I/O for network-attached libraries.
 The merged analyze_file loads once and feeds both feature engines.
 
 Live-playback path (process_pcm_chunk / _finalize via AudioAnalysisController)
-produces librosa outputs and — for non-filesystem providers — runs CLAP
-on a deterministic 7-second window, so streaming providers (Tidal,
-Spotify, Qobuz, etc.) also get the 5 soft scalars and the persisted
-1024-dim embedding.
+plans target window positions from the track duration at session start,
+selectively buffers only those 7-second slices as PCM streams in, and
+fires per-window CLAP inference off-thread as each window completes.
+Mean-pooled at finalize.
 """
 
 from __future__ import annotations
@@ -109,23 +109,7 @@ CLAP_WINDOW_COUNTS: dict[str, int] = {
     CLAP_SAMPLING_THOROUGH: 8,
 }
 
-# Live-path PCM buffer cap in seconds (at session sample rate). Sized to
-# cover the Thorough preset's spread (~8 windows + intro skip ~= 86s);
-# smaller presets just ignore the extra. At 48 kHz stereo this is ~17 MB
-# per session — bounded so podcasts don't pin memory indefinitely.
-CLAP_LIVE_BUFFER_SECONDS: float = 90.0
-
 CONF_CLAP_SAMPLING: str = "clap_sampling"
-
-# Upstream's AudioAnalysisController runs analyze_file for tracks from
-# these provider domains only. For those, the background scan fills in
-# CLAP scalars and the persisted embedding — running CLAP again in the
-# live path would be redundant. Streaming providers (Tidal, Spotify,
-# Qobuz, etc.) never hit analyze_file, so live CLAP is the only way
-# they get the 5 soft scalars + the 1024-dim embedding in extra_data.
-FILESYSTEM_PROVIDER_DOMAINS: frozenset[str] = frozenset(
-    {"filesystem_local", "filesystem_smb", "filesystem_nfs"}
-)
 
 
 @dataclass
@@ -140,13 +124,9 @@ class SonicSessionData(AnalysisSessionData):
     start_time: float = 0.0
     peak_absolute: float = 0.0
     waveform_peaks: list[float] = field(default_factory=list)
-    # Accumulated raw PCM for live CLAP inference in _finalize, capped
-    # at CLAP_LIVE_MAX_SECONDS of source-SR mono audio. Only populated
-    # when the CLAP model loaded successfully; otherwise left empty.
-    clap_audio: list[np.ndarray] = field(default_factory=list)
-    clap_audio_samples: int = 0
-    # Per-window selective buffer for live CLAP. Populated by the
-    # dispatch state machine; populated and consumed in upcoming steps.
+    # Per-window selective buffer for live CLAP. clap_target_starts is
+    # planned at session start from streamdetails.duration + preset; the
+    # buffers fill via _dispatch_clap_chunk and free on completion.
     clap_target_starts: list[int] = field(default_factory=list)
     clap_target_buffers: list[list[np.ndarray]] = field(default_factory=list)
     clap_target_complete: list[bool] = field(default_factory=list)
@@ -755,17 +735,41 @@ class SonicAnalysisProvider(AudioAnalysisProvider):
                 audio_format.channels,
             )
             return False
+        target_starts: list[int] = []
+        if self._clap_model is not None and streamdetails.duration:
+            preset = str(self.config.get_value(CONF_CLAP_SAMPLING, CLAP_SAMPLING_FAST))
+            preset_n = CLAP_WINDOW_COUNTS.get(preset, 1)
+            target_starts = compute_clap_target_starts(
+                streamdetails.duration, preset_n, audio_format.sample_rate
+            )
+
         base = self._sessions[session_id]
         self._sessions[session_id] = SonicSessionData(
             streamdetails=base.streamdetails,
             audio_format=base.audio_format,
             block_samples=block_bytes,
             start_time=time.monotonic(),
+            clap_target_starts=target_starts,
+            clap_target_buffers=[[] for _ in target_starts],
+            clap_target_complete=[False] * len(target_starts),
         )
         self.logger.debug(
-            "Started sonic analysis for %s/%s", streamdetails.provider, streamdetails.item_id
+            "Started sonic analysis for %s/%s (%d CLAP target windows)",
+            streamdetails.provider,
+            streamdetails.item_id,
+            len(target_starts),
         )
         return True
+
+    async def cancel(self, session_id: str) -> None:
+        """Cancel pending CLAP inferences and free per-window buffers."""
+        session = self._sessions.get(session_id)
+        if isinstance(session, SonicSessionData):
+            for task in session.clap_inference_tasks:
+                if not task.done():
+                    task.cancel()
+            session.clap_target_buffers.clear()
+        await super().cancel(session_id)
 
     async def process_pcm_chunk(
         self,
@@ -791,7 +795,7 @@ class SonicAnalysisProvider(AudioAnalysisProvider):
             block_peak = float(np.max(np.abs(audio)))
             session.peak_absolute = max(session.peak_absolute, block_peak)
             session.waveform_peaks.append(block_peak)
-            self._maybe_buffer_clap_audio(session, audio, af.sample_rate)
+            self._dispatch_clap_to_targets(session, audio, af.sample_rate)
             if session.overlap is not None:
                 audio = np.concatenate([session.overlap, audio])
             session.overlap = audio[-OVERLAP_SAMPLES:].copy()
@@ -799,84 +803,63 @@ class SonicAnalysisProvider(AudioAnalysisProvider):
             if bf is not None:
                 merge_block_features(session.accumulated, bf)
 
-    def _maybe_buffer_clap_audio(
+    def _dispatch_clap_to_targets(
         self, session: SonicSessionData, audio: np.ndarray, source_sr: int
     ) -> None:
-        """Append up to CLAP_LIVE_BUFFER_SECONDS of audio to the session buffer.
-
-        No-op when the CLAP model didn't load. Buffer is capped so long
-        tracks/podcasts don't pin memory. We buffer from time-zero of the
-        session (not from the 30s mark) because select_clap_window needs
-        the earlier samples for its short-track fallback.
-        """
-        if self._clap_model is None:
+        """Route a decoded block to active CLAP target windows; spawn inference per completion."""
+        if not session.clap_target_starts:
             return
-        limit = int(CLAP_LIVE_BUFFER_SECONDS * source_sr)
-        remaining = limit - session.clap_audio_samples
-        if remaining <= 0:
-            return
-        take = audio[:remaining] if len(audio) > remaining else audio
-        session.clap_audio.append(np.asarray(take, dtype=np.float32))
-        session.clap_audio_samples += len(take)
+        completed = _dispatch_clap_chunk(session, audio, source_sr)
+        for window_audio in completed:
+            task = self.mass.create_task(
+                self._run_single_clap_window(session, window_audio, source_sr)
+            )
+            session.clap_inference_tasks.append(task)
 
     async def _run_live_clap_if_eligible(
         self, session: SonicSessionData, analysis: AudioAnalysisData
     ) -> None:
-        """Run CLAP on buffered live audio and populate scalars + extra_data embedding.
-
-        Gated on: CLAP model loaded, source is a non-filesystem provider
-        (filesystem tracks get CLAP via analyze_file instead), and at
-        least 1 second of audio was buffered. Populates the 5 CLAP
-        scalars directly on analysis and stores the 1024-dim embedding
-        under extra_data["clap_embedding"]. Always clears the buffer
-        before returning so memory is released regardless of outcome.
-        """
+        """Await per-window inferences, mean-pool, populate scalars + extra_data embedding."""
+        if not session.clap_target_starts:
+            return
+        if session.clap_inference_tasks:
+            await asyncio.gather(*session.clap_inference_tasks, return_exceptions=True)
+        n = session.clap_completed_count
         sd = session.streamdetails
-        af = session.audio_format
         if (
-            self._clap_model is None
-            or sd.provider in FILESYSTEM_PROVIDER_DOMAINS
-            or session.clap_audio_samples < af.sample_rate
+            n == 0
+            or session.clap_sum_embedding is None
+            or session.clap_sum_similarities is None
         ):
-            session.clap_audio.clear()
-            session.clap_audio_samples = 0
+            self.logger.warning(
+                "Live CLAP for %s/%s: no windows completed (planned %d)",
+                sd.provider,
+                sd.item_id,
+                len(session.clap_target_starts),
+            )
             return
-        buffered = (
-            np.concatenate(session.clap_audio)
-            if len(session.clap_audio) > 1
-            else session.clap_audio[0]
+
+        mean_emb = session.clap_sum_embedding / n
+        norm = float(np.linalg.norm(mean_emb))
+        if norm > 0:
+            mean_emb = mean_emb / norm
+        mean_sim = session.clap_sum_similarities / n
+
+        for idx, (scalar_name, _) in enumerate(self._clap_prompt_order):
+            pos_logit = float(mean_sim[idx * 2])
+            neg_logit = float(mean_sim[idx * 2 + 1])
+            a, b = CALIBRATION[scalar_name]
+            margin = pos_logit - neg_logit
+            setattr(analysis, scalar_name, 1.0 / (1.0 + math.exp(-(a * margin + b))))
+
+        _store_clap_embedding(analysis, mean_emb)
+        self.logger.debug(
+            "Live CLAP for %s/%s: %d/%d windows completed",
+            sd.provider,
+            sd.item_id,
+            n,
+            len(session.clap_target_starts),
         )
-        window = select_clap_window(buffered, af.sample_rate)
-        if window is None:
-            session.clap_audio.clear()
-            session.clap_audio_samples = 0
-            return
-        try:
-            clap_start = time.monotonic()
-            clap_scalars, clap_emb = await asyncio.to_thread(
-                self._run_clap_inference, window, af.sample_rate
-            )
-            clap_elapsed = time.monotonic() - clap_start
-        except Exception as err:
-            self.logger.debug(
-                "_finalize: live CLAP failed for %s/%s: %s",
-                sd.provider,
-                sd.item_id,
-                err,
-            )
-        else:
-            for field_name, value in clap_scalars.items():
-                setattr(analysis, field_name, value)
-            _store_clap_embedding(analysis, clap_emb)
-            self.logger.debug(
-                "_finalize: live CLAP for %s/%s (%.1fs buffered, %.2fs inference)",
-                sd.provider,
-                sd.item_id,
-                session.clap_audio_samples / af.sample_rate,
-                clap_elapsed,
-            )
-        session.clap_audio.clear()
-        session.clap_audio_samples = 0
 
     async def _finalize(self, session_id: str) -> None:
         """Process remaining PCM, collapse features, and store analysis data.
@@ -899,7 +882,7 @@ class SonicAnalysisProvider(AudioAnalysisProvider):
             block_peak = float(np.max(np.abs(audio)))
             session.peak_absolute = max(session.peak_absolute, block_peak)
             session.waveform_peaks.append(block_peak)
-            self._maybe_buffer_clap_audio(session, audio, af.sample_rate)
+            self._dispatch_clap_to_targets(session, audio, af.sample_rate)
             if session.overlap is not None:
                 audio = np.concatenate([session.overlap, audio])
             bf = await asyncio.to_thread(extract_block_features, audio, af.sample_rate)
@@ -921,11 +904,6 @@ class SonicAnalysisProvider(AudioAnalysisProvider):
             analysis.true_peak = float(20.0 * np.log10(session.peak_absolute))
         else:
             analysis.true_peak = -96.0
-
-        # AudioAnalysisData has no wave_form field upstream — the per-block
-        # waveform peaks accumulated in session.waveform_peaks aren't persisted
-        # by this provider. Drop the dead computation to avoid mypy warnings
-        # and the wasted allocation.
 
         await self._run_live_clap_if_eligible(session, analysis)
 
