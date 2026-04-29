@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+from collections.abc import Mapping
 from math import inf
 from typing import TYPE_CHECKING, Any
 
@@ -353,7 +354,7 @@ class AudioAnalysisController:
         aa_provider_domain: str,
         *,
         media_type: MediaType = MediaType.TRACK,
-    ) -> list[dict[str, Any]]:
+    ) -> list[Mapping[str, Any]]:
         """
         List all audio_analysis rows for a given aa_provider_domain.
 
