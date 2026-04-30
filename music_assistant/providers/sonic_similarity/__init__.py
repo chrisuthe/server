@@ -82,6 +82,11 @@ OVERLAY_SOURCES: dict[str, tuple[str, ...]] = {
 # results without overriding the audio sliders.
 METADATA_BONUS_SCALE: float = 0.1
 
+# `rhythm`/`loudness`/`timbre`/`regularity`/`mood`/`tonal`/`dynamics` weight
+# the audio-vector distance (per FEATURE_GROUPS in vectors.py). `genre` and
+# `era` are independent metadata-reranking knobs (they don't enter the vector
+# distance) — split out so a user can disable e.g. tonal matching without
+# silently disabling era reranking too.
 SIMILARITY_PRESETS: dict[str, dict[str, float]] = {
     "balanced": {
         "rhythm": 1.0,
@@ -91,6 +96,8 @@ SIMILARITY_PRESETS: dict[str, dict[str, float]] = {
         "mood": 1.0,
         "tonal": 1.0,
         "dynamics": 1.0,
+        "genre": 1.0,
+        "era": 1.0,
     },
     "vibe": {
         "rhythm": 0.3,
@@ -100,6 +107,8 @@ SIMILARITY_PRESETS: dict[str, dict[str, float]] = {
         "mood": 1.0,
         "tonal": 0.5,
         "dynamics": 0.8,
+        "genre": 0.5,
+        "era": 0.5,
     },
     "party": {
         "rhythm": 1.0,
@@ -109,6 +118,8 @@ SIMILARITY_PRESETS: dict[str, dict[str, float]] = {
         "mood": 0.5,
         "tonal": 0.2,
         "dynamics": 0.3,
+        "genre": 0.3,
+        "era": 0.3,
     },
     "genre_era": {
         "rhythm": 0.5,
@@ -118,6 +129,8 @@ SIMILARITY_PRESETS: dict[str, dict[str, float]] = {
         "mood": 0.8,
         "tonal": 0.8,
         "dynamics": 0.5,
+        "genre": 1.0,
+        "era": 1.0,
     },
     "discover": {
         "rhythm": 0.5,
@@ -127,6 +140,8 @@ SIMILARITY_PRESETS: dict[str, dict[str, float]] = {
         "mood": 0.8,
         "tonal": 0.8,
         "dynamics": 0.7,
+        "genre": 0.3,
+        "era": 0.3,
     },
 }
 
@@ -471,7 +486,7 @@ class SonicSimilarityPlugin(PluginProvider):
                 exclude_artists=params["exclude_artists"],
             )
 
-        if weights.get("tonal", 0.0) > 0:
+        if weights.get("genre", 0.0) > 0 or weights.get("era", 0.0) > 0:
             raw_results = await self._apply_metadata_reranking(
                 valid_seed_ids[0],
                 raw_results,
@@ -933,8 +948,8 @@ class SonicSimilarityPlugin(PluginProvider):
                 scored.append((item_id, provider, features, dist, gen))
                 continue
 
-            genre_weight = weights.get("tonal", 0.0)
-            year_weight = weights.get("tonal", 0.0)
+            genre_weight = weights.get("genre", 0.0)
+            year_weight = weights.get("era", 0.0)
             if genre_weight > 0 and seed_genres:
                 cand_genres: set[str] = set()
                 if cand_track.metadata and cand_track.metadata.genres:
