@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -168,6 +169,41 @@ def _parse_weights(params: dict[str, Any]) -> dict[str, float]:
     return result
 
 
+@dataclass(frozen=True, slots=True)
+class SimilarParams:
+    """Validated parameters for one /similar request."""
+
+    item_ids: list[str]
+    limit: int
+    depth: int
+    branch_factor: int
+    blend_mode: str  # "centroid" | "union"
+    seed_weights: list[float] | None
+    diversity: float
+    preset: str
+    candidates: int
+    filter_genres: list[str] | None
+    filter_providers: list[str] | None
+    exclude_track_ids: list[str] | None
+    exclude_artists: list[str] | None
+    resolve: bool
+    include_group_distances: bool
+    weight_overrides: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class _SearchContext:
+    """Per-request snapshot of the inputs needed by every search-pipeline phase."""
+
+    params: SimilarParams
+    weights: dict[str, float]
+    seed_sigs: list[list[float]]
+    valid_seed_ids: list[str]
+    corpus_means: list[float]
+    corpus_stds: list[float]
+    orig_normalized: list[float]
+
+
 def _parse_similar_params(  # noqa: PLR0913
     item_id: str | None = None,
     item_ids: list[str] | None = None,
@@ -184,8 +220,9 @@ def _parse_similar_params(  # noqa: PLR0913
     exclude_track_ids: list[str] | None = None,
     exclude_artists: list[str] | None = None,
     resolve: bool = False,
+    include_group_distances: bool = False,
     **kwargs: Any,
-) -> dict[str, Any]:
+) -> SimilarParams:
     """Validate and normalize parameters for the similar endpoint."""
     if item_ids is None:
         if item_id is None:
@@ -210,23 +247,24 @@ def _parse_similar_params(  # noqa: PLR0913
     if has_filters:
         candidates = candidates * 2
 
-    return {
-        "item_ids": item_ids,
-        "limit": limit,
-        "depth": depth,
-        "branch_factor": branch_factor,
-        "blend_mode": blend_mode,
-        "seed_weights": seed_weights,
-        "diversity": diversity,
-        "preset": preset,
-        "candidates": candidates,
-        "filter_genres": filter_genres,
-        "filter_providers": filter_providers,
-        "exclude_track_ids": exclude_track_ids,
-        "exclude_artists": exclude_artists,
-        "resolve": resolve,
-        "kwargs": kwargs,
-    }
+    return SimilarParams(
+        item_ids=item_ids,
+        limit=limit,
+        depth=depth,
+        branch_factor=branch_factor,
+        blend_mode=blend_mode,
+        seed_weights=seed_weights,
+        diversity=diversity,
+        preset=preset,
+        candidates=candidates,
+        filter_genres=filter_genres,
+        filter_providers=filter_providers,
+        exclude_track_ids=exclude_track_ids,
+        exclude_artists=exclude_artists,
+        resolve=resolve,
+        include_group_distances=include_group_distances,
+        weight_overrides=kwargs,
+    )
 
 
 def apply_filters(
@@ -364,7 +402,7 @@ class SonicSimilarityPlugin(PluginProvider):
 
     # --- API handlers ---
 
-    async def _handle_similar(  # noqa: PLR0913, PLR0915
+    async def _handle_similar(  # noqa: PLR0913
         self,
         item_id: str | None = None,
         item_ids: list[str] | None = None,
@@ -401,38 +439,67 @@ class SonicSimilarityPlugin(PluginProvider):
             exclude_track_ids=exclude_track_ids,
             exclude_artists=exclude_artists,
             resolve=resolve,
+            include_group_distances=include_group_distances,
             **kwargs,
         )
-        p_item_ids: list[str] = params["item_ids"]
-        weights = _parse_weights({**params.get("kwargs", {}), "preset": params["preset"]})
+        weights = _parse_weights({**params.weight_overrides, "preset": params.preset})
 
+        seed_sigs, valid_seed_ids = self._lookup_seed_signatures(params.item_ids)
+        if not seed_sigs or self.corpus_means is None or self.corpus_stds is None:
+            return {
+                "analyzed": False,
+                "seed_track_ids": params.item_ids,
+                "blend_mode": params.blend_mode,
+                "depth": params.depth,
+                "items": [],
+            }
+
+        corpus_means = self.corpus_means
+        corpus_stds = self.corpus_stds
+        # Centroid of the seed_sigs is invariant across the search/MMR/debug
+        # paths; compute once and pass through the context.
+        orig_normalized = normalize_features(
+            combine_seeds_centroid(seed_sigs), corpus_means, corpus_stds
+        )
+        ctx = _SearchContext(
+            params=params,
+            weights=weights,
+            seed_sigs=seed_sigs,
+            valid_seed_ids=valid_seed_ids,
+            corpus_means=corpus_means,
+            corpus_stds=corpus_stds,
+            orig_normalized=orig_normalized,
+        )
+
+        raw_results = self._run_ann_search(ctx)
+        raw_results = await self._post_process_candidates(ctx, raw_results)
+        final_items = self._diversify_and_limit(ctx, raw_results)
+        debug_breakdown_map = self._build_debug_breakdowns(ctx, final_items)
+        items = await self._format_response_items(ctx, final_items, debug_breakdown_map)
+
+        return {
+            "analyzed": True,
+            "seed_track_ids": valid_seed_ids,
+            "blend_mode": params.blend_mode,
+            "depth": params.depth,
+            "items": items,
+        }
+
+    def _lookup_seed_signatures(self, item_ids: list[str]) -> tuple[list[list[float]], list[str]]:
+        """Look up signatures by item_id; warn on misses; return (sigs, valid_ids) in input order."""
         seed_sigs: list[list[float]] = []
         valid_seed_ids: list[str] = []
-        for sid in p_item_ids:
+        for sid in item_ids:
             sig = self._signatures_by_id.get(sid)
             if sig is not None:
                 seed_sigs.append(sig)
                 valid_seed_ids.append(sid)
             else:
                 self.logger.warning("Seed %s not in signature cache, skipping", sid)
+        return seed_sigs, valid_seed_ids
 
-        if not seed_sigs or self.corpus_means is None or self.corpus_stds is None:
-            return {
-                "analyzed": False,
-                "seed_track_ids": p_item_ids,
-                "blend_mode": params["blend_mode"],
-                "depth": params["depth"],
-                "items": [],
-            }
-
-        corpus_means = self.corpus_means
-        corpus_stds = self.corpus_stds
-
-        # Centroid of the original (outer-scope) seed_sigs is invariant across
-        # generations of the recursive search and reused by MMR / debug paths;
-        # compute once and capture in the closure.
-        original_centroid = combine_seeds_centroid(seed_sigs)
-        orig_normalized = normalize_features(original_centroid, corpus_means, corpus_stds)
+    def _run_ann_search(self, ctx: _SearchContext) -> list[Candidate]:
+        """Run the recursive ANN search for `params.depth` generations and return all hits."""
 
         def _search_generation(
             seeds: list[list[float]],
@@ -442,11 +509,11 @@ class SonicSimilarityPlugin(PluginProvider):
             # provider per cand_id so the raw_tuples build below is O(1) per
             # candidate rather than O(N) (rescanning _reverse_label_map).
             id_to_prov: dict[str, str] = {}
-            if params["blend_mode"] == "union":
+            if ctx.params.blend_mode == "union":
                 all_neighborhoods: list[list[tuple[str, float]]] = []
                 for seed_vec in seeds:
-                    normalized = normalize_features(seed_vec, corpus_means, corpus_stds)
-                    raw = self._query_index(normalized, params["candidates"])
+                    normalized = normalize_features(seed_vec, ctx.corpus_means, ctx.corpus_stds)
+                    raw = self._query_index(normalized, ctx.params.candidates)
                     neighborhood: list[tuple[str, float]] = []
                     for lbl, cos_dist in raw:
                         if lbl not in self._label_map:
@@ -458,9 +525,9 @@ class SonicSimilarityPlugin(PluginProvider):
                     all_neighborhoods.append(neighborhood)
                 candidate_ids = merge_union_results(all_neighborhoods)
             else:
-                centroid = combine_seeds_centroid(seeds, params.get("seed_weights"))
-                normalized = normalize_features(centroid, corpus_means, corpus_stds)
-                raw = self._query_index(normalized, params["candidates"])
+                centroid = combine_seeds_centroid(seeds, ctx.params.seed_weights)
+                normalized = normalize_features(centroid, ctx.corpus_means, ctx.corpus_stds)
+                raw = self._query_index(normalized, ctx.params.candidates)
                 candidate_ids = []
                 for lbl, cos_dist in raw:
                     if lbl not in self._label_map:
@@ -475,10 +542,12 @@ class SonicSimilarityPlugin(PluginProvider):
                 for cand_id, cos_dist in candidate_ids
             ]
 
-            seed_id_set = set(valid_seed_ids)
-            exclude_set = set(params["exclude_track_ids"]) if params["exclude_track_ids"] else None
+            seed_id_set = set(ctx.valid_seed_ids)
+            exclude_set = (
+                set(ctx.params.exclude_track_ids) if ctx.params.exclude_track_ids else None
+            )
             filter_prov_set = (
-                set(params["filter_providers"]) if params["filter_providers"] else None
+                set(ctx.params.filter_providers) if ctx.params.filter_providers else None
             )
             filtered = apply_filters(raw_tuples, seed_id_set | seen, exclude_set, filter_prov_set)
 
@@ -487,92 +556,111 @@ class SonicSimilarityPlugin(PluginProvider):
                 cand_features = self._signature_cache.get((cand_id, cand_provider))
                 if cand_features is None:
                     continue
-                cand_normalized = normalize_features(cand_features, corpus_means, corpus_stds)
-                dist = compute_weighted_distance(orig_normalized, cand_normalized, weights)
+                cand_normalized = normalize_features(
+                    cand_features, ctx.corpus_means, ctx.corpus_stds
+                )
+                dist = compute_weighted_distance(ctx.orig_normalized, cand_normalized, ctx.weights)
                 results.append((cand_id, cand_provider, cand_features, dist))
 
             results.sort(key=lambda x: x[3])
             return results
 
-        raw_results = expand_recursive(
-            initial_seeds=seed_sigs,
+        return expand_recursive(
+            initial_seeds=ctx.seed_sigs,
             searcher=_search_generation,
-            depth=params["depth"],
-            branch_factor=params["branch_factor"],
+            depth=ctx.params.depth,
+            branch_factor=ctx.params.branch_factor,
         )
 
-        if params["filter_genres"] or params["exclude_artists"]:
-            raw_results = await self._apply_metadata_filters(
-                raw_results,
-                filter_genres=params["filter_genres"],
-                exclude_artists=params["exclude_artists"],
+    async def _post_process_candidates(
+        self, ctx: _SearchContext, candidates: list[Candidate]
+    ) -> list[Candidate]:
+        """Apply genre/artist filters and metadata reranking when configured."""
+        if ctx.params.filter_genres or ctx.params.exclude_artists:
+            candidates = await self._apply_metadata_filters(
+                candidates,
+                filter_genres=ctx.params.filter_genres,
+                exclude_artists=ctx.params.exclude_artists,
             )
-
-        if weights.get("genre", 0.0) > 0 or weights.get("era", 0.0) > 0:
-            raw_results = await self._apply_metadata_reranking(
-                valid_seed_ids,
-                raw_results,
-                weights,
+        if ctx.weights.get("genre", 0.0) > 0 or ctx.weights.get("era", 0.0) > 0:
+            candidates = await self._apply_metadata_reranking(
+                ctx.valid_seed_ids, candidates, ctx.weights
             )
+        return candidates
 
-        if params["diversity"] > 0:
+    def _diversify_and_limit(
+        self, ctx: _SearchContext, candidates: list[Candidate]
+    ) -> list[tuple[str, str, float, int]]:
+        """Apply MMR diversity OR distance sort, then trim to `limit`."""
+        if ctx.params.diversity > 0:
             mmr_candidates = [
-                (c.item_id, normalize_features(c.features, corpus_means, corpus_stds), c.distance)
-                for c in raw_results
+                (
+                    c.item_id,
+                    normalize_features(c.features, ctx.corpus_means, ctx.corpus_stds),
+                    c.distance,
+                )
+                for c in candidates
             ]
             mmr_result = apply_mmr(
                 mmr_candidates,
-                orig_normalized,
-                params["diversity"],
-                params["limit"],
-                weights=weights,
+                ctx.orig_normalized,
+                ctx.params.diversity,
+                ctx.params.limit,
+                weights=ctx.weights,
             )
-            result_lookup = {c.item_id: c for c in raw_results}
+            result_lookup = {c.item_id: c for c in candidates}
             final_items: list[tuple[str, str, float, int]] = [
                 (cid, result_lookup[cid].provider, dist, result_lookup[cid].generation)
                 for cid, dist in mmr_result
             ]
         else:
-            raw_results.sort(key=lambda c: c.distance)
-            final_items = [(c.item_id, c.provider, c.distance, c.generation) for c in raw_results]
+            candidates.sort(key=lambda c: c.distance)
+            final_items = [(c.item_id, c.provider, c.distance, c.generation) for c in candidates]
+        return final_items[: ctx.params.limit]
 
-        final_items = final_items[: params["limit"]]
-
-        debug_breakdown_map: dict[str, dict[str, Any]] = {}
-        if include_group_distances:
-            for cid, prov, displayed_dist, _gen in final_items:
-                cand_features = self._signature_cache.get((cid, prov))
-                if cand_features is not None:
-                    cand_normalized = normalize_features(cand_features, corpus_means, corpus_stds)
-                    debug_breakdown_map[cid] = build_debug_breakdown(
-                        orig_normalized, cand_normalized, weights, displayed_dist
-                    )
-
-        if params["resolve"]:
-            items = await self._resolve_results(
-                final_items,
-                debug_breakdown_map if include_group_distances else None,
+    def _build_debug_breakdowns(
+        self,
+        ctx: _SearchContext,
+        final_items: list[tuple[str, str, float, int]],
+    ) -> dict[str, dict[str, Any]]:
+        """Build the per-track debug breakdown when include_group_distances is set."""
+        if not ctx.params.include_group_distances:
+            return {}
+        breakdown: dict[str, dict[str, Any]] = {}
+        for cid, prov, displayed_dist, _gen in final_items:
+            cand_features = self._signature_cache.get((cid, prov))
+            if cand_features is None:
+                continue
+            cand_normalized = normalize_features(cand_features, ctx.corpus_means, ctx.corpus_stds)
+            breakdown[cid] = build_debug_breakdown(
+                ctx.orig_normalized, cand_normalized, ctx.weights, displayed_dist
             )
-        else:
-            items = []
-            for cid, prov, dist, gen in final_items:
-                entry: dict[str, Any] = {
-                    "item_id": cid,
-                    "provider": prov,
-                    "distance": round(dist, 4),
-                    "generation": gen,
-                }
-                if include_group_distances and cid in debug_breakdown_map:
-                    entry.update(debug_breakdown_map[cid])
-                items.append(entry)
+        return breakdown
 
-        return {
-            "analyzed": True,
-            "seed_track_ids": valid_seed_ids,
-            "blend_mode": params["blend_mode"],
-            "depth": params["depth"],
-            "items": items,
-        }
+    async def _format_response_items(
+        self,
+        ctx: _SearchContext,
+        final_items: list[tuple[str, str, float, int]],
+        debug_breakdown_map: dict[str, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Format final_items into the response shape, optionally resolving track metadata."""
+        if ctx.params.resolve:
+            return await self._resolve_results(
+                final_items,
+                debug_breakdown_map if ctx.params.include_group_distances else None,
+            )
+        items: list[dict[str, Any]] = []
+        for cid, prov, dist, gen in final_items:
+            entry: dict[str, Any] = {
+                "item_id": cid,
+                "provider": prov,
+                "distance": round(dist, 4),
+                "generation": gen,
+            }
+            if ctx.params.include_group_distances and cid in debug_breakdown_map:
+                entry.update(debug_breakdown_map[cid])
+            items.append(entry)
+        return items
 
     async def _handle_status(self) -> dict[str, Any]:
         """Return current analysis status."""
@@ -697,10 +785,10 @@ class SonicSimilarityPlugin(PluginProvider):
                 except (ValueError, TypeError, KeyError):
                     continue
                 per_track = merged.setdefault((row["item_id"], row["provider"]), {})
-                for field in fields:
-                    value = getattr(data, field, None)
+                for field_name in fields:
+                    value = getattr(data, field_name, None)
                     if value is not None:
-                        per_track[field] = value
+                        per_track[field_name] = value
         return merged
 
     @staticmethod
@@ -708,8 +796,8 @@ class SonicSimilarityPlugin(PluginProvider):
         """Overlay per-field values from overlay sources onto analysis data in place."""
         if not override:
             return
-        for field, value in override.items():
-            setattr(data, field, value)
+        for field_name, value in override.items():
+            setattr(data, field_name, value)
 
     async def _rebuild_search_index(self) -> None:
         """Rebuild the search index from all stored analysis rows."""

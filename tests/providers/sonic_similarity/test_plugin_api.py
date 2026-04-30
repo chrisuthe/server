@@ -18,17 +18,17 @@ class TestParseSimilarParams:
     def test_item_id_alias(self) -> None:
         """Single item_id string wraps into item_ids list."""
         params = _parse_similar_params(item_id="abc")
-        assert params["item_ids"] == ["abc"]
+        assert params.item_ids == ["abc"]
 
     def test_item_ids_list(self) -> None:
         """item_ids list passes through directly."""
         params = _parse_similar_params(item_ids=["a", "b"])
-        assert params["item_ids"] == ["a", "b"]
+        assert params.item_ids == ["a", "b"]
 
     def test_item_id_and_item_ids_prefers_ids(self) -> None:
         """When both provided, item_ids takes precedence."""
         params = _parse_similar_params(item_id="old", item_ids=["new"])
-        assert params["item_ids"] == ["new"]
+        assert params.item_ids == ["new"]
 
     def test_no_ids_raises(self) -> None:
         """Must provide at least item_id or item_ids."""
@@ -37,25 +37,25 @@ class TestParseSimilarParams:
 
     def test_limit_clamped(self) -> None:
         """Limit is clamped to [1, 100]."""
-        assert _parse_similar_params(item_id="x", limit=0)["limit"] == 1
-        assert _parse_similar_params(item_id="x", limit=200)["limit"] == 100
-        assert _parse_similar_params(item_id="x", limit=50)["limit"] == 50
+        assert _parse_similar_params(item_id="x", limit=0).limit == 1
+        assert _parse_similar_params(item_id="x", limit=200).limit == 100
+        assert _parse_similar_params(item_id="x", limit=50).limit == 50
 
     def test_depth_clamped(self) -> None:
         """Depth is clamped to [1, 5]."""
-        assert _parse_similar_params(item_id="x", depth=0)["depth"] == 1
-        assert _parse_similar_params(item_id="x", depth=10)["depth"] == 5
+        assert _parse_similar_params(item_id="x", depth=0).depth == 1
+        assert _parse_similar_params(item_id="x", depth=10).depth == 5
 
     def test_diversity_clamped(self) -> None:
         """Diversity is clamped to [0.0, 1.0]."""
-        assert _parse_similar_params(item_id="x", diversity=-1.0)["diversity"] == 0.0
-        assert _parse_similar_params(item_id="x", diversity=5.0)["diversity"] == 1.0
+        assert _parse_similar_params(item_id="x", diversity=-1.0).diversity == 0.0
+        assert _parse_similar_params(item_id="x", diversity=5.0).diversity == 1.0
 
     def test_blend_mode_validated(self) -> None:
         """Invalid blend_mode falls back to centroid."""
-        assert _parse_similar_params(item_id="x", blend_mode="centroid")["blend_mode"] == "centroid"
-        assert _parse_similar_params(item_id="x", blend_mode="union")["blend_mode"] == "union"
-        assert _parse_similar_params(item_id="x", blend_mode="invalid")["blend_mode"] == "centroid"
+        assert _parse_similar_params(item_id="x", blend_mode="centroid").blend_mode == "centroid"
+        assert _parse_similar_params(item_id="x", blend_mode="union").blend_mode == "union"
+        assert _parse_similar_params(item_id="x", blend_mode="invalid").blend_mode == "centroid"
 
     def test_seed_weights_length_validated(self) -> None:
         """seed_weights length must match item_ids."""
@@ -66,23 +66,23 @@ class TestParseSimilarParams:
         """Candidates doubled when filters are active."""
         no_filter = _parse_similar_params(item_id="x", candidates=50)
         with_filter = _parse_similar_params(item_id="x", candidates=50, filter_genres=["jazz"])
-        assert with_filter["candidates"] == no_filter["candidates"] * 2
+        assert with_filter.candidates == no_filter.candidates * 2
 
     def test_defaults(self) -> None:
         """Verify all default values."""
         params = _parse_similar_params(item_id="x")
-        assert params["limit"] == 25
-        assert params["depth"] == 1
-        assert params["branch_factor"] == 5
-        assert params["blend_mode"] == "centroid"
-        assert params["seed_weights"] is None
-        assert params["diversity"] == 0.0
-        assert params["preset"] == "balanced"
-        assert params["resolve"] is False
-        assert params["filter_genres"] is None
-        assert params["filter_providers"] is None
-        assert params["exclude_track_ids"] is None
-        assert params["exclude_artists"] is None
+        assert params.limit == 25
+        assert params.depth == 1
+        assert params.branch_factor == 5
+        assert params.blend_mode == "centroid"
+        assert params.seed_weights is None
+        assert params.diversity == 0.0
+        assert params.preset == "balanced"
+        assert params.resolve is False
+        assert params.filter_genres is None
+        assert params.filter_providers is None
+        assert params.exclude_track_ids is None
+        assert params.exclude_artists is None
 
 
 class TestApplyFilters:
@@ -198,18 +198,18 @@ class TestBackwardCompat:
         """item_id='abc' produces same params as item_ids=['abc']."""
         old_style = _parse_similar_params(item_id="abc")
         new_style = _parse_similar_params(item_ids=["abc"])
-        assert old_style["item_ids"] == new_style["item_ids"]
-        assert old_style["limit"] == new_style["limit"]
-        assert old_style["depth"] == new_style["depth"]
+        assert old_style.item_ids == new_style.item_ids
+        assert old_style.limit == new_style.limit
+        assert old_style.depth == new_style.depth
 
     def test_old_style_with_limit_and_preset(self) -> None:
         """Old-style call with extra kwargs works."""
         params = _parse_similar_params(item_id="abc", limit=10, preset="vibe")
-        assert params["item_ids"] == ["abc"]
-        assert params["limit"] == 10
-        assert params["preset"] == "vibe"
+        assert params.item_ids == ["abc"]
+        assert params.limit == 10
+        assert params.preset == "vibe"
 
     def test_old_style_with_weight_overrides(self) -> None:
         """Weight kwargs pass through."""
         params = _parse_similar_params(item_id="abc", timbre_weight="0.5")
-        assert params["kwargs"]["timbre_weight"] == "0.5"
+        assert params.weight_overrides["timbre_weight"] == "0.5"
