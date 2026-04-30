@@ -125,12 +125,7 @@ class TestApplyMMR:
 
 
 class TestApplyMMRWeights:
-    """Tests for preset-weight-aware MMR ranking.
-
-    These tests exercise the weights= path that uses compute_weighted_distance
-    instead of plain L2 cosine similarity for relevance and redundancy. Without
-    these, MMR ignores presets entirely (the bug Daisy hit on the debug page).
-    """
+    """Tests for the preset-weight-aware path of apply_mmr (weights=... shapes the picked set)."""
 
     @staticmethod
     def _zero18() -> list[float]:
@@ -181,16 +176,16 @@ class TestApplyMMRWeights:
         assert r1[0][0] == "rhythm-cand"
         assert r2[0][0] == "mood-cand"
 
-    def test_weights_none_falls_back_to_cosine_sim(self) -> None:
-        """weights=None preserves the legacy cosine-sim behavior bit-for-bit."""
+    def test_weights_none_matches_default(self) -> None:
+        """weights=None and an explicit None argument produce identical results."""
         candidates = [
             ("a", [1.0, 0.0], 0.1),
             ("b", [0.9, 0.1], 0.2),
             ("c", [0.5, 0.5], 0.5),
         ]
-        legacy = apply_mmr(candidates, [1.0, 0.0], diversity=0.0, limit=3)
+        default = apply_mmr(candidates, [1.0, 0.0], diversity=0.0, limit=3)
         explicit_none = apply_mmr(candidates, [1.0, 0.0], diversity=0.0, limit=3, weights=None)
-        assert legacy == explicit_none
+        assert default == explicit_none
 
     def test_weights_affect_redundancy_when_diversity_positive(self) -> None:
         """With diversity > 0, weights also affect which 2nd pick MMR diversifies to.

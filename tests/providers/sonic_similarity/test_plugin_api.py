@@ -191,25 +191,25 @@ class TestParseWeights:
             assert key in result
 
 
-class TestBackwardCompat:
-    """Verify old-style single item_id calls still work."""
+class TestSingleSeedAPI:
+    """Cover the single-seed `item_id=` API: parsing, options, and parity with `item_ids=[...]`."""
 
-    def test_old_style_params_parse(self) -> None:
+    def test_single_and_multi_seed_param_parse(self) -> None:
         """item_id='abc' produces same params as item_ids=['abc']."""
-        old_style = _parse_similar_params(item_id="abc")
-        new_style = _parse_similar_params(item_ids=["abc"])
-        assert old_style.item_ids == new_style.item_ids
-        assert old_style.limit == new_style.limit
-        assert old_style.depth == new_style.depth
+        single = _parse_similar_params(item_id="abc")
+        multi = _parse_similar_params(item_ids=["abc"])
+        assert single.item_ids == multi.item_ids
+        assert single.limit == multi.limit
+        assert single.depth == multi.depth
 
-    def test_old_style_with_limit_and_preset(self) -> None:
-        """Old-style call with extra kwargs works."""
+    def test_single_seed_with_limit_and_preset(self) -> None:
+        """Single-seed call with extra kwargs works."""
         params = _parse_similar_params(item_id="abc", limit=10, preset="vibe")
         assert params.item_ids == ["abc"]
         assert params.limit == 10
         assert params.preset == "vibe"
 
-    def test_old_style_with_weight_overrides(self) -> None:
+    def test_single_seed_with_weight_overrides(self) -> None:
         """Weight kwargs pass through."""
         params = _parse_similar_params(item_id="abc", timbre_weight="0.5")
         assert params.weight_overrides["timbre_weight"] == "0.5"

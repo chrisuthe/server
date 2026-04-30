@@ -1,4 +1,4 @@
-"""Unit tests for the vectors module — 14-dim semantic vector assembly."""
+"""Unit tests for the vectors module — assemble_vector + corpus stats + group distances."""
 
 from __future__ import annotations
 
@@ -342,7 +342,7 @@ class TestComputeWeightedDistance:
     """Tests for compute_weighted_distance function."""
 
     def _make_vector(self, val: float = 0.0) -> list[float]:
-        """Create a 14-dim vector with uniform value."""
+        """Build a uniform vector at VECTOR_DIMENSIONS-length."""
         return [val] * VECTOR_DIMENSIONS
 
     def test_identical_vectors_give_zero_distance(self) -> None:

@@ -1,17 +1,6 @@
-"""Sonic Similarity plugin for Music Assistant.
+"""Sonic Similarity plugin: weighted-Euclidean similarity over audio_analysis signatures.
 
-Provides similarity search and USearch indexing on top of signatures
-produced by audio_analysis-type providers (default: sonic_analysis).
-Engine:
-
-  - 18-dim weighted Euclidean over engineered audio features
-    (assembled via vectors.assemble_vector), with preset weights, MMR
-    diversity, depth/branch_factor recursive expansion, and optional
-    metadata reranking. Surfaced as sonic_similarity/similar.
-
-The 1024-dim CLAP-embedding similarity engine lives in the separate
-sonic_clap plugin, which manages the CLAP usearch index and reads the
-persisted embeddings from audio_analysis.extra_data.
+CLAP-embedding similarity (1024-dim cosine) lives in the separate sonic_clap plugin.
 """
 
 from __future__ import annotations
@@ -56,20 +45,14 @@ USEARCH_INDEX_FILENAME_TPL = "sonic_signatures_{domain}_v{version}.usearch"
 USEARCH_INDEX_FILENAME_GLOB = "sonic_signatures_{domain}_v*.usearch"
 CONF_AA_PROVIDER = "aa_provider_domain"
 
-# Scale factor applied to the genre/year metadata bonus in
-# _apply_metadata_reranking. Without scaling the raw genre Jaccard +
-# year-proximity terms reach magnitudes ~10-20x the audio-similarity
-# distance and dominate ranking entirely, making preset weight changes
-# invisible. 0.1 brings max combined bonus to ~0.2 - comparable to the
-# audio-distance dynamic range, so categorical context still nudges
-# results without overriding the audio sliders.
+# Genre/year reranking bonus scale. Raw genre Jaccard + year-proximity terms reach
+# magnitudes ~10-20x the audio-distance dynamic range; without scaling they dominate
+# ranking and make preset weight changes invisible. 0.1 caps combined bonus at ~0.2,
+# comparable to the audio-distance range — categorical context nudges, not overrides.
 METADATA_BONUS_SCALE: float = 0.1
 
-# `rhythm`/`loudness`/`timbre`/`regularity`/`mood`/`tonal`/`dynamics` weight
-# the audio-vector distance (per FEATURE_GROUPS in vectors.py). `genre` and
-# `era` are independent metadata-reranking knobs (they don't enter the vector
-# distance) — split out so a user can disable e.g. tonal matching without
-# silently disabling era reranking too.
+# Audio-vector group weights match FEATURE_GROUPS in vectors.py. `genre` and `era`
+# are metadata-rerank-only knobs that don't enter the vector distance.
 SIMILARITY_PRESETS: dict[str, dict[str, float]] = {
     "balanced": {
         "rhythm": 1.0,
@@ -133,7 +116,7 @@ def _parse_weights(params: dict[str, Any]) -> dict[str, float]:
     """Parse similarity weights from API parameters."""
     preset_name = str(params.get("preset", "balanced"))
     preset = SIMILARITY_PRESETS.get(preset_name, SIMILARITY_PRESETS["balanced"])
-    result = dict(preset)  # copy
+    result = dict(preset)
 
     def _clamp(val: str, fallback: float) -> float:
         try:
@@ -336,7 +319,7 @@ class SonicSimilarityPlugin(PluginProvider):
         self._rebuild_lock = asyncio.Lock()
 
     async def loaded_in_mass(self) -> None:
-        """Register similarity API commands and build the 18-dim search index."""
+        """Register similarity API commands and build the search index."""
         self._unregister_handles.append(
             self.mass.register_api_command("sonic_similarity/similar", self._handle_similar)
         )
@@ -377,8 +360,6 @@ class SonicSimilarityPlugin(PluginProvider):
                 path.unlink()
             except OSError as err:
                 self.logger.debug("Could not unlink %s during uninstall: %s", path, err)
-
-    # --- API handlers ---
 
     async def _handle_similar(  # noqa: PLR0913
         self,
@@ -688,8 +669,6 @@ class SonicSimilarityPlugin(PluginProvider):
             for lbl, dist in zip(results.keys, results.distances, strict=False)
         ]
 
-    # --- Index rebuild ---
-
     async def _rebuild_search_index(self) -> None:
         """Rebuild the search index from all stored analysis rows."""
         async with self._rebuild_lock:
@@ -819,8 +798,6 @@ class SonicSimilarityPlugin(PluginProvider):
                 path.unlink()
             except OSError as err:
                 self.logger.debug("Could not unlink stale index file %s: %s", path, err)
-
-    # --- Similarity helpers ---
 
     @staticmethod
     def _track_genres(track: Track) -> set[str]:

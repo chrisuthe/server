@@ -88,8 +88,8 @@ def apply_mmr(
     :param limit: Maximum number of results to return.
     :param weights: Optional per-feature-group weights. When provided, MMR
         scores relevance and redundancy via compute_weighted_distance so
-        preset selection actually shapes the picked set. When None, falls
-        back to plain L2 cosine similarity (legacy behavior).
+        preset selection shapes the picked set. When None, uses plain L2
+        cosine similarity.
     """
     if not candidates:
         return []
@@ -123,8 +123,7 @@ def apply_mmr(
     selected: list[tuple[str, float]] = []
     remaining: set[str] = {cid for cid, _, _ in candidates}
     dist_lookup = {cid: d for cid, _, d in candidates}
-    # Iterate over candidates in input order for deterministic tie-breaking;
-    # `remaining` stays a set for O(1) membership tests.
+    # Input-order list for deterministic tie-breaking, set for O(1) membership.
     ordered_ids = [cid for cid, _, _ in candidates]
 
     for _ in range(min(limit, len(candidates))):

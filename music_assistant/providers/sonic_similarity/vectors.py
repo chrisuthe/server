@@ -1,11 +1,8 @@
-"""14-dimensional semantic vector schema for sonic similarity search.
+"""18-dimensional semantic vector schema for sonic similarity search.
 
-Owns the mapping from AudioAnalysisData fields to a fixed-size float vector
-suitable for USearch ANN indexing. The 14 dimensions are:
-  [0-8]  9 scalar features (bpm, energy, danceability, ...)
-  [9-11] circular key encoding (sin, cos) + mode
-  [12]   RMS energy variance over time
-  [13]   Spectral centroid variance over time
+Maps AudioAnalysisData to a fixed-size float vector for USearch ANN indexing.
+Dimensions: [0-8] required scalars, [9-12] optional ML scalars, [13-15] key
+sin/cos + mode, [16-17] RMS and spectral-centroid time-series variance.
 """
 
 from __future__ import annotations
@@ -71,21 +68,14 @@ def encode_key_mode(key: str, mode: str) -> tuple[float, float, float]:
 
 
 def assemble_vector(analysis: AudioAnalysisData) -> list[float] | None:
-    """Assemble a 17-dimensional feature vector from an AudioAnalysisData instance.
-
-    Returns None if any required field (VECTOR_FIELDS, key, or mode) is None or
-    NaN — treating NaN values as unusable input so they cannot propagate into
-    distance calculations and produce null values in JSON responses.
-    Optional ML fields (instrumentalness, valence, acousticness) use a neutral
-    default of 0.5 when absent, so tracks without ML analysis still get valid
-    vectors that don't skew similarity in any direction.
+    """Assemble the VECTOR_DIMENSIONS-element feature vector for an analysis row.
 
     :param analysis: Source audio analysis data.
-    :returns: 17-element list of floats, or None if required fields are missing.
+    :returns: List of floats sized to VECTOR_DIMENSIONS, or None when any required
+        field (VECTOR_FIELDS, key, mode) is missing or NaN.
     """
-    # Validate all required scalar fields are present and finite. The isinstance
-    # guard is load-bearing: getattr can return non-numeric junk (e.g. a list
-    # serialized into the wrong column) which would crash math.isnan otherwise.
+    # The isinstance guard is load-bearing: getattr can return non-numeric junk
+    # (e.g. a list serialized into the wrong column) which would crash math.isnan.
     for field in VECTOR_FIELDS:
         val = getattr(analysis, field)
         if not isinstance(val, (int, float)) or math.isnan(float(val)):
@@ -93,10 +83,10 @@ def assemble_vector(analysis: AudioAnalysisData) -> list[float] | None:
     if analysis.key is None or analysis.mode is None:
         return None
 
-    # 9 required scalars
     vec: list[float] = [float(getattr(analysis, field)) for field in VECTOR_FIELDS]
 
-    # 3 optional ML scalars (default to 0.5 = neutral when absent or NaN)
+    # Optional ML scalars default to OPTIONAL_DEFAULT (= 0.5, the neutral midpoint
+    # of the 0..1 calibrated probability range) when absent or NaN.
     for field in OPTIONAL_FIELDS:
         val = getattr(analysis, field, None)
         vec.append(
@@ -105,7 +95,6 @@ def assemble_vector(analysis: AudioAnalysisData) -> list[float] | None:
             else OPTIONAL_DEFAULT
         )
 
-    # 3 key/mode encoding
     key_sin, key_cos, mode_float = encode_key_mode(analysis.key, analysis.mode)
     vec.extend([key_sin, key_cos, mode_float])
 
@@ -128,16 +117,12 @@ def normalize_features(
 ) -> list[float]:
     """Apply z-score then L2 normalization to a raw feature vector.
 
-    Zero standard deviation for a feature produces 0.0 for that dimension.
-    If the resulting z-score vector has zero L2 norm, it is returned as-is
-    without L2 normalization.
-
     :param raw_features: Raw feature vector to normalize.
     :param corpus_means: Per-feature means from the corpus.
     :param corpus_stds: Per-feature standard deviations from the corpus.
     :returns: Normalized feature vector as a list of floats.
     """
-    # Z-score normalization; zero std → 0.0 for that dimension
+    # Zero std → 0.0 for that dimension; zero L2 norm → return z-scores as-is.
     z_scored = [
         (v - m) / s if s != 0.0 else 0.0
         for v, m, s in zip(raw_features, corpus_means, corpus_stds, strict=True)
@@ -219,7 +204,7 @@ def build_debug_breakdown(
     weights: dict[str, float],
     displayed_dist: float,
 ) -> dict[str, object]:
-    """Diagnostic breakdown surfaced on the debug page when include_group_distances=True.
+    """Build a per-track diagnostic dict (weighted_distance, metadata_bonus, group_distances).
 
     :param seed_normalized: Normalized seed feature vector.
     :param cand_normalized: Normalized candidate feature vector.
