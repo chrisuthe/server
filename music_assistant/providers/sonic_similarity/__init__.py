@@ -413,20 +413,18 @@ class SonicSimilarityPlugin(PluginProvider):
                 "items": [],
             }
 
-        corpus_means = self.corpus_means
-        corpus_stds = self.corpus_stds
-        # Centroid of the seed_sigs is invariant across the search/MMR/debug
-        # paths; compute once and pass through the context.
+        # Centroid of seed_sigs is invariant across search/MMR/debug paths;
+        # compute once and pass through the context.
         orig_normalized = normalize_features(
-            combine_seeds_centroid(seed_sigs), corpus_means, corpus_stds
+            combine_seeds_centroid(seed_sigs), self.corpus_means, self.corpus_stds
         )
         ctx = _SearchContext(
             params=params,
             weights=weights,
             seed_sigs=seed_sigs,
             valid_seed_ids=valid_seed_ids,
-            corpus_means=corpus_means,
-            corpus_stds=corpus_stds,
+            corpus_means=self.corpus_means,
+            corpus_stds=self.corpus_stds,
             orig_normalized=orig_normalized,
         )
 
