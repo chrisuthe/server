@@ -309,6 +309,7 @@ class SonicSimilarityPlugin(PluginProvider):
         # last-write-wins behavior for cross-provider collisions.
         self._signature_cache: dict[tuple[str, str], list[float]] = {}
         self._signatures_by_id: dict[str, list[float]] = {}
+        self._provider_by_item_id: dict[str, str] = {}
         self.corpus_means: list[float] | None = None
         self.corpus_stds: list[float] | None = None
         self._search_index: Any = None
@@ -417,6 +418,10 @@ class SonicSimilarityPlugin(PluginProvider):
             seeds: list[list[float]],
             seen: set[str],
         ) -> list[tuple[str, str, list[float], float]]:
+            # `_label_map[lbl]` already returns (item_id, provider); cache the
+            # provider per cand_id so the raw_tuples build below is O(1) per
+            # candidate rather than O(N) (rescanning _reverse_label_map).
+            id_to_prov: dict[str, str] = {}
             if params["blend_mode"] == "union":
                 all_neighborhoods: list[list[tuple[str, float]]] = []
                 for seed_vec in seeds:
@@ -426,7 +431,8 @@ class SonicSimilarityPlugin(PluginProvider):
                     for lbl, cos_dist in raw:
                         if lbl not in self._label_map:
                             continue
-                        cand_id, _prov = self._label_map[lbl]
+                        cand_id, cand_provider = self._label_map[lbl]
+                        id_to_prov[cand_id] = cand_provider
                         if cand_id not in seen:
                             neighborhood.append((cand_id, cos_dist))
                     all_neighborhoods.append(neighborhood)
@@ -439,18 +445,15 @@ class SonicSimilarityPlugin(PluginProvider):
                 for lbl, cos_dist in raw:
                     if lbl not in self._label_map:
                         continue
-                    cand_id, _prov = self._label_map[lbl]
+                    cand_id, cand_provider = self._label_map[lbl]
+                    id_to_prov[cand_id] = cand_provider
                     if cand_id not in seen:
                         candidate_ids.append((cand_id, cos_dist))
 
-            raw_tuples: list[tuple[str, str, float]] = []
-            for cand_id, cos_dist in candidate_ids:
-                cand_provider = "library"
-                for key in self._reverse_label_map:
-                    if key[0] == cand_id:
-                        cand_provider = key[1]
-                        break
-                raw_tuples.append((cand_id, cand_provider, cos_dist))
+            raw_tuples: list[tuple[str, str, float]] = [
+                (cand_id, id_to_prov.get(cand_id, "library"), cos_dist)
+                for cand_id, cos_dist in candidate_ids
+            ]
 
             seed_id_set = set(valid_seed_ids)
             exclude_set = set(params["exclude_track_ids"]) if params["exclude_track_ids"] else None
@@ -719,6 +722,7 @@ class SonicSimilarityPlugin(PluginProvider):
         new_reverse_label_map: dict[tuple[str, str], int] = {}
         new_signature_cache: dict[tuple[str, str], list[float]] = {}
         new_signatures_by_id: dict[str, list[float]] = {}
+        new_provider_by_item_id: dict[str, str] = {}
         next_label = 1
 
         # Collect signatures, deduplicating by (item_id, provider)
@@ -752,6 +756,7 @@ class SonicSimilarityPlugin(PluginProvider):
             row_entries.append((label, vec))
             new_signature_cache[(item_id, provider)] = vec
             new_signatures_by_id[item_id] = vec
+            new_provider_by_item_id[item_id] = provider
 
         if not all_features:
             # Help the user diagnose the frustrating "250 rows, 0 signatures" case.
@@ -838,6 +843,7 @@ class SonicSimilarityPlugin(PluginProvider):
         self._next_label = next_label
         self._signature_cache = new_signature_cache
         self._signatures_by_id = new_signatures_by_id
+        self._provider_by_item_id = new_provider_by_item_id
         self.corpus_means = new_corpus_means
         self.corpus_stds = new_corpus_stds
 
@@ -982,12 +988,8 @@ class SonicSimilarityPlugin(PluginProvider):
         return scored
 
     async def _resolve_seed_track(self, seed_item_id: str) -> Track | None:
-        """Resolve a seed track from its item_id by looking up its provider in the label map."""
-        seed_prov = "library"
-        for key in self._reverse_label_map:
-            if key[0] == seed_item_id:
-                seed_prov = key[1]
-                break
+        """Resolve a seed track from its item_id, falling back to the 'library' provider."""
+        seed_prov = self._provider_by_item_id.get(seed_item_id, "library")
         try:
             return await self.mass.music.tracks.get(seed_item_id, seed_prov)
         except Exception:
