@@ -829,6 +829,27 @@ class SonicSimilarityPlugin(PluginProvider):
             return set()
         return {g.lower() for g in track.metadata.genres}
 
+    async def _resolve_candidate_tracks(
+        self, candidates: list[Candidate], log_context: str
+    ) -> list[tuple[Candidate, Track | None]]:
+        """Resolve every candidate's Track concurrently; None marks a lookup miss."""
+
+        async def _one(cand: Candidate) -> tuple[Candidate, Track | None]:
+            try:
+                track = await self.mass.music.tracks.get(cand.item_id, cand.provider)
+            except MusicAssistantError as err:
+                self.logger.debug(
+                    "%s lookup failed for %s/%s: %s",
+                    log_context,
+                    cand.provider,
+                    cand.item_id,
+                    err,
+                )
+                return (cand, None)
+            return (cand, track)
+
+        return list(await asyncio.gather(*(_one(c) for c in candidates)))
+
     async def _apply_metadata_filters(
         self,
         results: list[Candidate],
@@ -843,13 +864,8 @@ class SonicSimilarityPlugin(PluginProvider):
         artist_set = {a.lower() for a in exclude_artists} if exclude_artists else None
 
         filtered: list[Candidate] = []
-        for cand in results:
-            try:
-                track = await self.mass.music.tracks.get(cand.item_id, cand.provider)
-            except MusicAssistantError as err:
-                self.logger.debug(
-                    "Skipping %s/%s during filter: %s", cand.provider, cand.item_id, err
-                )
+        for cand, track in await self._resolve_candidate_tracks(results, "filter"):
+            if track is None:
                 continue
 
             if genre_set:
@@ -892,12 +908,9 @@ class SonicSimilarityPlugin(PluginProvider):
         seed_year_avg = sum(seed_years) / len(seed_years) if seed_years else None
 
         scored: list[Candidate] = []
-        for cand in results:
+        for cand, cand_track in await self._resolve_candidate_tracks(results, "rerank"):
             bonus = 0.0
-            try:
-                cand_track: Track = await self.mass.music.tracks.get(cand.item_id, cand.provider)
-            except MusicAssistantError as err:
-                self.logger.debug("Skipping rerank for %s/%s: %s", cand.provider, cand.item_id, err)
+            if cand_track is None:
                 scored.append(cand)
                 continue
 

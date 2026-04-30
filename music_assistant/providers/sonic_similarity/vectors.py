@@ -17,6 +17,7 @@ import numpy as np
 from music_assistant.models.audio_analysis import AudioAnalysisData
 
 PITCH_CLASS_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+PITCH_CLASS_INDEX = {name: idx for idx, name in enumerate(PITCH_CLASS_NAMES)}
 
 # Required fields — must be non-None for a valid vector
 VECTOR_FIELDS = [
@@ -61,7 +62,7 @@ def encode_key_mode(key: str, mode: str) -> tuple[float, float, float]:
     :param mode: Tonality string — "major" encodes to 1.0, anything else to 0.0.
     :returns: Tuple of (key_sin, key_cos, mode_float).
     """
-    pitch_class = PITCH_CLASS_NAMES.index(key) if key in PITCH_CLASS_NAMES else 0
+    pitch_class = PITCH_CLASS_INDEX.get(key, 0)
     angle = 2.0 * math.pi * pitch_class / 12
     key_sin = math.sin(angle)
     key_cos = math.cos(angle)
