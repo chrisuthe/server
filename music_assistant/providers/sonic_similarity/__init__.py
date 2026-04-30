@@ -17,7 +17,6 @@ persisted embeddings from audio_analysis.extra_data.
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -26,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from music_assistant_models.media_items import Album
 
+from music_assistant.helpers.json import json_loads
 from music_assistant.models.audio_analysis import AudioAnalysisData
 from music_assistant.models.plugin import PluginProvider
 from music_assistant.providers.sonic_similarity.similarity import (
@@ -53,7 +53,6 @@ if TYPE_CHECKING:
 USEARCH_INDEX_FILENAME_TPL = "sonic_signatures_{domain}_v{version}.usearch"
 USEARCH_INDEX_FILENAME_GLOB = "sonic_signatures_{domain}_v*.usearch"
 CONF_AA_PROVIDER = "aa_provider_domain"
-BACKGROUND_SCAN_TASK_ID = "audio_analysis_background_scan"
 
 # Overlay registry: each aa_provider_domain listed here declares which
 # AudioAnalysisData fields it owns. At vector-assembly time, rows from
@@ -300,8 +299,6 @@ class SonicSimilarityPlugin(PluginProvider):
         """Initialize the Sonic Similarity plugin."""
         super().__init__(mass, manifest, config)
         self._aa_domain: str = "sonic_analysis"
-        self._indexes: dict[str, Any] = {}
-        self._corpus_stats: dict[str, tuple[list[float], list[float]]] = {}
         self._label_map: dict[int, tuple[str, str]] = {}
         self._reverse_label_map: dict[tuple[str, str], int] = {}
         self._next_label: int = 1
@@ -315,7 +312,6 @@ class SonicSimilarityPlugin(PluginProvider):
         self.corpus_means: list[float] | None = None
         self.corpus_stds: list[float] | None = None
         self._search_index: Any = None
-        self._signatures_since_rebuild: int = 0
         self._unregister_handles: list[Callable[[], None]] = []
         self._rebuild_lock = asyncio.Lock()
 
@@ -685,8 +681,8 @@ class SonicSimilarityPlugin(PluginProvider):
             rows = await self.mass.streams.audio_analysis.get_audio_analysis_rows(source_domain)
             for row in rows:
                 try:
-                    data = AudioAnalysisData.from_dict(json.loads(row["analysis_data"]))
-                except (json.JSONDecodeError, TypeError, KeyError):
+                    data = AudioAnalysisData.from_dict(json_loads(row["analysis_data"]))
+                except (ValueError, TypeError, KeyError):
                     continue
                 per_track = merged.setdefault((row["item_id"], row["provider"]), {})
                 for field in fields:
@@ -732,8 +728,8 @@ class SonicSimilarityPlugin(PluginProvider):
         overlay_applied_count = 0
         for row in rows:
             try:
-                data = AudioAnalysisData.from_dict(json.loads(row["analysis_data"]))
-            except (json.JSONDecodeError, TypeError, KeyError):
+                data = AudioAnalysisData.from_dict(json_loads(row["analysis_data"]))
+            except (ValueError, TypeError, KeyError):
                 continue
             item_id = row["item_id"]
             provider = row["provider"]
@@ -763,8 +759,8 @@ class SonicSimilarityPlugin(PluginProvider):
             missing_report: list[str] = []
             for row in rows[:3]:
                 try:
-                    data = AudioAnalysisData.from_dict(json.loads(row["analysis_data"]))
-                except (json.JSONDecodeError, TypeError, KeyError):
+                    data = AudioAnalysisData.from_dict(json_loads(row["analysis_data"]))
+                except (ValueError, TypeError, KeyError):
                     missing_report.append(f"{row['item_id']}: row unparsable")
                     continue
                 missing = [
@@ -844,7 +840,6 @@ class SonicSimilarityPlugin(PluginProvider):
         self._signatures_by_id = new_signatures_by_id
         self.corpus_means = new_corpus_means
         self.corpus_stds = new_corpus_stds
-        self._signatures_since_rebuild = 0
 
         # Drop the old viewer's reference; CPython refcounting closes the mmap
         # synchronously, releasing the previous on-disk file for unlink below.
