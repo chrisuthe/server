@@ -488,7 +488,7 @@ class SonicSimilarityPlugin(PluginProvider):
 
         if weights.get("genre", 0.0) > 0 or weights.get("era", 0.0) > 0:
             raw_results = await self._apply_metadata_reranking(
-                valid_seed_ids[0],
+                valid_seed_ids,
                 raw_results,
                 weights,
             )
@@ -916,28 +916,31 @@ class SonicSimilarityPlugin(PluginProvider):
 
     async def _apply_metadata_reranking(
         self,
-        seed_item_id: str,
+        seed_item_ids: list[str],
         results: list[tuple[str, str, list[float], float, int]],
         weights: dict[str, float],
     ) -> list[tuple[str, str, list[float], float, int]]:
-        """Apply genre and year bonuses to re-rank candidates."""
-        try:
-            seed_prov = "library"
-            for key in self._reverse_label_map:
-                if key[0] == seed_item_id:
-                    seed_prov = key[1]
-                    break
-            seed_track: Track = await self.mass.music.tracks.get(seed_item_id, seed_prov)
-        except Exception:
+        """Apply genre and year bonuses to re-rank candidates.
+
+        :param seed_item_ids: All seed track ids — genres are unioned across
+            seeds, year is averaged. With one seed this collapses to the
+            single-seed behavior; with N seeds the metadata bonus reflects
+            the centroid of the seed set, matching how the audio-distance
+            blend already works.
+        """
+        seed_lookups = [self._resolve_seed_track(sid) for sid in seed_item_ids]
+        seed_tracks = [t for t in await asyncio.gather(*seed_lookups) if t is not None]
+        if not seed_tracks:
             return results
 
         seed_genres: set[str] = set()
-        if seed_track.metadata and seed_track.metadata.genres:
-            seed_genres = seed_track.metadata.genres
-
-        seed_year: int | None = None
-        if isinstance(seed_track.album, Album) and seed_track.album.year:
-            seed_year = seed_track.album.year
+        seed_years: list[int] = []
+        for seed_track in seed_tracks:
+            if seed_track.metadata and seed_track.metadata.genres:
+                seed_genres |= set(seed_track.metadata.genres)
+            if isinstance(seed_track.album, Album) and seed_track.album.year:
+                seed_years.append(seed_track.album.year)
+        seed_year_avg = sum(seed_years) / len(seed_years) if seed_years else None
 
         scored: list[tuple[str, str, list[float], float, int]] = []
         for item_id, provider, features, dist, gen in results:
@@ -960,18 +963,30 @@ class SonicSimilarityPlugin(PluginProvider):
                     if union_size > 0:
                         bonus -= METADATA_BONUS_SCALE * genre_weight * (intersection / union_size)
 
-            if year_weight > 0 and seed_year is not None:
+            if year_weight > 0 and seed_year_avg is not None:
                 cand_year: int | None = None
                 if isinstance(cand_track.album, Album) and cand_track.album.year:
                     cand_year = cand_track.album.year
                 if cand_year is not None:
-                    year_diff = abs(seed_year - cand_year)
+                    year_diff = abs(seed_year_avg - cand_year)
                     bonus -= METADATA_BONUS_SCALE * year_weight * (1.0 / (1.0 + year_diff * 0.1))
 
             scored.append((item_id, provider, features, dist + bonus, gen))
 
         scored.sort(key=lambda x: x[3])
         return scored
+
+    async def _resolve_seed_track(self, seed_item_id: str) -> Track | None:
+        """Resolve a seed track from its item_id by looking up its provider in the label map."""
+        seed_prov = "library"
+        for key in self._reverse_label_map:
+            if key[0] == seed_item_id:
+                seed_prov = key[1]
+                break
+        try:
+            return await self.mass.music.tracks.get(seed_item_id, seed_prov)
+        except Exception:
+            return None
 
     async def _resolve_results(
         self,
