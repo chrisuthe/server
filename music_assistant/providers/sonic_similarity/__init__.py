@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -49,7 +50,8 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
 
-USEARCH_INDEX_FILENAME_TPL = "sonic_signatures_{domain}.usearch"
+USEARCH_INDEX_FILENAME_TPL = "sonic_signatures_{domain}_v{version}.usearch"
+USEARCH_INDEX_FILENAME_GLOB = "sonic_signatures_{domain}_v*.usearch"
 CONF_AA_PROVIDER = "aa_provider_domain"
 BACKGROUND_SCAN_TASK_ID = "audio_analysis_background_scan"
 
@@ -294,6 +296,7 @@ class SonicSimilarityPlugin(PluginProvider):
         self._search_index: Any = None
         self._signatures_since_rebuild: int = 0
         self._unregister_handles: list[Callable[[], None]] = []
+        self._rebuild_lock = asyncio.Lock()
 
     async def loaded_in_mass(self) -> None:
         """Register similarity API commands and build the 18-dim search index."""
@@ -321,19 +324,10 @@ class SonicSimilarityPlugin(PluginProvider):
         )
 
     async def unload(self, is_removed: bool = False) -> None:
-        """Unregister API commands and save the search index."""
+        """Unregister API commands."""
         for unregister in self._unregister_handles:
             unregister()
         self._unregister_handles.clear()
-        await asyncio.to_thread(self._save_search_index)
-        for cached_domain, cached in self._indexes.items():
-            if cached_domain == self._aa_domain:
-                continue
-            old_domain = self._aa_domain
-            self._aa_domain = cached_domain
-            self._search_index = cached["index"]
-            await asyncio.to_thread(self._save_search_index)
-            self._aa_domain = old_domain
         await super().unload(is_removed)
 
     # --- API handlers ---
@@ -567,13 +561,19 @@ class SonicSimilarityPlugin(PluginProvider):
         index_size = len(self._search_index) if self._search_index is not None else 0
         return {"status": "rebuilt", "index_size": index_size}
 
-    def _init_search_index(self) -> None:
-        """Create the index handle, mmap-viewing the on-disk file when present.
+    def _existing_index_files(self) -> list[Path]:
+        """List on-disk index files for the active aa_domain, oldest first."""
+        storage = Path(self.mass.storage_path)
+        pattern = USEARCH_INDEX_FILENAME_GLOB.format(domain=self._aa_domain)
+        return sorted(storage.glob(pattern), key=lambda p: p.stat().st_mtime)
 
-        view() keeps vectors on disk (page-cached), so RAM cost is the HNSW
-        graph + metadata only — much smaller than the raw vectors themselves.
-        Mutations (add/remove) only happen inside _rebuild_search_index, which
-        builds a fresh in-memory Index, saves it, then swaps to a new view.
+    def _init_search_index(self) -> None:
+        """Create the index handle, mmap-viewing the newest on-disk file when present.
+
+        Each rebuild writes a NEW versioned file (sonic_signatures_<domain>_v<ts>.usearch)
+        and atomically swaps the live viewer; old files are cleaned up after the swap.
+        Versioning means readers and writers never share a file, so the mmap from a
+        live viewer doesn't block the next rebuild from saving on any platform.
         """
         from usearch.index import (  # type: ignore[attr-defined]  # noqa: PLC0415
             Index,
@@ -581,49 +581,40 @@ class SonicSimilarityPlugin(PluginProvider):
             ScalarKind,
         )
 
-        index_path = Path(self.mass.storage_path) / USEARCH_INDEX_FILENAME_TPL.format(
-            domain=self._aa_domain
-        )
         self._search_index = Index(
             ndim=VECTOR_DIMENSIONS,
             metric=MetricKind.Cos,
             dtype=ScalarKind.F32,
         )
-        if index_path.exists():
-            try:
-                self._search_index.view(str(index_path))
-                if self._search_index.ndim != VECTOR_DIMENSIONS:
-                    self.logger.warning(
-                        "Index dimension mismatch (%d vs %d), discarding stale index",
-                        self._search_index.ndim,
-                        VECTOR_DIMENSIONS,
-                    )
-                    index_path.unlink()
-                    self._search_index = Index(
-                        ndim=VECTOR_DIMENSIONS,
-                        metric=MetricKind.Cos,
-                        dtype=ScalarKind.F32,
-                    )
-                else:
-                    self.logger.debug("Mmap-viewing USearch index from %s", index_path)
-            except Exception:
-                self.logger.warning("Failed to view index file, starting fresh")
-                index_path.unlink(missing_ok=True)
-                self._search_index = Index(
-                    ndim=VECTOR_DIMENSIONS,
-                    metric=MetricKind.Cos,
-                    dtype=ScalarKind.F32,
-                )
-
-    def _save_search_index(self) -> None:
-        """Persist the USearch index to disk."""
-        if self._search_index is None:
+        candidates = self._existing_index_files()
+        if not candidates:
             return
-        index_path = Path(self.mass.storage_path) / USEARCH_INDEX_FILENAME_TPL.format(
-            domain=self._aa_domain
-        )
-        self._search_index.save(str(index_path))
-        self.logger.debug("Saved USearch index to %s", index_path)
+        latest = candidates[-1]
+        try:
+            self._search_index.view(str(latest))
+        except Exception:
+            self.logger.warning("Failed to view %s, starting fresh", latest)
+            latest.unlink(missing_ok=True)
+            self._search_index = Index(
+                ndim=VECTOR_DIMENSIONS,
+                metric=MetricKind.Cos,
+                dtype=ScalarKind.F32,
+            )
+            return
+        if self._search_index.ndim != VECTOR_DIMENSIONS:
+            self.logger.warning(
+                "Index dimension mismatch (%d vs %d), discarding stale index",
+                self._search_index.ndim,
+                VECTOR_DIMENSIONS,
+            )
+            self._search_index = Index(
+                ndim=VECTOR_DIMENSIONS,
+                metric=MetricKind.Cos,
+                dtype=ScalarKind.F32,
+            )
+            latest.unlink(missing_ok=True)
+            return
+        self.logger.debug("Mmap-viewing USearch index from %s", latest)
 
     def _add_to_index(self, label: int, normalized_features: list[float]) -> None:
         """Add a vector to the search index.
@@ -691,8 +682,13 @@ class SonicSimilarityPlugin(PluginProvider):
         for field, value in override.items():
             setattr(data, field, value)
 
-    async def _rebuild_search_index(self) -> None:  # noqa: PLR0915
+    async def _rebuild_search_index(self) -> None:
         """Rebuild the search index from all stored analysis rows."""
+        async with self._rebuild_lock:
+            await self._rebuild_search_index_locked()
+
+    async def _rebuild_search_index_locked(self) -> None:  # noqa: PLR0915
+        """Rebuild body — assumes self._rebuild_lock is held."""
         rows = await self.mass.streams.audio_analysis.get_audio_analysis_rows(self._aa_domain)
         if not rows:
             self.logger.info("No analysis rows found in database, skipping index rebuild")
@@ -700,16 +696,17 @@ class SonicSimilarityPlugin(PluginProvider):
 
         overlay_overrides = await self._load_overlay_overrides()
 
-        # Reset state before rebuilding
-        self._label_map.clear()
-        self._reverse_label_map.clear()
-        self._next_label = 1
-        self._signature_cache.clear()
+        # Build new state in LOCALS — old self.* state continues to serve queries
+        # until we atomically swap at the end.
+        new_label_map: dict[int, tuple[str, str]] = {}
+        new_reverse_label_map: dict[tuple[str, str], int] = {}
+        new_signature_cache: dict[str, list[float]] = {}
+        next_label = 1
 
         # Collect signatures, deduplicating by (item_id, provider)
         all_features: list[list[float]] = []
         seen: set[tuple[str, str]] = set()
-        row_entries: list[tuple[str, str, list[float]]] = []
+        row_entries: list[tuple[int, list[float]]] = []  # (label, raw vec)
         overlay_applied_count = 0
         for row in rows:
             try:
@@ -729,9 +726,13 @@ class SonicSimilarityPlugin(PluginProvider):
             if key in seen:
                 continue
             seen.add(key)
+            label = next_label
+            next_label += 1
+            new_label_map[label] = key
+            new_reverse_label_map[key] = label
             all_features.append(vec)
-            row_entries.append((item_id, provider, vec))
-            self._signature_cache[item_id] = vec
+            row_entries.append((label, vec))
+            new_signature_cache[item_id] = vec
 
         if not all_features:
             # Help the user diagnose the frustrating "250 rows, 0 signatures" case.
@@ -773,52 +774,76 @@ class SonicSimilarityPlugin(PluginProvider):
             )
             return
 
-        self.corpus_means, self.corpus_stds = compute_corpus_stats(all_features)
+        new_corpus_means, new_corpus_stds = compute_corpus_stats(all_features)
 
-        # Delete old index file and rebuild in a thread to avoid blocking the event loop
-        index_path = Path(self.mass.storage_path) / USEARCH_INDEX_FILENAME_TPL.format(
-            domain=self._aa_domain
+        # Each rebuild writes a NEW versioned file so the previous viewer's mmap
+        # is never disturbed. After the atomic swap the old file gets cleaned up.
+        new_index_path = Path(self.mass.storage_path) / USEARCH_INDEX_FILENAME_TPL.format(
+            domain=self._aa_domain, version=int(time.time() * 1000)
         )
-        index_path.unlink(missing_ok=True)
-        self._search_index = None
 
-        def _build_save_and_view() -> None:
-            assert self.corpus_means is not None
-            assert self.corpus_stds is not None
+        def _build_save_and_view() -> Any:
             from usearch.index import (  # type: ignore[attr-defined]  # noqa: PLC0415
                 Index,
                 MetricKind,
                 ScalarKind,
             )
 
-            # Build the index in memory (adds need a writable index)…
             builder = Index(
                 ndim=VECTOR_DIMENSIONS,
                 metric=MetricKind.Cos,
                 dtype=ScalarKind.F32,
             )
-            self._search_index = builder
-            for item_id, provider, features in row_entries:
-                label = self._get_or_assign_label(item_id, provider)
-                normalized = normalize_features(features, self.corpus_means, self.corpus_stds)
-                self._add_to_index(label, normalized)
-            self._save_search_index()
-            # …then swap to an mmap-backed view so the vectors don't sit in RAM.
+            for label, features in row_entries:
+                normalized = normalize_features(features, new_corpus_means, new_corpus_stds)
+                builder.add(label, np.array(normalized, dtype=np.float32))
+            builder.save(str(new_index_path))
             viewer = Index(
                 ndim=VECTOR_DIMENSIONS,
                 metric=MetricKind.Cos,
                 dtype=ScalarKind.F32,
             )
-            viewer.view(str(index_path))
-            self._search_index = viewer
+            viewer.view(str(new_index_path))
+            return viewer
 
-        await asyncio.to_thread(_build_save_and_view)
+        new_viewer = await asyncio.to_thread(_build_save_and_view)
+
+        # Atomic swap: queries that yielded before this point either resume seeing
+        # fully old state (if scheduled before this block) or fully new state
+        # (after). No `await` between writes, so other tasks cannot observe a
+        # half-rotated state.
+        old_search_index = self._search_index
+        self._search_index = new_viewer
+        self._label_map = new_label_map
+        self._reverse_label_map = new_reverse_label_map
+        self._next_label = next_label
+        self._signature_cache = new_signature_cache
+        self.corpus_means = new_corpus_means
+        self.corpus_stds = new_corpus_stds
         self._signatures_since_rebuild = 0
+
+        # Drop the old viewer's reference; CPython refcounting closes the mmap
+        # synchronously, releasing the previous on-disk file for unlink below.
+        del old_search_index
+
+        # Best-effort cleanup of the previous versioned files (off the event loop).
+        await asyncio.to_thread(self._cleanup_stale_index_files, new_index_path)
+
         self.logger.info(
             "Rebuilt search index with %d signatures (%d with overlay fields applied)",
             len(row_entries),
             overlay_applied_count,
         )
+
+    def _cleanup_stale_index_files(self, keep: Path) -> None:
+        """Remove old versioned index files for the active domain except `keep`."""
+        for path in self._existing_index_files():
+            if path == keep:
+                continue
+            try:
+                path.unlink()
+            except OSError as err:
+                self.logger.debug("Could not unlink stale index file %s: %s", path, err)
 
     # --- Label mapping ---
 
