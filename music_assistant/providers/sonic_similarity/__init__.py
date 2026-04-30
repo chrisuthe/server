@@ -568,7 +568,13 @@ class SonicSimilarityPlugin(PluginProvider):
         return {"status": "rebuilt", "index_size": index_size}
 
     def _init_search_index(self) -> None:
-        """Create or load a USearch HNSW index."""
+        """Create the index handle, mmap-viewing the on-disk file when present.
+
+        view() keeps vectors on disk (page-cached), so RAM cost is the HNSW
+        graph + metadata only — much smaller than the raw vectors themselves.
+        Mutations (add/remove) only happen inside _rebuild_search_index, which
+        builds a fresh in-memory Index, saves it, then swaps to a new view.
+        """
         from usearch.index import (  # type: ignore[attr-defined]  # noqa: PLC0415
             Index,
             MetricKind,
@@ -585,7 +591,7 @@ class SonicSimilarityPlugin(PluginProvider):
         )
         if index_path.exists():
             try:
-                self._search_index.load(str(index_path))
+                self._search_index.view(str(index_path))
                 if self._search_index.ndim != VECTOR_DIMENSIONS:
                     self.logger.warning(
                         "Index dimension mismatch (%d vs %d), discarding stale index",
@@ -599,9 +605,9 @@ class SonicSimilarityPlugin(PluginProvider):
                         dtype=ScalarKind.F32,
                     )
                 else:
-                    self.logger.debug("Loaded USearch index from %s", index_path)
+                    self.logger.debug("Mmap-viewing USearch index from %s", index_path)
             except Exception:
-                self.logger.warning("Failed to load index file, starting fresh")
+                self.logger.warning("Failed to view index file, starting fresh")
                 index_path.unlink(missing_ok=True)
                 self._search_index = Index(
                     ndim=VECTOR_DIMENSIONS,
@@ -776,24 +782,37 @@ class SonicSimilarityPlugin(PluginProvider):
         index_path.unlink(missing_ok=True)
         self._search_index = None
 
-        def _build_and_save() -> None:
+        def _build_save_and_view() -> None:
             assert self.corpus_means is not None
             assert self.corpus_stds is not None
-            # Create a fresh empty index (don't load from disk — file was already deleted)
-            from usearch.index import Index, MetricKind, ScalarKind  # noqa: PLC0415
+            from usearch.index import (  # type: ignore[attr-defined]  # noqa: PLC0415
+                Index,
+                MetricKind,
+                ScalarKind,
+            )
 
-            self._search_index = Index(
+            # Build the index in memory (adds need a writable index)…
+            builder = Index(
                 ndim=VECTOR_DIMENSIONS,
                 metric=MetricKind.Cos,
                 dtype=ScalarKind.F32,
             )
+            self._search_index = builder
             for item_id, provider, features in row_entries:
                 label = self._get_or_assign_label(item_id, provider)
                 normalized = normalize_features(features, self.corpus_means, self.corpus_stds)
                 self._add_to_index(label, normalized)
             self._save_search_index()
+            # …then swap to an mmap-backed view so the vectors don't sit in RAM.
+            viewer = Index(
+                ndim=VECTOR_DIMENSIONS,
+                metric=MetricKind.Cos,
+                dtype=ScalarKind.F32,
+            )
+            viewer.view(str(index_path))
+            self._search_index = viewer
 
-        await asyncio.to_thread(_build_and_save)
+        await asyncio.to_thread(_build_save_and_view)
         self._signatures_since_rebuild = 0
         self.logger.info(
             "Rebuilt search index with %d signatures (%d with overlay fields applied)",
