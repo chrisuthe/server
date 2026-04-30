@@ -1,1 +1,1 @@
-"""Tests for the streams controller subpackage."""
+"""Tests for Music Assistant stream controllers."""

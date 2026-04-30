@@ -34,9 +34,37 @@ class AudioAnalysisProvider(Provider):
     These providers receive PCM audio chunks during streaming and produce analysis
     results such as beat tracking, key detection, phrase boundaries, etc.
 
-    The AudioAnalysisController creates session IDs and passes them to all methods.
-    Providers implement _start_analysis and _finalize as hooks — the base class
-    manages session lifecycle, version gating, and cleanup.
+    Providers implement four hooks (`_start_analysis`, `process_pcm_chunk`,
+    `_finalize`, optionally `post_analysis`) and the base class manages session
+    lifecycle, version gating, and cleanup. The same hooks drive both live
+    playback (PCM from `AudioBuffer`) and background scans (PCM from ffmpeg
+    decoding a local file). Providers do not need to know which context they
+    are running in.
+
+    Provider contract (binding):
+
+    1. `process_pcm_chunk` MUST `await` all work that processes the chunk.
+       The controller serializes chunks across providers and uses this to
+       backpressure the audio source. Fire-and-forget per-chunk work breaks
+       backpressure and can pile up unboundedly at flat-out background rates.
+
+    2. Providers MAY spawn background tasks during `process_pcm_chunk` only
+       when the total task count is bounded by per-track properties (e.g. a
+       fixed number of CLAP target windows configured per track). All such
+       tasks MUST be tracked and awaited in `_finalize`.
+
+    3. Providers MUST NOT begin work for session N+1 while session N is
+       still active. Per-session state should be keyed on `session_id`.
+
+    4. `_finalize` MUST return the AudioAnalysisData it persisted, or None
+       if it chose not to persist (e.g. insufficient audio). The base class
+       uses the return value to drive `post_analysis`.
+
+    5. `post_analysis` is optional and called by the base class after
+       `_finalize` returns a non-None analysis. It is the place for filesystem
+       side effects such as tag-writing. Implementations MUST self-gate on
+       whether `streamdetails.path` is a writable filesystem path, because
+       this hook fires for both live and background scans.
     """
 
     # Version of the analysis algorithm. Providers should increment this when
@@ -121,44 +149,64 @@ class AudioAnalysisProvider(Provider):
         """
 
     @abstractmethod
-    async def _finalize(self, session_id: str) -> None:
-        """Finalize analysis and store results.
+    async def _finalize(self, session_id: str) -> AudioAnalysisData | None:
+        """Finalize analysis and return the persisted analysis (or None to skip).
 
         Called when the track has finished streaming. Providers are responsible
         for storing their results via mass.streams.audio_analysis.set_audio_analysis().
+        Return the AudioAnalysisData that was persisted, or None if the provider
+        chose not to store a result (e.g. insufficient audio data). The base
+        class uses the returned value to drive the post_analysis hook.
 
         :param session_id: The analysis session ID.
         """
 
     async def finalize(self, session_id: str) -> None:
-        """Finalize analysis and clean up session state.
+        """Finalize analysis, optionally fire post_analysis, and clean up state.
 
-        Calls _finalize, then removes the session from _sessions.
-        The controller calls this method — providers override _finalize.
+        Calls _finalize, then post_analysis (when _finalize returned a non-None
+        analysis), then removes the session from _sessions. Both _finalize and
+        post_analysis exceptions are caught and logged — neither is allowed to
+        leave session state behind or to propagate to the controller.
 
         :param session_id: The analysis session ID.
         """
+        analysis: AudioAnalysisData | None = None
         try:
-            await self._finalize(session_id)
-        finally:
-            self._sessions.pop(session_id, None)
+            analysis = await self._finalize(session_id)
+        except Exception as err:
+            self.logger.error("_finalize raised for session %s: %s", session_id, err, exc_info=err)
+        session = self._sessions.get(session_id)
+        if analysis is not None and session is not None:
+            try:
+                await self.post_analysis(session.streamdetails, analysis)
+            except Exception as err:
+                self.logger.warning(
+                    "post_analysis raised for %s: %s", self.domain, err, exc_info=err
+                )
+        self._sessions.pop(session_id, None)
 
-    async def analyze_file(
+    async def post_analysis(
         self,
         streamdetails: StreamDetails,
-    ) -> AudioAnalysisData | None:
-        """
-        Run analysis directly on a local audio file.
+        analysis: AudioAnalysisData,
+    ) -> None:
+        """Run side effects after analysis is finalized and persisted.
 
-        Used by the AudioAnalysisController's background scan. Providers that can
-        analyze a file without going through live PCM streaming (e.g. by handing
-        the path to FFmpeg/librosa/etc.) should override this. Default returns
-        None, meaning the provider does not support file-based analysis.
+        Called by the base class `finalize` wrapper after `_finalize` returns
+        a non-None analysis. Default is a no-op. Providers override this to
+        perform filesystem side effects such as writing tags back to the
+        source file. Failures are caught by the base class and logged — they
+        must not undo the analysis row.
 
-        :param streamdetails: StreamDetails for the item being analyzed.
-            Contains the local file path and audio format.
+        Implementations must self-gate on whether `streamdetails.path` is a
+        writable filesystem path, since this hook fires for both live and
+        background-scan analyses.
+
+        :param streamdetails: The stream details for the analyzed item.
+        :param analysis: The analysis data that was persisted by `_finalize`.
         """
-        return None
+        return
 
     async def cancel(self, session_id: str) -> None:
         """Cancel an in-progress analysis session."""

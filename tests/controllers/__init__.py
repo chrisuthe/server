@@ -1,1 +1,1 @@
-"""Tests for the controllers package."""
+"""Tests for Music Assistant controllers."""
