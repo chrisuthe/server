@@ -27,8 +27,6 @@ import numpy as np
 from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.media_items import Album
 
-from music_assistant.helpers.json import json_loads
-from music_assistant.models.audio_analysis import AudioAnalysisData
 from music_assistant.models.plugin import PluginProvider
 from music_assistant.providers.sonic_similarity.similarity import (
     Candidate,
@@ -57,24 +55,6 @@ if TYPE_CHECKING:
 USEARCH_INDEX_FILENAME_TPL = "sonic_signatures_{domain}_v{version}.usearch"
 USEARCH_INDEX_FILENAME_GLOB = "sonic_signatures_{domain}_v*.usearch"
 CONF_AA_PROVIDER = "aa_provider_domain"
-
-# Overlay registry: each aa_provider_domain listed here declares which
-# AudioAnalysisData fields it owns. At vector-assembly time, rows from
-# these sources are overlaid onto the primary provider's row. Skipped
-# when the primary aa_provider_domain equals an overlay source (no
-# self-overlay). Silent fallback when a track has no overlay row.
-#
-#   smart_fades — BPM from beat_this CNN, key/mode from S-KEY;
-#                  strictly better than librosa's heuristic versions.
-#
-# Note: sonic_analysis used to have an overlay entry for CLAP zero-shot
-# soft scalars (a separate clap_analysis provider). That provider has
-# been merged into sonic_analysis itself — one audio load per track
-# produces both the librosa measurements and the CLAP scalars, written
-# to a single audio_analysis row. No cross-provider overlay needed.
-OVERLAY_SOURCES: dict[str, tuple[str, ...]] = {
-    "smart_fades": ("bpm", "key", "mode"),
-}
 
 # Scale factor applied to the genre/year metadata bonus in
 # _apply_metadata_reranking. Without scaling the raw genre Jaccard +
@@ -710,54 +690,24 @@ class SonicSimilarityPlugin(PluginProvider):
 
     # --- Index rebuild ---
 
-    async def _load_overlay_overrides(
-        self,
-    ) -> dict[tuple[str, str], dict[str, Any]]:
-        """Load overlay rows from every source in OVERLAY_SOURCES, merged.
-
-        :returns: Map of (item_id, provider) → {field: value}. Populated fields
-            come from each overlay source's declared field list. Sources are
-            processed in OVERLAY_SOURCES registration order; later entries win
-            on field conflicts (no current conflicts).
-        """
-        merged: dict[tuple[str, str], dict[str, Any]] = {}
-        for source_domain, fields in OVERLAY_SOURCES.items():
-            if self._aa_domain == source_domain:
-                continue
-            rows = await self.mass.streams.audio_analysis.get_audio_analysis_rows(source_domain)
-            for row in rows:
-                try:
-                    data = AudioAnalysisData.from_dict(json_loads(row["analysis_data"]))
-                except (ValueError, TypeError, KeyError):
-                    continue
-                per_track = merged.setdefault((row["item_id"], row["provider"]), {})
-                for field_name in fields:
-                    value = getattr(data, field_name, None)
-                    if value is not None:
-                        per_track[field_name] = value
-        return merged
-
-    @staticmethod
-    def _apply_overlay_overrides(data: AudioAnalysisData, override: dict[str, Any] | None) -> None:
-        """Overlay per-field values from overlay sources onto analysis data in place."""
-        if not override:
-            return
-        for field_name, value in override.items():
-            setattr(data, field_name, value)
-
     async def _rebuild_search_index(self) -> None:
         """Rebuild the search index from all stored analysis rows."""
         async with self._rebuild_lock:
             await self._rebuild_search_index_locked()
 
-    async def _rebuild_search_index_locked(self) -> None:  # noqa: PLR0915
+    async def _rebuild_search_index_locked(self) -> None:
         """Rebuild body — assumes self._rebuild_lock is held."""
-        rows = await self.mass.streams.audio_analysis.get_audio_analysis_rows(self._aa_domain)
-        if not rows:
+        # Cross-AA-provider merge runs in the controller (see get_merged_audio_analysis_rows).
+        # Conflict resolution is timestamp-order (latest non-None write wins per field), which
+        # means a re-run of the primary analyzer can override fields a secondary analyzer
+        # populated earlier — accept that for symmetry with the rest of MA's analysis stack.
+        # Rows from currently-unavailable AA providers are skipped by the helper.
+        merged_entries = await self.mass.streams.audio_analysis.get_merged_audio_analysis_rows(
+            self._aa_domain
+        )
+        if not merged_entries:
             self.logger.info("No analysis rows found in database, skipping index rebuild")
             return
-
-        overlay_overrides = await self._load_overlay_overrides()
 
         # Build new state in LOCALS — old self.* state continues to serve queries
         # until we atomically swap at the end.
@@ -767,48 +717,27 @@ class SonicSimilarityPlugin(PluginProvider):
         new_provider_by_item_id: dict[str, str] = {}
         next_label = 1
 
-        # Collect signatures, deduplicating by (item_id, provider)
         all_features: list[list[float]] = []
-        seen: set[tuple[str, str]] = set()
         row_entries: list[tuple[int, list[float]]] = []  # (label, raw vec)
-        overlay_applied_count = 0
-        for row in rows:
-            try:
-                data = AudioAnalysisData.from_dict(json_loads(row["analysis_data"]))
-            except (ValueError, TypeError, KeyError):
-                continue
-            item_id = row["item_id"]
-            provider = row["provider"]
-            per_track_override = overlay_overrides.get((item_id, provider))
-            if per_track_override:
-                overlay_applied_count += 1
-            self._apply_overlay_overrides(data, per_track_override)
+        for item_id, provider, data in merged_entries:
             vec = assemble_vector(data)
             if vec is None or len(vec) != VECTOR_DIMENSIONS:
                 continue
-            key = (item_id, provider)
-            if key in seen:
-                continue
-            seen.add(key)
             label = next_label
             next_label += 1
+            key = (item_id, provider)
             new_label_map[label] = key
             all_features.append(vec)
             row_entries.append((label, vec))
-            new_signature_cache[(item_id, provider)] = vec
+            new_signature_cache[key] = vec
             new_signatures_by_id[item_id] = vec
             new_provider_by_item_id[item_id] = provider
 
         if not all_features:
-            # Help the user diagnose the frustrating "250 rows, 0 signatures" case.
-            # Peek at up to 3 rows and report which required fields they are missing.
+            # Help the user diagnose the "250 rows, 0 signatures" case. Peek at
+            # up to 3 merged entries and report which required fields are missing.
             missing_report: list[str] = []
-            for row in rows[:3]:
-                try:
-                    data = AudioAnalysisData.from_dict(json_loads(row["analysis_data"]))
-                except (ValueError, TypeError, KeyError):
-                    missing_report.append(f"{row['item_id']}: row unparsable")
-                    continue
+            for item_id, _provider, data in merged_entries[:3]:
                 missing = [
                     f
                     for f in (
@@ -826,14 +755,14 @@ class SonicSimilarityPlugin(PluginProvider):
                     )
                     if getattr(data, f, None) is None
                 ]
-                missing_report.append(f"{row['item_id']}: missing {missing}")
+                missing_report.append(f"{item_id}: missing {missing}")
             self.logger.info(
-                "No valid signatures assembled from %d rows in domain=%s, "
+                "No valid signatures assembled from %d merged tracks in domain=%s, "
                 "skipping index rebuild. Sample diagnostics: %s. "
                 "Common cause: current aa_provider_domain lacks required scalar fields — "
                 "switch Similarity Source to sonic_analysis (which populates all "
                 "required hard scalars).",
-                len(rows),
+                len(merged_entries),
                 self._aa_domain,
                 "; ".join(missing_report),
             )
@@ -879,11 +808,7 @@ class SonicSimilarityPlugin(PluginProvider):
         # Best-effort cleanup of the previous versioned files (off the event loop).
         await asyncio.to_thread(self._cleanup_stale_index_files, new_index_path)
 
-        self.logger.info(
-            "Rebuilt search index with %d signatures (%d with overlay fields applied)",
-            len(row_entries),
-            overlay_applied_count,
-        )
+        self.logger.info("Rebuilt search index with %d signatures", len(row_entries))
 
     def _cleanup_stale_index_files(self, keep: Path) -> None:
         """Remove old versioned index files for the active domain except `keep`."""
