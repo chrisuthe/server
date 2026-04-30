@@ -10,6 +10,8 @@ from collections.abc import Callable
 
 import numpy as np
 
+from .vectors import compute_weighted_distance
+
 
 def combine_seeds_centroid(
     seeds: list[list[float]],
@@ -85,7 +87,6 @@ def apply_mmr(
     seed_arr = np.array(seed_vec, dtype=np.float64)
 
     if weights is not None:
-        from .vectors import compute_weighted_distance  # noqa: PLC0415
 
         def _similarity(a: np.ndarray, b: np.ndarray) -> float:
             d = compute_weighted_distance(a.tolist(), b.tolist(), weights)

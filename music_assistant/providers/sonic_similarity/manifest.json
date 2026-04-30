@@ -5,6 +5,7 @@
   "description": "Find similar tracks in your library using audio signature analysis.",
   "codeowners": ["@music-assistant"],
   "requirements": ["usearch"],
-  "documentation": "",
-  "depends_on": "sonic_analysis"
+  "depends_on": "sonic_analysis",
+  "multi_instance": false,
+  "builtin": false
 }

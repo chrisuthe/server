@@ -171,17 +171,11 @@ def compute_corpus_stats(
 def compute_group_distances(
     sig_a: list[float],
     sig_b: list[float],
-    weights: dict[str, float],  # noqa: ARG001
 ) -> dict[str, float]:
-    """Compute per-group Euclidean distance between two feature vectors.
-
-    Returns a dict mapping each FEATURE_GROUPS name to its raw (unweighted)
-    normalized distance. Weights are accepted for API symmetry but do not
-    affect the per-group values.
+    """Compute per-group raw (unweighted) Euclidean distance between two feature vectors.
 
     :param sig_a: First feature vector.
     :param sig_b: Second feature vector.
-    :param weights: Accepted for API compatibility, not used.
     """
     a = np.array(sig_a, dtype=np.float64)
     b = np.array(sig_b, dtype=np.float64)
@@ -205,7 +199,7 @@ def compute_weighted_distance(
     :param weights: Per-group weight overrides keyed by FEATURE_GROUPS name.
     :returns: Weighted normalized distance as a float.
     """
-    group_dists = compute_group_distances(sig_a, sig_b, weights)
+    group_dists = compute_group_distances(sig_a, sig_b)
     weighted_sq_sum = 0.0
     total_weighted_dims = 0.0
     for group, (start, end) in FEATURE_GROUPS.items():
@@ -238,6 +232,6 @@ def build_debug_breakdown(
         "metadata_bonus": round(displayed_dist - weighted, 4),
         "group_distances": {
             k: round(v, 4)
-            for k, v in compute_group_distances(seed_normalized, cand_normalized, weights).items()
+            for k, v in compute_group_distances(seed_normalized, cand_normalized).items()
         },
     }

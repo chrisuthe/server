@@ -37,6 +37,7 @@ from music_assistant.providers.sonic_similarity.similarity import (
 from music_assistant.providers.sonic_similarity.vectors import (
     VECTOR_DIMENSIONS,
     assemble_vector,
+    build_debug_breakdown,
     compute_corpus_stats,
     compute_weighted_distance,
     normalize_features,
@@ -525,10 +526,6 @@ class SonicSimilarityPlugin(PluginProvider):
 
         debug_breakdown_map: dict[str, dict[str, Any]] = {}
         if include_group_distances:
-            from music_assistant.providers.sonic_similarity.vectors import (  # noqa: PLC0415
-                build_debug_breakdown,
-            )
-
             original_centroid = combine_seeds_centroid(seed_sigs)
             orig_normalized = normalize_features(original_centroid, corpus_means, corpus_stds)
             for cid, prov, displayed_dist, _gen in final_items:
