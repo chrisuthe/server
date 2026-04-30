@@ -235,7 +235,7 @@ class TestExpandRecursive:
         """Depth=1 runs the searcher once, all results are generation 0."""
 
         def searcher(
-            seeds: list[list[float]],
+            seeds: list[list[float]],  # noqa: ARG001
             seen: set[str],  # noqa: ARG001
         ) -> list[tuple[str, str, list[float], float]]:
             return [
@@ -254,7 +254,7 @@ class TestExpandRecursive:
         call_count = 0
 
         def searcher(
-            seeds: list[list[float]],
+            seeds: list[list[float]],  # noqa: ARG001
             seen: set[str],  # noqa: ARG001
         ) -> list[tuple[str, str, list[float], float]]:
             nonlocal call_count
@@ -284,7 +284,7 @@ class TestExpandRecursive:
         call_count = 0
 
         def searcher(
-            seeds: list[list[float]],
+            seeds: list[list[float]],  # noqa: ARG001
             seen: set[str],  # noqa: ARG001
         ) -> list[tuple[str, str, list[float], float]]:
             nonlocal call_count

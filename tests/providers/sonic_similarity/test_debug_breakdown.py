@@ -1,6 +1,4 @@
-"""Tests for build_debug_breakdown — per-track diagnostic info exposed
-through the debug page when include_group_distances=True.
-"""
+"""Tests for build_debug_breakdown — per-track diagnostic via include_group_distances=True."""
 
 from __future__ import annotations
 
