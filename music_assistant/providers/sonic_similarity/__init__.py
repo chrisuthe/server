@@ -341,8 +341,6 @@ class SonicSimilarityPlugin(PluginProvider):
         super().__init__(mass, manifest, config)
         self._aa_domain: str = "sonic_analysis"
         self._label_map: dict[int, tuple[str, str]] = {}
-        self._reverse_label_map: dict[tuple[str, str], int] = {}
-        self._next_label: int = 1
         # _signature_cache is keyed on (item_id, provider) so a track that
         # exists in two providers under the same item_id doesn't overwrite
         # itself. _signatures_by_id is the fallback for the seed-lookup path,
@@ -506,8 +504,8 @@ class SonicSimilarityPlugin(PluginProvider):
             seen: set[str],
         ) -> list[tuple[str, str, list[float], float]]:
             # `_label_map[lbl]` already returns (item_id, provider); cache the
-            # provider per cand_id so the raw_tuples build below is O(1) per
-            # candidate rather than O(N) (rescanning _reverse_label_map).
+            # provider per cand_id so the raw_tuples build below stays O(1) per
+            # candidate.
             id_to_prov: dict[str, str] = {}
             if ctx.params.blend_mode == "union":
                 all_neighborhoods: list[list[tuple[str, float]]] = []
@@ -684,68 +682,16 @@ class SonicSimilarityPlugin(PluginProvider):
         pattern = USEARCH_INDEX_FILENAME_GLOB.format(domain=self._aa_domain)
         return sorted(storage.glob(pattern), key=lambda p: p.stat().st_mtime)
 
-    def _init_search_index(self) -> None:
-        """Create the index handle, mmap-viewing the newest on-disk file when present.
-
-        Each rebuild writes a NEW versioned file (sonic_signatures_<domain>_v<ts>.usearch)
-        and atomically swaps the live viewer; old files are cleaned up after the swap.
-        Versioning means readers and writers never share a file, so the mmap from a
-        live viewer doesn't block the next rebuild from saving on any platform.
-        """
+    @staticmethod
+    def _make_empty_index() -> Any:
+        """Return a fresh, empty USearch HNSW index sized for our 18-dim cosine space."""
         from usearch.index import (  # type: ignore[attr-defined]  # noqa: PLC0415
             Index,
             MetricKind,
             ScalarKind,
         )
 
-        self._search_index = Index(
-            ndim=VECTOR_DIMENSIONS,
-            metric=MetricKind.Cos,
-            dtype=ScalarKind.F32,
-        )
-        candidates = self._existing_index_files()
-        if not candidates:
-            return
-        latest = candidates[-1]
-        try:
-            self._search_index.view(str(latest))
-        except Exception:
-            self.logger.warning("Failed to view %s, starting fresh", latest)
-            latest.unlink(missing_ok=True)
-            self._search_index = Index(
-                ndim=VECTOR_DIMENSIONS,
-                metric=MetricKind.Cos,
-                dtype=ScalarKind.F32,
-            )
-            return
-        if self._search_index.ndim != VECTOR_DIMENSIONS:
-            self.logger.warning(
-                "Index dimension mismatch (%d vs %d), discarding stale index",
-                self._search_index.ndim,
-                VECTOR_DIMENSIONS,
-            )
-            self._search_index = Index(
-                ndim=VECTOR_DIMENSIONS,
-                metric=MetricKind.Cos,
-                dtype=ScalarKind.F32,
-            )
-            latest.unlink(missing_ok=True)
-            return
-        self.logger.debug("Mmap-viewing USearch index from %s", latest)
-
-    def _add_to_index(self, label: int, normalized_features: list[float]) -> None:
-        """Add a vector to the search index.
-
-        :param label: Integer label for the vector.
-        :param normalized_features: Z-score normalized feature vector.
-        """
-        if self._search_index is None:
-            self._init_search_index()
-        vec = np.array(normalized_features, dtype=np.float32)
-        # Remove existing entry if present (handles dimension change rebuilds)
-        if label in self._search_index:
-            self._search_index.remove(label)
-        self._search_index.add(label, vec)
+        return Index(ndim=VECTOR_DIMENSIONS, metric=MetricKind.Cos, dtype=ScalarKind.F32)
 
     def _query_index(self, normalized_features: list[float], k: int) -> list[tuple[int, float]]:
         """Search the index for the k nearest neighbors.
@@ -816,7 +762,6 @@ class SonicSimilarityPlugin(PluginProvider):
         # Build new state in LOCALS — old self.* state continues to serve queries
         # until we atomically swap at the end.
         new_label_map: dict[int, tuple[str, str]] = {}
-        new_reverse_label_map: dict[tuple[str, str], int] = {}
         new_signature_cache: dict[tuple[str, str], list[float]] = {}
         new_signatures_by_id: dict[str, list[float]] = {}
         new_provider_by_item_id: dict[str, str] = {}
@@ -848,7 +793,6 @@ class SonicSimilarityPlugin(PluginProvider):
             label = next_label
             next_label += 1
             new_label_map[label] = key
-            new_reverse_label_map[key] = label
             all_features.append(vec)
             row_entries.append((label, vec))
             new_signature_cache[(item_id, provider)] = vec
@@ -904,26 +848,12 @@ class SonicSimilarityPlugin(PluginProvider):
         )
 
         def _build_save_and_view() -> Any:
-            from usearch.index import (  # type: ignore[attr-defined]  # noqa: PLC0415
-                Index,
-                MetricKind,
-                ScalarKind,
-            )
-
-            builder = Index(
-                ndim=VECTOR_DIMENSIONS,
-                metric=MetricKind.Cos,
-                dtype=ScalarKind.F32,
-            )
+            builder = self._make_empty_index()
             for label, features in row_entries:
                 normalized = normalize_features(features, new_corpus_means, new_corpus_stds)
                 builder.add(label, np.array(normalized, dtype=np.float32))
             builder.save(str(new_index_path))
-            viewer = Index(
-                ndim=VECTOR_DIMENSIONS,
-                metric=MetricKind.Cos,
-                dtype=ScalarKind.F32,
-            )
+            viewer = self._make_empty_index()
             viewer.view(str(new_index_path))
             return viewer
 
@@ -936,8 +866,6 @@ class SonicSimilarityPlugin(PluginProvider):
         old_search_index = self._search_index
         self._search_index = new_viewer
         self._label_map = new_label_map
-        self._reverse_label_map = new_reverse_label_map
-        self._next_label = next_label
         self._signature_cache = new_signature_cache
         self._signatures_by_id = new_signatures_by_id
         self._provider_by_item_id = new_provider_by_item_id
@@ -966,23 +894,6 @@ class SonicSimilarityPlugin(PluginProvider):
                 path.unlink()
             except OSError as err:
                 self.logger.debug("Could not unlink stale index file %s: %s", path, err)
-
-    # --- Label mapping ---
-
-    def _get_or_assign_label(self, item_id: str, provider: str) -> int:
-        """Return (or create) a unique integer label for an item_id/provider pair.
-
-        :param item_id: The track's item ID.
-        :param provider: The music provider domain or instance ID.
-        """
-        key = (item_id, provider)
-        if key in self._reverse_label_map:
-            return self._reverse_label_map[key]
-        label = self._next_label
-        self._next_label += 1
-        self._label_map[label] = key
-        self._reverse_label_map[key] = label
-        return label
 
     # --- Similarity helpers ---
 
