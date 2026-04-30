@@ -174,10 +174,20 @@ class TestParseWeights:
         assert result["rhythm"] == SIMILARITY_PRESETS["vibe"]["rhythm"]
 
     def test_returns_dict(self) -> None:
-        """Result is a plain dict with all feature group keys."""
+        """Result is a plain dict with every preset weight key (7 audio groups + 2 metadata)."""
         result = _parse_weights({})
         assert isinstance(result, dict)
-        for key in ("rhythm", "loudness", "timbre", "regularity", "tonal", "dynamics"):
+        for key in (
+            "rhythm",
+            "loudness",
+            "timbre",
+            "regularity",
+            "mood",
+            "tonal",
+            "dynamics",
+            "genre",
+            "era",
+        ):
             assert key in result
 
 

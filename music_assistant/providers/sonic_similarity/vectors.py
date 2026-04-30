@@ -82,10 +82,12 @@ def assemble_vector(analysis: AudioAnalysisData) -> list[float] | None:
     :param analysis: Source audio analysis data.
     :returns: 17-element list of floats, or None if required fields are missing.
     """
-    # Validate all required scalar fields are present and finite
+    # Validate all required scalar fields are present and finite. The isinstance
+    # guard is load-bearing: getattr can return non-numeric junk (e.g. a list
+    # serialized into the wrong column) which would crash math.isnan otherwise.
     for field in VECTOR_FIELDS:
         val = getattr(analysis, field)
-        if val is None or math.isnan(float(val)):
+        if not isinstance(val, (int, float)) or math.isnan(float(val)):
             return None
     if analysis.key is None or analysis.mode is None:
         return None
@@ -97,7 +99,9 @@ def assemble_vector(analysis: AudioAnalysisData) -> list[float] | None:
     for field in OPTIONAL_FIELDS:
         val = getattr(analysis, field, None)
         vec.append(
-            float(val) if val is not None and not math.isnan(float(val)) else OPTIONAL_DEFAULT
+            float(val)
+            if isinstance(val, (int, float)) and not math.isnan(float(val))
+            else OPTIONAL_DEFAULT
         )
 
     # 3 key/mode encoding

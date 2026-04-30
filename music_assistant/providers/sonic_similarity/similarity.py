@@ -22,7 +22,7 @@ def combine_seeds_centroid(
     :raises ValueError: If seeds is empty or weights length mismatches.
     """
     if not seeds:
-        msg = "Cannot compute centroid from at least one seed"
+        msg = "Cannot compute centroid: at least one seed is required"
         raise ValueError(msg)
     if weights is not None and len(weights) != len(seeds):
         msg = f"weights length ({len(weights)}) must match seeds length ({len(seeds)})"

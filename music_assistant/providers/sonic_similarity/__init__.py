@@ -305,7 +305,13 @@ class SonicSimilarityPlugin(PluginProvider):
         self._label_map: dict[int, tuple[str, str]] = {}
         self._reverse_label_map: dict[tuple[str, str], int] = {}
         self._next_label: int = 1
-        self._signature_cache: dict[str, list[float]] = {}
+        # _signature_cache is keyed on (item_id, provider) so a track that
+        # exists in two providers under the same item_id doesn't overwrite
+        # itself. _signatures_by_id is the fallback for the seed-lookup path,
+        # where the API caller only supplies item_id; matches the previous
+        # last-write-wins behavior for cross-provider collisions.
+        self._signature_cache: dict[tuple[str, str], list[float]] = {}
+        self._signatures_by_id: dict[str, list[float]] = {}
         self.corpus_means: list[float] | None = None
         self.corpus_stds: list[float] | None = None
         self._search_index: Any = None
@@ -392,7 +398,7 @@ class SonicSimilarityPlugin(PluginProvider):
         seed_sigs: list[list[float]] = []
         valid_seed_ids: list[str] = []
         for sid in p_item_ids:
-            sig = self._signature_cache.get(sid)
+            sig = self._signatures_by_id.get(sid)
             if sig is not None:
                 seed_sigs.append(sig)
                 valid_seed_ids.append(sid)
@@ -462,7 +468,7 @@ class SonicSimilarityPlugin(PluginProvider):
 
             results: list[tuple[str, str, list[float], float]] = []
             for cand_id, cand_provider, _cos_dist in filtered:
-                cand_features = self._signature_cache.get(cand_id)
+                cand_features = self._signature_cache.get((cand_id, cand_provider))
                 if cand_features is None:
                     continue
                 cand_normalized = normalize_features(cand_features, corpus_means, corpus_stds)
@@ -526,8 +532,8 @@ class SonicSimilarityPlugin(PluginProvider):
 
             original_centroid = combine_seeds_centroid(seed_sigs)
             orig_normalized = normalize_features(original_centroid, corpus_means, corpus_stds)
-            for cid, _prov, displayed_dist, _gen in final_items:
-                cand_features = self._signature_cache.get(cid)
+            for cid, prov, displayed_dist, _gen in final_items:
+                cand_features = self._signature_cache.get((cid, prov))
                 if cand_features is not None:
                     cand_normalized = normalize_features(cand_features, corpus_means, corpus_stds)
                     debug_breakdown_map[cid] = build_debug_breakdown(
@@ -715,7 +721,8 @@ class SonicSimilarityPlugin(PluginProvider):
         # until we atomically swap at the end.
         new_label_map: dict[int, tuple[str, str]] = {}
         new_reverse_label_map: dict[tuple[str, str], int] = {}
-        new_signature_cache: dict[str, list[float]] = {}
+        new_signature_cache: dict[tuple[str, str], list[float]] = {}
+        new_signatures_by_id: dict[str, list[float]] = {}
         next_label = 1
 
         # Collect signatures, deduplicating by (item_id, provider)
@@ -747,7 +754,8 @@ class SonicSimilarityPlugin(PluginProvider):
             new_reverse_label_map[key] = label
             all_features.append(vec)
             row_entries.append((label, vec))
-            new_signature_cache[item_id] = vec
+            new_signature_cache[(item_id, provider)] = vec
+            new_signatures_by_id[item_id] = vec
 
         if not all_features:
             # Help the user diagnose the frustrating "250 rows, 0 signatures" case.
@@ -833,6 +841,7 @@ class SonicSimilarityPlugin(PluginProvider):
         self._reverse_label_map = new_reverse_label_map
         self._next_label = next_label
         self._signature_cache = new_signature_cache
+        self._signatures_by_id = new_signatures_by_id
         self.corpus_means = new_corpus_means
         self.corpus_stds = new_corpus_stds
         self._signatures_since_rebuild = 0
@@ -879,6 +888,13 @@ class SonicSimilarityPlugin(PluginProvider):
 
     # --- Similarity helpers ---
 
+    @staticmethod
+    def _track_genres(track: Track) -> set[str]:
+        """Lower-cased genre set for a track; empty when metadata is absent."""
+        if not track.metadata or not track.metadata.genres:
+            return set()
+        return {g.lower() for g in track.metadata.genres}
+
     async def _apply_metadata_filters(
         self,
         results: list[tuple[str, str, list[float], float, int]],
@@ -900,10 +916,7 @@ class SonicSimilarityPlugin(PluginProvider):
                 continue
 
             if genre_set:
-                track_genres = set()
-                if track.metadata and track.metadata.genres:
-                    track_genres = {g.lower() for g in track.metadata.genres}
-                if not track_genres & genre_set:
+                if not self._track_genres(track) & genre_set:
                     continue
 
             if artist_set:
@@ -936,8 +949,7 @@ class SonicSimilarityPlugin(PluginProvider):
         seed_genres: set[str] = set()
         seed_years: list[int] = []
         for seed_track in seed_tracks:
-            if seed_track.metadata and seed_track.metadata.genres:
-                seed_genres |= set(seed_track.metadata.genres)
+            seed_genres |= self._track_genres(seed_track)
             if isinstance(seed_track.album, Album) and seed_track.album.year:
                 seed_years.append(seed_track.album.year)
         seed_year_avg = sum(seed_years) / len(seed_years) if seed_years else None
@@ -954,9 +966,7 @@ class SonicSimilarityPlugin(PluginProvider):
             genre_weight = weights.get("genre", 0.0)
             year_weight = weights.get("era", 0.0)
             if genre_weight > 0 and seed_genres:
-                cand_genres: set[str] = set()
-                if cand_track.metadata and cand_track.metadata.genres:
-                    cand_genres = cand_track.metadata.genres
+                cand_genres = self._track_genres(cand_track)
                 if cand_genres:
                     intersection = len(seed_genres & cand_genres)
                     union_size = len(seed_genres | cand_genres)
