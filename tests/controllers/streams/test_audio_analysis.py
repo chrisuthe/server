@@ -1,11 +1,4 @@
-"""Tests for the bulk-read helpers on AudioAnalysisController.
-
-get_audio_analysis_count / get_audio_analysis_rows are the single chokepoint
-for "give me everything for this domain" queries that previously lived
-inside AudioAnalysisProvider subclasses. These tests pin the SQL/argument
-shape they emit so providers can rely on stable behavior across schema
-evolution.
-"""
+"""Tests for AudioAnalysisController's bulk-read helpers."""
 
 from __future__ import annotations
 
@@ -22,10 +15,7 @@ def _stub_controller(
     count_result: int = 0,
     list_result: list[dict[str, Any]] | None = None,
 ) -> tuple[AudioAnalysisController, MagicMock]:
-    """Build a bare AudioAnalysisController whose database is mocked.
-
-    :returns: (controller, database_mock).
-    """
+    """Build a bare AudioAnalysisController whose database is mocked."""
     c = AudioAnalysisController.__new__(AudioAnalysisController)
     c.logger = MagicMock()
     db = MagicMock()

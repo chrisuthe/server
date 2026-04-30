@@ -1,30 +1,4 @@
-"""Sonic Analysis provider for Music Assistant.
-
-On-device audio analysis combining two engines driven off a single
-audio load per track:
-
-- librosa-derived measurements (extract_block_features / collapse_to_analysis)
-  producing energy, loudness_integrated/range, brightness,
-  harmonic_complexity, roughness, rhythmic_regularity, rms_energy +
-  spectral_centroid time series.
-
-- Microsoft CLAP zero-shot inference (vendored msclap) producing
-  Platt-calibrated danceability, valence, arousal, instrumentalness,
-  acousticness, plus the raw 1024-dim audio embedding which is persisted
-  under audio_analysis.extra_data["clap_embedding"] for downstream
-  plugins (e.g. sonic_clap) to consume.
-
-This provider previously lived as two separate providers (sonic_analysis
-and clap_analysis). They were merged because each was loading the audio
-file independently — wasteful double I/O for network-attached libraries.
-The merged analyze_file loads once and feeds both feature engines.
-
-Live-playback path (process_pcm_chunk / _finalize via AudioAnalysisController)
-plans target window positions from the track duration at session start,
-selectively buffers only those 7-second slices as PCM streams in, and
-fires per-window CLAP inference off-thread as each window completes.
-Mean-pooled at finalize.
-"""
+"""On-device audio analysis: librosa scalars + Microsoft CLAP zero-shot, one audio load per track."""
 
 from __future__ import annotations
 
@@ -72,34 +46,17 @@ if TYPE_CHECKING:
     from music_assistant.models import ProviderInstanceType
 
 ANALYZE_FILE_SAMPLE_RATE: int = 22050
-# Minimum audio length (1 second) required for meaningful feature extraction.
 ANALYZE_FILE_MIN_SAMPLES: int = 22050
-
 
 BLOCK_SECONDS: int = 10
 OVERLAP_SAMPLES: int = 2048
 
-# Key under audio_analysis.extra_data where the 1024-dim CLAP audio
-# embedding is persisted. Downstream plugins (sonic_clap) read this to
-# build search indexes; sonic_analysis does not own any usearch index.
 EXTRA_DATA_CLAP_EMBEDDING: str = "clap_embedding"
 
-# CLAP's HTSAT audio encoder has a fixed 7-second input at 44.1 kHz —
-# not a knob, architecturally load-bearing. We always feed it exactly
-# one 7s window per call; repeated calls return identical embeddings
-# because we slice deterministically before handing it off (instead of
-# letting the vendored wrapper's random.randrange pick).
+# CLAP's HTSAT audio encoder takes a fixed 7-second input at 44.1 kHz.
 CLAP_WINDOW_SECONDS: int = 7
-# Skip the first 45s of each track (intros, buildups, sparse openers)
-# and sample past that. For Fast (N=1) this lands the single window at
-# [45s, 52s); for multi-window modes this is where the sampled region
-# begins. 45s (vs the original 30s) is more conservative — empirically
-# fewer tracks slip into a window that's still in their intro region.
 CLAP_SKIP_SECONDS: int = 45
 
-# Sampling presets — one enum value in the provider config maps to a
-# window count. More windows → more representative embeddings (mean-
-# pooled) and scalars (mean-pooled logits) at linear CPU cost.
 CLAP_SAMPLING_FAST: str = "fast"
 CLAP_SAMPLING_BALANCED: str = "balanced"
 CLAP_SAMPLING_THOROUGH: str = "thorough"
@@ -164,24 +121,11 @@ async def get_config_entries(
             type=ConfigEntryType.STRING,
             label="CLAP quality (windows per track)",
             description=(
-                "How many 7-second audio windows CLAP analyzes per "
-                "track. Choices are benchmarked against external "
-                "references (Essentia, LAION-CLAP, MERT-based "
-                "Music2Emo) on a 50-track ground-truth set with "
-                "bootstrap confidence intervals. More windows cost "
-                "proportionally more CPU.\n\n"
-                "• Fast — 1 window. Default. Best-measured for "
-                "danceability, arousal, and valence; tied or near-"
-                "tied for the other attributes in most sources.\n"
-                "• Balanced — 3 windows (~2.4x CPU). Slightly "
-                "better at classifying acousticness; a solid all-"
-                "around middle choice.\n"
-                "• Thorough — 8 windows (~6.6x CPU). Meaningfully "
-                "better at instrumentalness classification — vocals "
-                "appear intermittently across a track and a single "
-                "window can miss them if it lands in an instrumental "
-                "bridge. Pick this if 'find me instrumental tracks' "
-                "quality specifically matters to you."
+                "Number of 7-second windows CLAP analyzes per track. "
+                "More windows produce more representative scalars at "
+                "linear CPU cost. Thorough is most useful for "
+                "instrumentalness, where vocals can be missed by a "
+                "single window."
             ),
             default_value=CLAP_SAMPLING_FAST,
             options=[
@@ -195,20 +139,10 @@ async def get_config_entries(
 
 
 def select_clap_window(audio: np.ndarray, source_sr: int) -> np.ndarray | None:
-    """Deterministically select the 7-second slice CLAP will see (single-window).
+    """Return a deterministic 7-second slice for CLAP, or None if audio is shorter than 1s.
 
     :param audio: Mono float32 audio at source_sr.
     :param source_sr: Sample rate of audio in Hz.
-    :returns: The 7-second window (at source_sr) to feed CLAP, or None
-        if audio is too short (< 1s) to be meaningful.
-
-    Selection order:
-      1. Preferred: samples [45s, 52s) — skips typical intros.
-      2. Fallback (track shorter than 52s): the middle 7 seconds.
-      3. Short-track fallback (track shorter than 7s but >= 1s): the
-         whole clip; CLAP's wrapper pads by repeat to reach its fixed
-         7-second input.
-      4. Anything under 1s: return None so the caller skips inference.
     """
     skip_n = CLAP_SKIP_SECONDS * source_sr
     window_n = CLAP_WINDOW_SECONDS * source_sr
@@ -230,16 +164,8 @@ def select_clap_windows(audio: np.ndarray, source_sr: int, n_windows: int) -> li
     :param audio: Mono float32 audio at source_sr.
     :param source_sr: Sample rate of audio in Hz.
     :param n_windows: Target number of windows. >= 1.
-    :returns: List of window arrays (possibly shorter than n_windows if the
-        track is too short). Empty list if audio is too short for CLAP at all.
-
-    For n_windows == 1, delegates to select_clap_window (the "skip 45s,
-    take next 7s" rule with short-track fallback). For n_windows > 1,
-    evenly spaces n_windows window-start positions from the 45s mark to
-    the latest position that still fits a 7s window — so the first
-    window starts at the same place as the single-window rule, and the
-    last ends right at the track's tail. Windows may overlap slightly on
-    short tracks; on long tracks there are gaps between them.
+    :returns: List of window arrays (may be shorter than n_windows for short
+        tracks; empty if audio is too short for CLAP at all).
     """
     if n_windows <= 1:
         single = select_clap_window(audio, source_sr)
@@ -250,9 +176,6 @@ def select_clap_windows(audio: np.ndarray, source_sr: int, n_windows: int) -> li
     usable_start = skip_n
     usable_end = len(audio) - window_n
     if usable_end <= usable_start:
-        # Not enough audio past the intro for multi-window spacing —
-        # fall back to the single-window rule (which handles shorter
-        # tracks via middle-7s / whole-clip fallbacks).
         single = select_clap_window(audio, source_sr)
         return [single] if single is not None else []
 
@@ -265,14 +188,13 @@ def compute_clap_target_starts(
     preset_n: int,
     source_sr: int,
 ) -> list[int]:
-    """Compute deterministic 7-second window start offsets for live CLAP analysis.
+    """Plan deterministic 7s window start offsets for the live CLAP path.
 
     :param track_duration_s: Total track duration in seconds.
-    :param preset_n: Configured number of windows from the CLAP_SAMPLING preset.
+    :param preset_n: Configured window count (Fast/Balanced/Thorough → 1/3/8).
     :param source_sr: Sample rate the live PCM stream is delivered at.
-    :returns: Sample-position offsets at source_sr where each target window
-        begins. Length is the effective N — capped so the requested preset
-        never forces near-duplicate inferences on a short track.
+    :returns: Sample-position offsets at source_sr; length is the effective N
+        (capped at what the track length supports without near-duplicates).
     """
     if track_duration_s < 1.0:
         return []
@@ -305,27 +227,17 @@ def run_clap_inference(
     source_sr: int,
     n_windows: int = 1,
 ) -> tuple[dict[str, float], np.ndarray]:
-    """Run a CLAP forward pass with deterministic multi-window mean pooling.
+    """Run CLAP with deterministic multi-window mean pooling.
 
     :param model: A loaded CLAP wrapper (msclap CLAPWrapper instance).
-    :param text_embeddings: Pre-computed prompt text embeddings (shape
-        [2*len(prompt_order), d_proj]), ordered pos/neg/pos/neg/... per
-        prompt pair.
+    :param text_embeddings: Pre-computed prompt text embeddings, ordered
+        pos/neg/pos/neg per prompt pair.
     :param prompt_order: List of (scalar_name, (pos_prompt, neg_prompt))
-        tuples in the same order the text_embeddings were computed.
+        tuples in the same order text_embeddings were computed.
     :param audio: Mono float32 audio at source_sr.
     :param source_sr: Sample rate of audio in Hz.
     :param n_windows: Number of 7s windows to sample and mean-pool.
-    :returns: Tuple of (scalar_dict, 1024-dim mean-pooled audio embedding).
-
-    Module-level so both the provider's live/analyze_file paths and the
-    clap-spike eval harness can call the same code. Windows are sliced
-    deterministically via select_clap_windows, fed as one batch to the
-    CLAP audio encoder, and the resulting per-window embeddings are
-    mean-pooled + L2-renormalized so cosine similarity in downstream
-    indexes (sonic_clap) is well-defined. Per-window similarity logits
-    are also mean-pooled before Platt calibration, so the scalars
-    reflect the whole sampled region rather than any single window.
+    :returns: (scalar_dict, 1024-dim L2-normalized mean embedding).
     """
     windows = select_clap_windows(audio, source_sr, n_windows)
     if not windows:
@@ -335,7 +247,6 @@ def run_clap_inference(
     window_tensors = [torch.from_numpy(w).to(dtype=torch.float32) for w in windows]
     audio_embs = model.get_audio_embeddings_from_tensor(window_tensors, source_sr)
     similarities = model.compute_similarity(audio_embs, text_embeddings)
-    # audio_embs shape (N, d_proj); similarities shape (N, 2 * len(prompt_order))
 
     mean_sim = similarities.mean(dim=0).detach().cpu()
     scalars: dict[str, float] = {}
@@ -364,13 +275,11 @@ def _dispatch_clap_chunk(
     decoded_audio: np.ndarray,
     source_sr: int,
 ) -> list[np.ndarray]:
-    """Append a PCM chunk to active CLAP target windows; return any windows completed.
+    """Route a PCM chunk to active CLAP target windows; return any windows completed.
 
-    :param session: Active analysis session whose target buffers are mutated in place.
+    :param session: Active session; target buffers are mutated in place.
     :param decoded_audio: Mono float32 PCM chunk at source_sr.
     :param source_sr: Sample rate of decoded_audio.
-    :returns: Audio arrays for windows that completed during this call, in
-        target-list order. Caller is responsible for spawning inference.
     """
     if not session.clap_target_starts:
         return []
@@ -408,9 +317,6 @@ def _pcm_bytes_to_audio(audio_format: AudioFormat, pcm_chunk: bytes) -> np.ndarr
     :param audio_format: The audio format describing the PCM data.
     :param pcm_chunk: Raw PCM audio data.
     """
-    # Copied from smart_fades.helpers.decode_pcm_chunk_to_mono pending a
-    # shared helper. content_type is the canonical dispatch field —
-    # bit_depth alone collapses int32 vs float32 incorrectly.
     content_type = audio_format.content_type
     writable = bytearray(pcm_chunk)
 
@@ -440,21 +346,10 @@ def _pcm_bytes_to_audio(audio_format: AudioFormat, pcm_chunk: bytes) -> np.ndarr
 
 
 class SonicAnalysisProvider(AudioAnalysisProvider):
-    """Provider that extracts sonic features from audio streams.
-
-    On file-based analysis (analyze_file), loads the audio once and runs
-    both the librosa-based feature pipeline and Microsoft CLAP zero-shot
-    inference against the same audio tensor. On live playback, only the
-    librosa pipeline participates — CLAP is too expensive per-track for
-    real-time, and its outputs are better filled in via the background
-    scan when the track gets enqueued.
-    """
+    """Audio analysis provider running librosa scalars + CLAP zero-shot per track."""
 
     analysis_version: int = 1
 
-    # CLAP state — loaded in handle_async_init when the provider is enabled.
-    # Graceful degradation: if load fails, librosa-only mode is still
-    # fully functional.
     _clap_model: Any = None
     _clap_text_embeddings: Any = None
 
@@ -501,15 +396,7 @@ class SonicAnalysisProvider(AudioAnalysisProvider):
     def _load_clap(
         self,
     ) -> tuple[Any, Any, list[tuple[str, tuple[str, str]]]]:
-        """Construct the CLAP audio encoder and load prompt text embeddings.
-
-        Always prefers the shipped precomputed prompt embeddings (skips
-        the ~500MB GPT2 text encoder download). Falls back to a full live
-        load if the cache is missing or its prompts-hash drifts from the
-        current SCALAR_PROMPT_PAIRS.
-
-        :returns: (model, text_embedding_matrix, prompt_order)
-        """
+        """Return (model, text_embedding_matrix, prompt_order); prefers cached prompt .npz."""
         from .vendored_clap import CLAP  # noqa: PLC0415
 
         prompt_order: list[tuple[str, tuple[str, str]]] = list(SCALAR_PROMPT_PAIRS.items())
@@ -562,11 +449,7 @@ class SonicAnalysisProvider(AudioAnalysisProvider):
         await super().unload(is_removed)
 
     async def _handle_status(self) -> dict[str, Any]:
-        """Return a snapshot of the analysis provider's runtime state.
-
-        :returns: Dict with provider_loaded, clap_model_loaded,
-            analyzed_tracks_count, analysis_version.
-        """
+        """Return a snapshot of the provider's runtime state."""
         analyzed_tracks_count = await self.mass.streams.audio_analysis.get_audio_analysis_count(
             self.domain
         )
@@ -583,7 +466,7 @@ class SonicAnalysisProvider(AudioAnalysisProvider):
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:
-        """Return paginated list of tracks analyzed by this provider.
+        """Return a paginated list of tracks analyzed by this provider.
 
         :param search: Optional case-insensitive substring filter on item_id.
         :param limit: Max results per page.
@@ -623,7 +506,7 @@ class SonicAnalysisProvider(AudioAnalysisProvider):
         limit: int = 100,
         offset: int = 0,
     ) -> dict[str, Any]:
-        """Export analyzed tracks with their full scalar analysis data.
+        """Return a paginated dump of analyzed tracks with their scalar fields.
 
         :param limit: Max tracks per page.
         :param offset: Pagination offset.
@@ -701,10 +584,10 @@ class SonicAnalysisProvider(AudioAnalysisProvider):
         streamdetails: StreamDetails,
         audio_format: AudioFormat,
     ) -> bool:
-        """Initialize a new sonic analysis session.
+        """Initialize a new analysis session.
 
-        :param session_id: Unique session ID created by the controller.
-        :param streamdetails: Details about the stream being analyzed.
+        :param session_id: Unique session ID from the controller.
+        :param streamdetails: Stream details for the item being analyzed.
         :param audio_format: PCM format of the audio stream.
         """
         bytes_per_sample = audio_format.bit_depth // 8
@@ -762,7 +645,7 @@ class SonicAnalysisProvider(AudioAnalysisProvider):
         session_id: str,
         pcm_chunk: bytes,
     ) -> None:
-        """Accumulate PCM and extract features when a 10-second block is full.
+        """Accumulate PCM and run feature extraction once a 10-second block is full.
 
         :param session_id: The analysis session ID.
         :param pcm_chunk: Raw PCM audio data.
@@ -844,7 +727,7 @@ class SonicAnalysisProvider(AudioAnalysisProvider):
         )
 
     async def _finalize(self, session_id: str) -> None:
-        """Process remaining PCM, collapse features, and store analysis data.
+        """Flush remaining PCM, collapse features, and store analysis data.
 
         :param session_id: The analysis session ID.
         """
@@ -855,7 +738,6 @@ class SonicAnalysisProvider(AudioAnalysisProvider):
         sd = session.streamdetails
         af = session.audio_format
 
-        # Flush any remaining PCM as a final partial block
         if session.pcm_buffer:
             audio = _pcm_bytes_to_audio(af, bytes(session.pcm_buffer))
             session.total_samples += len(audio)
@@ -878,7 +760,6 @@ class SonicAnalysisProvider(AudioAnalysisProvider):
             collapse_to_analysis, session.accumulated, af.sample_rate
         )
 
-        # Fill in fields that need session-level state
         analysis.duration = session.total_samples / af.sample_rate
         if session.peak_absolute > 0:
             analysis.true_peak = float(20.0 * np.log10(session.peak_absolute))
@@ -904,22 +785,7 @@ class SonicAnalysisProvider(AudioAnalysisProvider):
         )
 
     async def analyze_file(self, streamdetails: StreamDetails) -> AudioAnalysisData | None:
-        """Run sonic analysis on a local audio file for the background scan.
-
-        Loads the audio file ONCE (via librosa at 22050 Hz mono) and drives
-        both engines:
-
-        1. librosa-based measurement pipeline → energy, loudness, brightness,
-           harmonic_complexity, roughness, rhythmic_regularity, rms_energy
-           and spectral_centroid time series.
-
-        2. Microsoft CLAP zero-shot → danceability, valence, arousal,
-           instrumentalness, acousticness (if CLAP model loaded successfully).
-
-        If CLAP is unavailable (load failed, transformers missing, etc.) the
-        librosa features are still populated and the CLAP fields are left
-        None. The overlay system in sonic_similarity handles None fields
-        gracefully via the usual "missing field → skip track" path.
+        """Run sonic analysis on a local file for the background scan.
 
         :param streamdetails: StreamDetails pointing at a local file path.
         """
@@ -947,10 +813,6 @@ class SonicAnalysisProvider(AudioAnalysisProvider):
         if len(audio) < ANALYZE_FILE_MIN_SAMPLES:
             return None
 
-        # librosa feature path: torch-accelerated per-block extraction +
-        # scalar/time-series collapse. Fields computed here: energy,
-        # loudness, brightness, harmonic_complexity, roughness,
-        # rhythmic_regularity, rms_energy, spectral_centroid.
         bf = await asyncio.to_thread(extract_block_features, audio, ANALYZE_FILE_SAMPLE_RATE)
         if bf is None:
             return None
@@ -959,12 +821,6 @@ class SonicAnalysisProvider(AudioAnalysisProvider):
         peak = float(np.max(np.abs(audio)))
         analysis.true_peak = float(20.0 * np.log10(peak)) if peak > 0 else -96.0
 
-        # CLAP zero-shot path: runs on the SAME pre-loaded audio tensor,
-        # no second file read. Gracefully skipped when the model failed
-        # to load (logged at startup). We feed CLAP exactly one 7-second
-        # deterministic window (seconds 45-52 of the track, or a
-        # short-track fallback) — eliminates the vendored wrapper's
-        # random slicing so the stored embedding is repeatable.
         if self._clap_model is not None:
             window = select_clap_window(audio, ANALYZE_FILE_SAMPLE_RATE)
             if window is not None:
@@ -991,11 +847,11 @@ class SonicAnalysisProvider(AudioAnalysisProvider):
         audio_np: np.ndarray,
         source_sr: int = ANALYZE_FILE_SAMPLE_RATE,
     ) -> tuple[dict[str, float], np.ndarray]:
-        """Run CLAP inference on pre-loaded audio using the configured preset.
+        """Run CLAP on pre-loaded audio using the configured preset.
 
         :param audio_np: Mono float32 audio at source_sr.
         :param source_sr: Sample rate of audio_np.
-        :returns: Tuple of (scalar dict, 1024-dim mean-pooled audio embedding).
+        :returns: (scalar dict, 1024-dim mean-pooled audio embedding).
         """
         preset = str(self.config.get_value(CONF_CLAP_SAMPLING, CLAP_SAMPLING_FAST))
         n_windows = CLAP_WINDOW_COUNTS.get(preset, 1)
