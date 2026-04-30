@@ -23,12 +23,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from music_assistant_models.errors import MusicAssistantError
 from music_assistant_models.media_items import Album
 
 from music_assistant.helpers.json import json_loads
 from music_assistant.models.audio_analysis import AudioAnalysisData
 from music_assistant.models.plugin import PluginProvider
 from music_assistant.providers.sonic_similarity.similarity import (
+    Candidate,
     apply_mmr,
     combine_seeds_centroid,
     expand_recursive,
@@ -343,11 +345,22 @@ class SonicSimilarityPlugin(PluginProvider):
         )
 
     async def unload(self, is_removed: bool = False) -> None:
-        """Unregister API commands."""
+        """Unregister API commands; delete on-disk indexes when the provider is uninstalled."""
         for unregister in self._unregister_handles:
             unregister()
         self._unregister_handles.clear()
+        if is_removed:
+            self._search_index = None
+            await asyncio.to_thread(self._delete_all_index_files)
         await super().unload(is_removed)
+
+    def _delete_all_index_files(self) -> None:
+        """Best-effort removal of every versioned index file for the active domain."""
+        for path in self._existing_index_files():
+            try:
+                path.unlink()
+            except OSError as err:
+                self.logger.debug("Could not unlink %s during uninstall: %s", path, err)
 
     # --- API handlers ---
 
@@ -415,6 +428,12 @@ class SonicSimilarityPlugin(PluginProvider):
         corpus_means = self.corpus_means
         corpus_stds = self.corpus_stds
 
+        # Centroid of the original (outer-scope) seed_sigs is invariant across
+        # generations of the recursive search and reused by MMR / debug paths;
+        # compute once and capture in the closure.
+        original_centroid = combine_seeds_centroid(seed_sigs)
+        orig_normalized = normalize_features(original_centroid, corpus_means, corpus_stds)
+
         def _search_generation(
             seeds: list[list[float]],
             seen: set[str],
@@ -463,9 +482,6 @@ class SonicSimilarityPlugin(PluginProvider):
             )
             filtered = apply_filters(raw_tuples, seed_id_set | seen, exclude_set, filter_prov_set)
 
-            original_centroid = combine_seeds_centroid(seed_sigs)
-            orig_normalized = normalize_features(original_centroid, corpus_means, corpus_stds)
-
             results: list[tuple[str, str, list[float], float]] = []
             for cand_id, cand_provider, _cos_dist in filtered:
                 cand_features = self._signature_cache.get((cand_id, cand_provider))
@@ -500,11 +516,9 @@ class SonicSimilarityPlugin(PluginProvider):
             )
 
         if params["diversity"] > 0:
-            original_centroid = combine_seeds_centroid(seed_sigs)
-            orig_normalized = normalize_features(original_centroid, corpus_means, corpus_stds)
             mmr_candidates = [
-                (r[0], normalize_features(r[2], corpus_means, corpus_stds), r[3])
-                for r in raw_results
+                (c.item_id, normalize_features(c.features, corpus_means, corpus_stds), c.distance)
+                for c in raw_results
             ]
             mmr_result = apply_mmr(
                 mmr_candidates,
@@ -513,21 +527,19 @@ class SonicSimilarityPlugin(PluginProvider):
                 params["limit"],
                 weights=weights,
             )
-            result_lookup = {r[0]: r for r in raw_results}
+            result_lookup = {c.item_id: c for c in raw_results}
             final_items: list[tuple[str, str, float, int]] = [
-                (cid, result_lookup[cid][1], dist, result_lookup[cid][4])
+                (cid, result_lookup[cid].provider, dist, result_lookup[cid].generation)
                 for cid, dist in mmr_result
             ]
         else:
-            raw_results.sort(key=lambda x: x[3])
-            final_items = [(r[0], r[1], r[3], r[4]) for r in raw_results]
+            raw_results.sort(key=lambda c: c.distance)
+            final_items = [(c.item_id, c.provider, c.distance, c.generation) for c in raw_results]
 
         final_items = final_items[: params["limit"]]
 
         debug_breakdown_map: dict[str, dict[str, Any]] = {}
         if include_group_distances:
-            original_centroid = combine_seeds_centroid(seed_sigs)
-            orig_normalized = normalize_features(original_centroid, corpus_means, corpus_stds)
             for cid, prov, displayed_dist, _gen in final_items:
                 cand_features = self._signature_cache.get((cid, prov))
                 if cand_features is not None:
@@ -895,10 +907,10 @@ class SonicSimilarityPlugin(PluginProvider):
 
     async def _apply_metadata_filters(
         self,
-        results: list[tuple[str, str, list[float], float, int]],
+        results: list[Candidate],
         filter_genres: list[str] | None = None,
         exclude_artists: list[str] | None = None,
-    ) -> list[tuple[str, str, list[float], float, int]]:
+    ) -> list[Candidate]:
         """Apply metadata-based filters that require track resolution."""
         if not filter_genres and not exclude_artists:
             return results
@@ -906,11 +918,14 @@ class SonicSimilarityPlugin(PluginProvider):
         genre_set = {g.lower() for g in filter_genres} if filter_genres else None
         artist_set = {a.lower() for a in exclude_artists} if exclude_artists else None
 
-        filtered: list[tuple[str, str, list[float], float, int]] = []
-        for item_id, provider, features, dist, gen in results:
+        filtered: list[Candidate] = []
+        for cand in results:
             try:
-                track = await self.mass.music.tracks.get(item_id, provider)
-            except Exception:  # noqa: S112
+                track = await self.mass.music.tracks.get(cand.item_id, cand.provider)
+            except MusicAssistantError as err:
+                self.logger.debug(
+                    "Skipping %s/%s during filter: %s", cand.provider, cand.item_id, err
+                )
                 continue
 
             if genre_set:
@@ -922,15 +937,15 @@ class SonicSimilarityPlugin(PluginProvider):
                 if track_artists & artist_set:
                     continue
 
-            filtered.append((item_id, provider, features, dist, gen))
+            filtered.append(cand)
         return filtered
 
     async def _apply_metadata_reranking(
         self,
         seed_item_ids: list[str],
-        results: list[tuple[str, str, list[float], float, int]],
+        results: list[Candidate],
         weights: dict[str, float],
-    ) -> list[tuple[str, str, list[float], float, int]]:
+    ) -> list[Candidate]:
         """Apply genre and year bonuses to re-rank candidates.
 
         :param seed_item_ids: All seed track ids — genres are unioned across
@@ -952,13 +967,14 @@ class SonicSimilarityPlugin(PluginProvider):
                 seed_years.append(seed_track.album.year)
         seed_year_avg = sum(seed_years) / len(seed_years) if seed_years else None
 
-        scored: list[tuple[str, str, list[float], float, int]] = []
-        for item_id, provider, features, dist, gen in results:
+        scored: list[Candidate] = []
+        for cand in results:
             bonus = 0.0
             try:
-                cand_track: Track = await self.mass.music.tracks.get(item_id, provider)
-            except Exception:
-                scored.append((item_id, provider, features, dist, gen))
+                cand_track: Track = await self.mass.music.tracks.get(cand.item_id, cand.provider)
+            except MusicAssistantError as err:
+                self.logger.debug("Skipping rerank for %s/%s: %s", cand.provider, cand.item_id, err)
+                scored.append(cand)
                 continue
 
             genre_weight = weights.get("genre", 0.0)
@@ -979,9 +995,9 @@ class SonicSimilarityPlugin(PluginProvider):
                     year_diff = abs(seed_year_avg - cand_year)
                     bonus -= METADATA_BONUS_SCALE * year_weight * (1.0 / (1.0 + year_diff * 0.1))
 
-            scored.append((item_id, provider, features, dist + bonus, gen))
+            scored.append(cand._replace(distance=cand.distance + bonus))
 
-        scored.sort(key=lambda x: x[3])
+        scored.sort(key=lambda c: c.distance)
         return scored
 
     async def _resolve_seed_track(self, seed_item_id: str) -> Track | None:
@@ -989,7 +1005,8 @@ class SonicSimilarityPlugin(PluginProvider):
         seed_prov = self._provider_by_item_id.get(seed_item_id, "library")
         try:
             return await self.mass.music.tracks.get(seed_item_id, seed_prov)
-        except Exception:
+        except MusicAssistantError as err:
+            self.logger.debug("Could not resolve seed %s/%s: %s", seed_prov, seed_item_id, err)
             return None
 
     async def _resolve_results(
@@ -1021,7 +1038,8 @@ class SonicSimilarityPlugin(PluginProvider):
                 artists = ", ".join(a.name for a in getattr(track, "artists", []) or [])
                 entry["name"] = track.name
                 entry["artist"] = artists
-            except Exception:
+            except MusicAssistantError as err:
+                self.logger.debug("Could not resolve %s/%s for output: %s", provider, item_id, err)
                 entry["name"] = "(unknown)"
                 entry["artist"] = ""
             if debug_breakdown_map and item_id in debug_breakdown_map:

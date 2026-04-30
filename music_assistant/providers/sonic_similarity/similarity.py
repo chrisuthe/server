@@ -7,10 +7,21 @@ All functions operate on plain lists of floats and numpy arrays.
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import NamedTuple
 
 import numpy as np
 
 from .vectors import compute_weighted_distance
+
+
+class Candidate(NamedTuple):
+    """A search-result candidate carrying its raw feature vector, distance, and generation index."""
+
+    item_id: str
+    provider: str
+    features: list[float]
+    distance: float
+    generation: int
 
 
 def combine_seeds_centroid(
@@ -149,33 +160,34 @@ def expand_recursive(
     ],
     depth: int,
     branch_factor: int,
-) -> list[tuple[str, str, list[float], float, int]]:
+) -> list[Candidate]:
     """Expand similarity search across multiple generations.
 
     :param initial_seeds: Seed signature vectors for generation 0.
     :param searcher: Callback that takes (seed_vectors, seen_ids) and returns
-        list of (item_id, provider, features, distance).
+        list of (item_id, provider, features, distance) — generation index is
+        added by this function.
     :param depth: Number of generations to run.
     :param branch_factor: How many top results from each generation become seeds.
     """
-    all_results: list[tuple[str, str, list[float], float, int]] = []
+    all_results: list[Candidate] = []
     seen: set[str] = set()
     current_seeds = initial_seeds
 
     for gen in range(depth):
         gen_results = searcher(current_seeds, seen)
-        new_results: list[tuple[str, str, list[float], float]] = []
+        gen_candidates: list[Candidate] = []
         for item_id, provider, features, dist in gen_results:
             if item_id not in seen:
                 seen.add(item_id)
-                new_results.append((item_id, provider, features, dist))
-                all_results.append((item_id, provider, features, dist, gen))
+                cand = Candidate(item_id, provider, features, dist, gen)
+                gen_candidates.append(cand)
+                all_results.append(cand)
 
-        if not new_results or gen == depth - 1:
+        if not gen_candidates or gen == depth - 1:
             break
 
-        new_results.sort(key=lambda x: x[3])
-        next_seeds = [features for _, _, features, _ in new_results[:branch_factor]]
-        current_seeds = next_seeds
+        gen_candidates.sort(key=lambda c: c.distance)
+        current_seeds = [c.features for c in gen_candidates[:branch_factor]]
 
     return all_results
