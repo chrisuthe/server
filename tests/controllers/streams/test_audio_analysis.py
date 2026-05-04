@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import datetime
-import time
 from collections.abc import AsyncGenerator
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -284,7 +282,7 @@ async def test_distribute_chunk_calls_all_providers() -> None:
 
 @pytest.mark.asyncio
 async def test_distribute_chunk_evicts_provider_on_timeout() -> None:
-    """A provider whose process_pcm_chunk exceeds CHUNK_PROCESS_TIMEOUT is evicted."""
+    """A provider whose process_pcm_chunk exceeds CHUNK_PROCESS_TIMEOUT_SECONDS is evicted."""
     controller = _make_controller()
     session_key = "track://provider/abc"
     controller._active_sessions[session_key] = {"slow", "fast"}
@@ -297,7 +295,7 @@ async def test_distribute_chunk_evicts_provider_on_timeout() -> None:
     provider_map = {"slow": slow, "fast": fast}
     controller.mass.get_provider = MagicMock(side_effect=provider_map.get)  # type: ignore[method-assign]
 
-    with patch.object(audio_analysis_mod, "CHUNK_PROCESS_TIMEOUT", 0.05):
+    with patch.object(audio_analysis_mod, "CHUNK_PROCESS_TIMEOUT_SECONDS", 0.05):
         await controller._distribute_chunk(session_key, b"\x00" * 1024)
 
     assert "slow" not in controller._active_sessions[session_key]
@@ -350,9 +348,21 @@ async def test_get_scan_concurrency_clamps_to_min() -> None:
     assert controller._get_scan_concurrency() == 1
 
 
+def _make_stream_mock(chunks: list[bytes]) -> object:
+    """Return a get_media_stream mock that yields the given chunks."""
+
+    async def _stream(
+        _streamdetails: object, _pcm_format: object, **_kwargs: object
+    ) -> AsyncGenerator[bytes, None]:
+        for chunk in chunks:
+            yield chunk
+
+    return _stream
+
+
 @pytest.mark.asyncio
-async def test_background_streaming_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Ffmpeg chunks reach providers; session is cleaned up on clean EOF."""
+async def test_background_streaming_happy_path() -> None:
+    """PCM chunks reach providers; session is cleaned up on clean EOF."""
     controller = _make_controller()
     streamdetails = _make_streamdetails(path="/music/test.flac")
     p = _make_aa_provider("p1", available=True)
@@ -361,12 +371,7 @@ async def test_background_streaming_happy_path(monkeypatch: pytest.MonkeyPatch) 
     controller.mass.get_provider = MagicMock(return_value=p)  # type: ignore[method-assign]
 
     fake_chunks = [b"\x00\x01" * 512 for _ in range(5)]
-    fake_ffmpeg = _FakeFFMpeg(chunks=fake_chunks, returncode=0)
-
-    monkeypatch.setattr(
-        "music_assistant.controllers.streams.audio_analysis.FFMpeg",
-        lambda **_: fake_ffmpeg,
-    )
+    controller.mass.streams.audio.get_media_stream = _make_stream_mock(fake_chunks)  # type: ignore[method-assign,assignment]
 
     await controller._run_background_streaming_for_track(streamdetails, [p])
 
@@ -390,56 +395,44 @@ async def test_background_streaming_per_track_timeout(monkeypatch: pytest.Monkey
     p.process_pcm_chunk = AsyncMock(side_effect=_hang_chunk)
     controller.mass.get_provider = MagicMock(return_value=p)  # type: ignore[method-assign]
 
-    fake_ffmpeg = _FakeFFMpeg(chunks=[b"\x00" * 1024] * 50, returncode=0)
-    monkeypatch.setattr(
-        "music_assistant.controllers.streams.audio_analysis.FFMpeg",
-        lambda **_: fake_ffmpeg,
-    )
-
+    controller.mass.streams.audio.get_media_stream = _make_stream_mock([b"\x00" * 1024] * 50)  # type: ignore[method-assign,assignment]
     monkeypatch.setattr(audio_analysis_mod, "BACKGROUND_PER_TRACK_TIMEOUT_SECONDS", 0.2)
 
     await controller._run_background_streaming_for_track(streamdetails, [p])
 
     assert streamdetails.uri not in controller._active_sessions
+    # Per-track timeout must be surfaced to the TasksController so the run ends
+    # as PARTIAL_SUCCESS with a retryable status.
+    controller.mass.tasks.add_task_failure.assert_called_once()  # type: ignore[attr-defined]
+    failure_args = controller.mass.tasks.add_task_failure.call_args.args  # type: ignore[attr-defined]
+    assert failure_args[0] == audio_analysis_mod.BACKGROUND_SCAN_TASK_ID
+    assert "Timed out" in failure_args[1]
+    assert streamdetails.uri in failure_args[1]
 
 
 @pytest.mark.asyncio
-async def test_background_streaming_ffmpeg_startup_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Ffmpeg startup failure cancels providers cleanly without raising."""
+async def test_background_streaming_ffmpeg_startup_failure() -> None:
+    """get_media_stream failure cancels providers cleanly without raising."""
     controller = _make_controller()
     streamdetails = _make_streamdetails(path="/nonexistent.flac")
     p = _make_aa_provider("p1", available=True)
     p.start_analysis = AsyncMock(return_value=True)
     controller.mass.get_provider = MagicMock(return_value=p)  # type: ignore[method-assign]
 
-    def _ffmpeg_fail(**_kwargs: object) -> None:
+    def _failing_stream(*_args: object, **_kwargs: object) -> AsyncGenerator[bytes, None]:
         raise RuntimeError("ffmpeg startup failed")
 
-    monkeypatch.setattr("music_assistant.controllers.streams.audio_analysis.FFMpeg", _ffmpeg_fail)
+    controller.mass.streams.audio.get_media_stream = _failing_stream  # type: ignore[method-assign]
 
     # Should not raise
     await controller._run_background_streaming_for_track(streamdetails, [p])
     assert streamdetails.uri not in controller._active_sessions
-
-
-class _FakeFFMpeg:
-    """Minimal FFMpeg stand-in for tests."""
-
-    def __init__(self, chunks: list[bytes], returncode: int = 0) -> None:
-        self._chunks = chunks
-        self.returncode = returncode
-        self.concat_error = None
-        self.log_history: list[str] = []
-
-    async def __aenter__(self) -> _FakeFFMpeg:
-        return self
-
-    async def __aexit__(self, *_: object) -> None:
-        return None
-
-    async def iter_chunked(self, _chunk_size: int) -> AsyncGenerator[bytes, None]:
-        for chunk in self._chunks:
-            yield chunk
+    # Per-track exception must be surfaced to the TasksController.
+    controller.mass.tasks.add_task_failure.assert_called_once()  # type: ignore[attr-defined]
+    failure_args = controller.mass.tasks.add_task_failure.call_args.args  # type: ignore[attr-defined]
+    assert failure_args[0] == audio_analysis_mod.BACKGROUND_SCAN_TASK_ID
+    assert "Failed" in failure_args[1]
+    assert "ffmpeg startup failed" in failure_args[1]
 
 
 def _make_streamdetails(*, path: str, item_id: str = "test-item") -> MagicMock:
@@ -529,7 +522,8 @@ async def test_run_background_scan_uses_union_candidate_query(
 async def test_find_candidates_handles_sqlite_row_without_get(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """_find_candidates_missing_analysis must use __getitem__ not .get() on rows.
+    """
+    _find_candidates_missing_analysis must use __getitem__ not .get() on rows.
 
     sqlite3.Row supports only __getitem__, not .get(). This regression test
     uses a row class that lacks .get() to ensure we never reintroduce the bug.
@@ -559,19 +553,14 @@ async def test_find_candidates_handles_sqlite_row_without_get(
         def __getitem__(self, key: str) -> object:
             return self._d[key]
 
+    # SQL filters out fully-covered tracks via NOT EXISTS + GROUP BY, so the
+    # rows we receive from the database only contain missing-domain pairs.
     rows = [
         _RowNoGet(
             {
                 "item_id": "track-1",
                 "provider_instance": "filesystem_local",
-                "covered_domains": None,  # no analysis yet
-            }
-        ),
-        _RowNoGet(
-            {
-                "item_id": "track-2",
-                "provider_instance": "filesystem_local",
-                "covered_domains": "loudness_analysis",  # already covered
+                "missing_domains": "loudness_analysis",
             }
         ),
     ]
@@ -579,8 +568,6 @@ async def test_find_candidates_handles_sqlite_row_without_get(
 
     result = await controller._find_candidates_missing_analysis(["loudness_analysis"], 100)
 
-    # track-1 is missing loudness_analysis → included
-    # track-2 is already covered → excluded
     assert len(result) == 1
     assert result[0]["item_id"] == "track-1"
     assert result[0]["missing_domains"] == ["loudness_analysis"]
@@ -643,188 +630,38 @@ async def test_run_background_scan_concurrency_semaphore(
     assert max_in_flight == 2
 
 
-# ---------------------------------------------------------------------------
-# _get_scan_start_hour / _get_scan_end_hour
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
-async def test_get_scan_start_hour_returns_default_on_unset() -> None:
-    """When the config read raises, fall back to DEFAULT_BACKGROUND_SCAN_START_HOUR (0)."""
-    controller = _make_controller()
-    controller.mass.config.get_raw_core_config_value = MagicMock(  # type: ignore[method-assign]
-        side_effect=Exception("no config")
-    )
-    assert controller._get_scan_start_hour() == 0
-
-
-@pytest.mark.asyncio
-async def test_get_scan_start_hour_clamps_to_max() -> None:
-    """Values above 23 are clamped to 23."""
-    controller = _make_controller()
-    controller.mass.config.get_raw_core_config_value = MagicMock(return_value=99)  # type: ignore[method-assign]
-    assert controller._get_scan_start_hour() == 23
-
-
-@pytest.mark.asyncio
-async def test_get_scan_start_hour_clamps_to_min() -> None:
-    """Values below 0 are clamped to 0."""
-    controller = _make_controller()
-    controller.mass.config.get_raw_core_config_value = MagicMock(return_value=-5)  # type: ignore[method-assign]
-    assert controller._get_scan_start_hour() == 0
-
-
-@pytest.mark.asyncio
-async def test_get_scan_end_hour_returns_default_on_error() -> None:
-    """When config read raises, fall back to DEFAULT_BACKGROUND_SCAN_END_HOUR (6)."""
-    controller = _make_controller()
-    controller.mass.config.get_raw_core_config_value = MagicMock(  # type: ignore[method-assign]
-        side_effect=Exception("no config")
-    )
-    assert controller._get_scan_end_hour() == 6
-
-
-@pytest.mark.asyncio
-async def test_get_scan_end_hour_clamps_to_max() -> None:
-    """Values above 23 are clamped to 23."""
-    controller = _make_controller()
-    controller.mass.config.get_raw_core_config_value = MagicMock(return_value=99)  # type: ignore[method-assign]
-    assert controller._get_scan_end_hour() == 23
-
-
-@pytest.mark.asyncio
-async def test_get_scan_end_hour_clamps_to_min() -> None:
-    """Values below 0 are clamped to 0."""
-    controller = _make_controller()
-    controller.mass.config.get_raw_core_config_value = MagicMock(return_value=-1)  # type: ignore[method-assign]
-    assert controller._get_scan_end_hour() == 0
-
-
-# ---------------------------------------------------------------------------
-# _compute_scan_deadline_monotonic
-# ---------------------------------------------------------------------------
-
-_FAKE_DATETIME_PATH = "music_assistant.controllers.streams.audio_analysis.datetime"
-
-
-@pytest.mark.asyncio
-async def test_compute_scan_deadline_same_day_window(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Same-day window: deadline is > now and within 24 hours."""
-    controller = _make_controller()
-    monkeypatch.setattr(controller, "_get_scan_start_hour", lambda: 0)
-    monkeypatch.setattr(controller, "_get_scan_end_hour", lambda: 6)
-
-    # Simulate 2 AM — end_hour=6 is still in the future today
-    fake_now = datetime.datetime(2025, 1, 15, 2, 0, 0)  # noqa: DTZ001
-    with patch(_FAKE_DATETIME_PATH) as mock_dt:
-        mock_dt.datetime.now.return_value = fake_now
-        mock_dt.timedelta = datetime.timedelta
-
-        before = time.monotonic()
-        deadline = controller._compute_scan_deadline_monotonic()
-        after = time.monotonic()
-
-    assert deadline > after  # deadline is in the future
-    assert deadline <= before + 24 * 3600  # within 24 hours
-
-
-@pytest.mark.asyncio
-async def test_compute_scan_deadline_wrap_around_at_4am(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Wrap-around window (start=22, end=6): at 4 AM, deadline is today's 6 AM."""
-    controller = _make_controller()
-    monkeypatch.setattr(controller, "_get_scan_start_hour", lambda: 22)
-    monkeypatch.setattr(controller, "_get_scan_end_hour", lambda: 6)
-
-    # Simulate 4 AM — end_hour=6 is still in the future today
-    fake_now = datetime.datetime(2025, 1, 15, 4, 0, 0)  # noqa: DTZ001
-    with patch(_FAKE_DATETIME_PATH) as mock_dt:
-        mock_dt.datetime.now.return_value = fake_now
-        mock_dt.timedelta = datetime.timedelta
-
-        before = time.monotonic()
-        deadline = controller._compute_scan_deadline_monotonic()
-
-    # From 4:00 to 6:00 = 2 hours = 7200 seconds
-    expected_seconds = 2 * 3600
-    assert abs((deadline - before) - expected_seconds) < 5  # within 5 seconds tolerance
-
-
-@pytest.mark.asyncio
-async def test_compute_scan_deadline_start_equals_end(monkeypatch: pytest.MonkeyPatch) -> None:
-    """When start_hour == end_hour, deadline is exactly 24 hours from now."""
-    controller = _make_controller()
-    monkeypatch.setattr(controller, "_get_scan_start_hour", lambda: 3)
-    monkeypatch.setattr(controller, "_get_scan_end_hour", lambda: 3)
-
-    before = time.monotonic()
-    deadline = controller._compute_scan_deadline_monotonic()
-
-    assert abs((deadline - before) - 24 * 3600) < 1  # within 1 second tolerance
-
-
-# ---------------------------------------------------------------------------
-# _is_in_scan_window
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_is_in_scan_window_inside_same_day(monkeypatch: pytest.MonkeyPatch) -> None:
-    """At 2 AM with start=0, end=6: inside the window."""
-    controller = _make_controller()
-    monkeypatch.setattr(controller, "_get_scan_start_hour", lambda: 0)
-    monkeypatch.setattr(controller, "_get_scan_end_hour", lambda: 6)
-    fake_now = datetime.datetime(2025, 1, 15, 2, 0, 0)  # noqa: DTZ001
-    with patch(_FAKE_DATETIME_PATH) as mock_dt:
-        mock_dt.datetime.now.return_value = fake_now
-        assert controller._is_in_scan_window() is True
-
-
-@pytest.mark.asyncio
-async def test_is_in_scan_window_outside_same_day(monkeypatch: pytest.MonkeyPatch) -> None:
-    """At noon with start=0, end=6: outside the window."""
-    controller = _make_controller()
-    monkeypatch.setattr(controller, "_get_scan_start_hour", lambda: 0)
-    monkeypatch.setattr(controller, "_get_scan_end_hour", lambda: 6)
-    fake_now = datetime.datetime(2025, 1, 15, 12, 0, 0)  # noqa: DTZ001
-    with patch(_FAKE_DATETIME_PATH) as mock_dt:
-        mock_dt.datetime.now.return_value = fake_now
-        assert controller._is_in_scan_window() is False
-
-
-@pytest.mark.asyncio
-async def test_is_in_scan_window_inside_wrap_around(monkeypatch: pytest.MonkeyPatch) -> None:
-    """At 2 AM with start=22, end=6: inside the wrap-around window."""
-    controller = _make_controller()
-    monkeypatch.setattr(controller, "_get_scan_start_hour", lambda: 22)
-    monkeypatch.setattr(controller, "_get_scan_end_hour", lambda: 6)
-    fake_now = datetime.datetime(2025, 1, 15, 2, 0, 0)  # noqa: DTZ001
-    with patch(_FAKE_DATETIME_PATH) as mock_dt:
-        mock_dt.datetime.now.return_value = fake_now
-        assert controller._is_in_scan_window() is True
-
-
-@pytest.mark.asyncio
-async def test_is_in_scan_window_outside_wrap_around(monkeypatch: pytest.MonkeyPatch) -> None:
-    """At noon with start=22, end=6: outside the wrap-around window."""
-    controller = _make_controller()
-    monkeypatch.setattr(controller, "_get_scan_start_hour", lambda: 22)
-    monkeypatch.setattr(controller, "_get_scan_end_hour", lambda: 6)
-    fake_now = datetime.datetime(2025, 1, 15, 12, 0, 0)  # noqa: DTZ001
-    with patch(_FAKE_DATETIME_PATH) as mock_dt:
-        mock_dt.datetime.now.return_value = fake_now
-        assert controller._is_in_scan_window() is False
-
-
-# ---------------------------------------------------------------------------
-# Deadline gating in _run_background_scan
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_run_background_scan_skips_past_deadline(
+async def test_background_streaming_cancellation_cleans_up(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Tracks are skipped when the deadline has already passed."""
+    """CancelledError mid-track must trigger _cancel_providers and re-raise."""
+    controller = _make_controller()
+    streamdetails = _make_streamdetails(path="/music/test.flac")
+    p = _make_aa_provider("p1", available=True)
+    controller.mass.get_provider = MagicMock(return_value=p)  # type: ignore[method-assign]
+
+    session_key = streamdetails.uri
+
+    async def _inner_cancelled(_session_key: str, _sd: object, _providers: object) -> None:
+        # Simulate the inner having registered the session before being cancelled.
+        controller._active_sessions[session_key] = {"p1"}
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(controller, "_run_background_streaming_inner", _inner_cancelled)
+
+    with pytest.raises(asyncio.CancelledError):
+        await controller._run_background_streaming_for_track(streamdetails, [p])
+
+    # Session must be popped and provider.cancel scheduled.
+    assert session_key not in controller._active_sessions
+    p.cancel.assert_called_once_with(session_key)
+
+
+@pytest.mark.asyncio
+async def test_run_background_scan_defers_past_run_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tracks past the run-budget deadline are deferred to the next run."""
     controller = _make_controller()
 
     p1 = _make_aa_provider("prov-1", available=True)
@@ -847,10 +684,8 @@ async def test_run_background_scan_skips_past_deadline(
         controller, "_find_candidates_missing_analysis", AsyncMock(return_value=candidates)
     )
 
-    # Deadline already expired
-    monkeypatch.setattr(
-        controller, "_compute_scan_deadline_monotonic", lambda: time.monotonic() - 1
-    )
+    # Force budget to negative so every candidate is past deadline.
+    monkeypatch.setattr(audio_analysis_mod, "BACKGROUND_SCAN_RUN_BUDGET_SECONDS", -1)
 
     streaming_called = False
 
@@ -865,36 +700,30 @@ async def test_run_background_scan_skips_past_deadline(
     assert not streaming_called
 
 
-# ---------------------------------------------------------------------------
-# setup() catch-up behaviour
-# ---------------------------------------------------------------------------
-
-
-def test_setup_schedules_catchup_when_in_window(monkeypatch: pytest.MonkeyPatch) -> None:
-    """setup() creates an immediate scan task when booting inside the scan window."""
+@pytest.mark.asyncio
+async def test_close_drains_sessions_and_workers() -> None:
+    """close() cancels in-flight chunk workers and dispatches provider cancels."""
     controller = _make_controller()
-    monkeypatch.setattr(controller, "_configure_thread_caps", lambda: None)
-    monkeypatch.setattr(controller, "_get_scan_start_hour", lambda: 0)
-    monkeypatch.setattr(controller, "_is_in_scan_window", lambda: True)
 
-    create_task_calls: list[object] = []
-    controller.mass.create_task = MagicMock(side_effect=create_task_calls.append)  # type: ignore[method-assign]
+    # Real asyncio task that swallows cancellation cleanly.
+    async def _busy_worker() -> None:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            return
 
-    controller.setup()
+    worker_task = asyncio.create_task(_busy_worker())
+    controller._workers["track://test/a"] = worker_task
 
-    assert len(create_task_calls) == 1
+    p = _make_aa_provider("p1", available=True)
+    controller.mass.get_provider = MagicMock(return_value=p)  # type: ignore[method-assign]
+    controller._active_sessions["track://test/a"] = {"p1"}
 
+    await controller.close()
 
-def test_setup_no_catchup_when_outside_window(monkeypatch: pytest.MonkeyPatch) -> None:
-    """setup() does NOT create an immediate scan task when outside the scan window."""
-    controller = _make_controller()
-    monkeypatch.setattr(controller, "_configure_thread_caps", lambda: None)
-    monkeypatch.setattr(controller, "_get_scan_start_hour", lambda: 0)
-    monkeypatch.setattr(controller, "_is_in_scan_window", lambda: False)
-
-    create_task_calls: list[object] = []
-    controller.mass.create_task = MagicMock(side_effect=create_task_calls.append)  # type: ignore[method-assign]
-
-    controller.setup()
-
-    assert len(create_task_calls) == 0
+    # Worker awaited to completion; both dicts drained.
+    assert worker_task.done()
+    assert controller._workers == {}
+    assert controller._active_sessions == {}
+    # Provider cancel scheduled with the session key.
+    p.cancel.assert_called_once_with("track://test/a")

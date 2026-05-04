@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import datetime
 import os
 import time
 from collections.abc import Mapping
@@ -21,24 +20,25 @@ from music_assistant.constants import (
     DB_TABLE_PROVIDER_MAPPINGS,
     LOUDNESS_MEASUREMENT_MIN_LUFS,
 )
+from music_assistant.controllers.streams.constants import (
+    CONF_BACKGROUND_SCAN_CONCURRENCY,
+    DEFAULT_BACKGROUND_SCAN_CONCURRENCY,
+)
 from music_assistant.helpers.datetime import local_clock_time_to_utc
-from music_assistant.helpers.ffmpeg import FFMpeg
 from music_assistant.helpers.json import json_dumps, json_loads
 from music_assistant.models.audio_analysis import AudioAnalysisData
 from music_assistant.models.audio_analysis_provider import AudioAnalysisProvider
 from music_assistant.models.music_provider import MusicProvider
 
-CHUNK_PROCESS_TIMEOUT = 1.0
+CHUNK_PROCESS_TIMEOUT_SECONDS = 1.0
 LOUDNESS_ANALYSIS_DOMAIN = "loudness_analysis"
 BACKGROUND_SCAN_TASK_ID = "audio_analysis_background_scan"
-BACKGROUND_SCAN_SLEEP_BETWEEN_ITEMS = 2.0
 BACKGROUND_PER_TRACK_TIMEOUT_SECONDS = 300
-CONF_BACKGROUND_SCAN_CONCURRENCY = "background_scan_concurrency"
-DEFAULT_BACKGROUND_SCAN_CONCURRENCY = 1
-CONF_BACKGROUND_SCAN_START_HOUR = "background_scan_start_hour"
-DEFAULT_BACKGROUND_SCAN_START_HOUR = 0
-CONF_BACKGROUND_SCAN_END_HOUR = "background_scan_end_hour"
-DEFAULT_BACKGROUND_SCAN_END_HOUR = 6
+# Wall-clock cap for a single _run_background_scan invocation. After this
+# budget is exhausted, in-flight tracks are allowed to finish (bounded by
+# their per-track timeout) but no new tracks are started. Remaining
+# candidates are picked up by the next scheduled run.
+BACKGROUND_SCAN_RUN_BUDGET_SECONDS = 4 * 3600
 # providers whose tracks can be analyzed from their local filesystem path
 FILESYSTEM_PROVIDER_DOMAINS: tuple[str, ...] = (
     "filesystem_local",
@@ -57,10 +57,7 @@ class AudioAnalysisController:
     """Controller that distributes PCM chunks to all registered AudioAnalysisProviders."""
 
     def __init__(self, streams: StreamsController) -> None:
-        """Initialize the AudioAnalysisController.
-
-        :param streams: Parent StreamsController instance.
-        """
+        """Initialize the AudioAnalysisController."""
         self.streams = streams
         self.mass = streams.mass
         self.logger = self.mass.logger.getChild("audio_analysis")
@@ -70,21 +67,27 @@ class AudioAnalysisController:
     def setup(self) -> None:
         """Register the nightly background scan task and apply CPU caps."""
         self._configure_thread_caps()
-        start_hour = self._get_scan_start_hour()
-        utc_hour, utc_minute = local_clock_time_to_utc(start_hour, 0)
+        utc_hour, utc_minute = local_clock_time_to_utc(0, 0)
         self.mass.tasks.register_scheduled_task(
             task_id=BACKGROUND_SCAN_TASK_ID,
             name="Audio analysis — background scan of local files",
             handler=self._run_background_scan,
             schedule=TaskSchedule.daily(hour=utc_hour, minute=utc_minute),
             metadata={"task_domain": "audio_analysis"},
+            allow_retry=True,
         )
-        # Catch-up: if MA boots inside the scan window, run a scan now with the
-        # remaining time in the window. The deadline computed inside
-        # _run_background_scan ensures the scan still ends at end_hour.
-        if self._is_in_scan_window():
-            self.logger.info("Booted inside scan window — running immediate catch-up scan")
-            self.mass.create_task(self._run_background_scan())
+
+    async def close(self) -> None:
+        """Drain in-flight sessions and chunk workers on shutdown."""
+        workers = list(self._workers.values())
+        self._workers.clear()
+        for worker in workers:
+            if not worker.done():
+                worker.cancel()
+        for session_key in list(self._active_sessions):
+            self._cancel_providers(session_key)
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
 
     def _configure_thread_caps(self) -> None:
         """Cap PyTorch threading so Audio Analysis inference stays around a quarter of cpu_count."""
@@ -116,9 +119,6 @@ class AudioAnalysisController:
         """
         Start analysis session for a track across all providers.
 
-        Starts an analysis session for the given track on all available
-        Audio Analysis providers.
-
         :param audio_buffer: The AudioBuffer to observe for PCM chunks.
         :param streamdetails: The stream details for the item being analyzed.
         """
@@ -148,7 +148,6 @@ class AudioAnalysisController:
         queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=10)
         self._workers[session_key] = self.mass.create_task(self._chunk_worker(session_key, queue))
 
-        # Build and register closures for callbacks on the audio buffer
         finalized = False
 
         async def _on_chunk(position_seconds: int, pcm_data: bytes, is_last_chunk: bool) -> None:  # noqa: ARG001
@@ -161,7 +160,7 @@ class AudioAnalysisController:
                 self.mass.create_task(_finalize_session())
                 return
             try:
-                await asyncio.wait_for(queue.put(pcm_data), timeout=CHUNK_PROCESS_TIMEOUT)
+                await asyncio.wait_for(queue.put(pcm_data), timeout=CHUNK_PROCESS_TIMEOUT_SECONDS)
             except (TimeoutError, asyncio.QueueFull):
                 return
 
@@ -458,7 +457,7 @@ class AudioAnalysisController:
         return results
 
     async def _run_background_scan(self) -> None:
-        """Run the scan as decode-once-fan-out streaming, bounded by the configured window."""
+        """Run the scan as decode-once-fan-out streaming over candidate tracks."""
         providers = self.providers
         if not providers:
             return
@@ -468,14 +467,14 @@ class AudioAnalysisController:
         if not candidates:
             return
 
-        deadline_monotonic = self._compute_scan_deadline_monotonic()
         scan_started = time.monotonic()
+        run_deadline = scan_started + BACKGROUND_SCAN_RUN_BUDGET_SECONDS
         self.logger.info(
             "Background analysis (streaming): %d track(s) pending across %d provider(s); "
-            "deadline in %.1f hours",
+            "run budget %.1fh",
             len(candidates),
             len(providers),
-            (deadline_monotonic - scan_started) / 3600,
+            BACKGROUND_SCAN_RUN_BUDGET_SECONDS / 3600,
         )
 
         concurrency = self._get_scan_concurrency()
@@ -483,13 +482,13 @@ class AudioAnalysisController:
         provider_by_domain = {p.domain: p for p in providers}
 
         processed = 0
-        skipped_past_deadline = 0
+        deferred = 0
 
         async def _run_one(candidate: dict[str, Any]) -> None:
-            nonlocal processed, skipped_past_deadline
+            nonlocal processed, deferred
             async with semaphore:
-                if time.monotonic() >= deadline_monotonic:
-                    skipped_past_deadline += 1
+                if time.monotonic() >= run_deadline:
+                    deferred += 1
                     return
 
                 item_id = candidate["item_id"]
@@ -528,11 +527,12 @@ class AudioAnalysisController:
         await asyncio.gather(*(_run_one(c) for c in candidates))
 
         elapsed = time.monotonic() - scan_started
-        if skipped_past_deadline > 0:
+        if deferred:
             self.logger.info(
-                "Background analysis: end-of-window reached (%d processed, %d deferred to next scan, %.1fs elapsed)",
+                "Background analysis: run-budget reached "
+                "(%d processed, %d deferred to next run, %.1fs elapsed)",
                 processed,
-                skipped_past_deadline,
+                deferred,
                 elapsed,
             )
         else:
@@ -547,16 +547,7 @@ class AudioAnalysisController:
         streamdetails: StreamDetails,
         providers: list[AudioAnalysisProvider],
     ) -> None:
-        """Run a single track through the streaming pipeline using ffmpeg as the source.
-
-        Wraps the entire body in a per-track wall-clock budget. On timeout, ffmpeg
-        failure, or any exception, all providers are cancelled and the session is
-        cleaned up. On clean EOF, finalize is dispatched per provider (which fires
-        post_analysis via the base class wrapper).
-
-        :param streamdetails: Stream details for the track to analyze.
-        :param providers: AA providers that need this track. Caller computes the set.
-        """
+        """Run a single track through the streaming pipeline using ffmpeg as the source."""
         session_key = streamdetails.uri
         if session_key in self._active_sessions:
             self.logger.debug(
@@ -569,6 +560,14 @@ class AudioAnalysisController:
                 self._run_background_streaming_inner(session_key, streamdetails, providers),
                 timeout=BACKGROUND_PER_TRACK_TIMEOUT_SECONDS,
             )
+        except asyncio.CancelledError:
+            # CancelledError inherits from BaseException so the broad except below
+            # does NOT catch it. Clean up per-session state, then re-raise so the
+            # cancel propagates to the caller (gather → _run_background_scan →
+            # TasksController) and is recorded as TaskStatus.CANCELLED.
+            self.logger.debug("Background analysis cancelled for %s", session_key)
+            self._cancel_providers(session_key)
+            raise
         except TimeoutError:
             self.logger.warning(
                 "Background analysis exceeded %ds budget for %s, skipping",
@@ -576,9 +575,17 @@ class AudioAnalysisController:
                 session_key,
             )
             self._cancel_providers(session_key)
+            self.mass.tasks.add_task_failure(
+                BACKGROUND_SCAN_TASK_ID,
+                f"Timed out after {BACKGROUND_PER_TRACK_TIMEOUT_SECONDS}s: {session_key}",
+            )
         except Exception as err:
             self.logger.warning("Background analysis failed for %s: %s", session_key, err)
             self._cancel_providers(session_key)
+            self.mass.tasks.add_task_failure(
+                BACKGROUND_SCAN_TASK_ID,
+                f"Failed: {session_key}: {err}",
+            )
 
     async def _run_background_streaming_inner(
         self,
@@ -586,25 +593,18 @@ class AudioAnalysisController:
         streamdetails: StreamDetails,
         providers: list[AudioAnalysisProvider],
     ) -> None:
-        """Inner body of _run_background_streaming_for_track, wrapped by wait_for.
-
-        :param session_key: The session key (streamdetails.uri).
-        :param streamdetails: Stream details for the track to analyze.
-        :param providers: AA providers that need this track.
-        """
+        """Inner body of _run_background_streaming_for_track, wrapped by wait_for."""
         if not isinstance(streamdetails.path, str) or not streamdetails.path:
-            self.logger.debug("Background streaming: no local path for %s, skipping", session_key)
             return
 
-        # ffmpeg must DECODE the source to PCM. Build a PCM format that preserves
-        # the source's sample rate and channel count but uses PCM_S16LE as the
-        # content type. All current AA providers expect 16-bit PCM; standardising
-        # here avoids a per-source bit-depth permutation that nothing downstream
-        # would benefit from.
+        # Derive the PCM format from streamdetails the same way the live playback
+        # path does (audio_buffer.py:385). Source bit depth, sample rate, and
+        # channel count are preserved; only content_type is overridden so ffmpeg
+        # decodes rather than re-muxing the source codec.
         pcm_format = AudioFormat(
-            content_type=ContentType.PCM_S16LE,
+            content_type=ContentType.from_bit_depth(streamdetails.audio_format.bit_depth),
             sample_rate=streamdetails.audio_format.sample_rate,
-            bit_depth=16,
+            bit_depth=streamdetails.audio_format.bit_depth,
             channels=streamdetails.audio_format.channels,
         )
 
@@ -616,38 +616,23 @@ class AudioAnalysisController:
             return
         self._active_sessions[session_key] = accepted
 
-        # 1 second of PCM per chunk
-        chunk_size = pcm_format.sample_rate * (pcm_format.bit_depth // 8) * pcm_format.channels
-
-        async with FFMpeg(
-            audio_input=streamdetails.path,
-            input_format=streamdetails.audio_format,  # source format — input
-            output_format=pcm_format,  # PCM_S16LE — output
-            collect_log_history=True,
-        ) as ffmpeg_proc:
-            async for chunk in ffmpeg_proc.iter_chunked(chunk_size):
-                if session_key not in self._active_sessions:
-                    # all providers evicted — bail early
-                    break
-                await self._distribute_chunk(session_key, chunk)
-            # Clean EOF: finalize the providers still in the session
-            if session_key in self._active_sessions:
-                self._finalize_providers(session_key)
+        # Reuse the canonical decode pipeline used by live playback. For
+        # LOCAL_FILE sources this runs ffmpeg flat-out (no -re pacing).
+        audio_source = self.mass.streams.audio.get_media_stream(streamdetails, pcm_format)
+        async for chunk in audio_source:
+            if session_key not in self._active_sessions:
+                # all providers evicted — bail early
+                break
+            await self._distribute_chunk(session_key, chunk)
+        if session_key in self._active_sessions:
+            self._finalize_providers(session_key)
 
     async def _find_candidates_missing_analysis(
         self,
         aa_provider_domains: list[str],
         limit: int,
     ) -> list[dict[str, Any]]:
-        """Return tracks where any of the given AA provider domains lacks analysis.
-
-        Returns rows with shape: {item_id, provider_instance, missing_domains}.
-        Order: arbitrary but stable within one call.
-
-        :param aa_provider_domains: List of AA provider domains to consider.
-        :param limit: Maximum number of candidates to return.
-        :returns: List of dicts with item_id, provider_instance, missing_domains.
-        """
+        """Return rows {item_id, provider_instance, missing_domains} for tracks lacking analysis."""
         if not aa_provider_domains:
             return []
 
@@ -662,42 +647,48 @@ class AudioAnalysisController:
         if not filesystem_domains:
             return []
 
-        domains_sql = ", ".join(f"'{d}'" for d in filesystem_domains)
-        track_media_type = MediaType.TRACK.value
-        aa_domains_in = ", ".join(f"'{d}'" for d in aa_provider_domains)
-
-        # Find every (item_id, provider_instance) for filesystem tracks, then
-        # left-join the existing analysis rows to figure out which AA domains
-        # are already covered. The resulting "missing_domains" is the diff.
+        # CROSS JOIN every track against every AA-provider domain it could need,
+        # then keep only (track, domain) pairs where no analysis row exists.
+        # GROUP_CONCAT collapses the surviving missing domains per track. Tracks
+        # that are fully covered produce zero pair-rows and so don't appear.
+        fs_inline = ", ".join(f"'{d}'" for d in filesystem_domains)
+        aa_select_terms = " UNION ALL ".join(
+            f"SELECT :aa_{i} AS aa_provider_domain" for i in range(len(aa_provider_domains))
+        )
+        params: dict[str, Any] = {
+            "media_type": MediaType.TRACK.value,
+            **{f"aa_{i}": d for i, d in enumerate(aa_provider_domains)},
+        }
         query = (
             f"SELECT pm.provider_item_id AS item_id, "
             f"       pm.provider_instance AS provider_instance, "
-            f"       GROUP_CONCAT(aa.aa_provider_domain) AS covered_domains "
+            f"       GROUP_CONCAT(possible.aa_provider_domain) AS missing_domains "
             f"FROM {DB_TABLE_PROVIDER_MAPPINGS} pm "
-            f"LEFT JOIN {DB_TABLE_AUDIO_ANALYSIS} aa "
-            f"  ON aa.item_id = pm.provider_item_id "
-            f"  AND aa.provider = pm.provider_instance "
-            f"  AND aa.aa_provider_domain IN ({aa_domains_in}) "
-            f"  AND aa.media_type = '{track_media_type}' "
-            f"WHERE pm.media_type = '{track_media_type}' "
-            f"  AND pm.provider_domain IN ({domains_sql}) "
+            f"CROSS JOIN ({aa_select_terms}) possible "
+            f"WHERE pm.media_type = :media_type "
+            f"  AND pm.provider_domain IN ({fs_inline}) "
+            f"  AND NOT EXISTS ("
+            f"    SELECT 1 FROM {DB_TABLE_AUDIO_ANALYSIS} aa "
+            f"    WHERE aa.item_id = pm.provider_item_id "
+            f"      AND aa.provider = pm.provider_instance "
+            f"      AND aa.aa_provider_domain = possible.aa_provider_domain "
+            f"      AND aa.media_type = :media_type"
+            f"  ) "
             f"GROUP BY pm.provider_item_id, pm.provider_instance"
         )
-        rows = await self.mass.music.database.get_rows_from_query(query, limit=limit)
+        rows = await self.mass.music.database.get_rows_from_query(query, params, limit=limit)
         results: list[dict[str, Any]] = []
-        all_domains = set(aa_provider_domains)
         for r in rows:
-            covered_raw = r["covered_domains"]
-            covered = set((covered_raw or "").split(",")) - {""}
-            missing = sorted(all_domains - covered)
-            if missing:
-                results.append(
-                    {
-                        "item_id": str(r["item_id"]),
-                        "provider_instance": str(r["provider_instance"]),
-                        "missing_domains": missing,
-                    }
-                )
+            missing_raw = r["missing_domains"]
+            if not missing_raw:
+                continue
+            results.append(
+                {
+                    "item_id": str(r["item_id"]),
+                    "provider_instance": str(r["provider_instance"]),
+                    "missing_domains": sorted(set(missing_raw.split(","))),
+                }
+            )
         return results
 
     async def _start_analysis_on_providers(
@@ -744,16 +735,7 @@ class AudioAnalysisController:
                 self.mass.create_task(provider.cancel(session_key))
 
     async def _distribute_chunk(self, session_key: str, pcm_data: bytes) -> None:
-        """Fan a single PCM chunk to every provider in the session.
-
-        Times out and evicts providers per CHUNK_PROCESS_TIMEOUT. Also evicts
-        providers that raise an exception (a provider that errors mid-session
-        cannot keep processing). Pops the session from _active_sessions if all
-        providers get evicted.
-
-        :param session_key: The active session key.
-        :param pcm_data: PCM bytes to process.
-        """
+        """Fan a single PCM chunk to every provider in the session."""
         provider_ids = self._active_sessions.get(session_key)
         if not provider_ids:
             return
@@ -767,7 +749,7 @@ class AudioAnalysisController:
                     return None
                 await asyncio.wait_for(
                     provider.process_pcm_chunk(session_key, pcm_data),
-                    timeout=CHUNK_PROCESS_TIMEOUT,
+                    timeout=CHUNK_PROCESS_TIMEOUT_SECONDS,
                 )
             except TimeoutError:
                 self.logger.warning(
@@ -811,10 +793,7 @@ class AudioAnalysisController:
         return max(1, (os.process_cpu_count() or os.cpu_count() or 4) // 4)
 
     def _get_scan_concurrency(self) -> int:
-        """Read background scan concurrency from config, clamped to [1, 8].
-
-        :returns: Configured concurrency, or DEFAULT_BACKGROUND_SCAN_CONCURRENCY on any read error.
-        """
+        """Read background scan concurrency from config, clamped to [1, 8]."""
         try:
             value = int(
                 self.mass.config.get_raw_core_config_value(
@@ -827,75 +806,3 @@ class AudioAnalysisController:
         except Exception:
             value = DEFAULT_BACKGROUND_SCAN_CONCURRENCY
         return max(1, min(value, 8))
-
-    def _get_scan_start_hour(self) -> int:
-        """Read scan start hour from config, clamped to [0, 23].
-
-        :returns: Configured start hour, or DEFAULT_BACKGROUND_SCAN_START_HOUR on any read error.
-        """
-        try:
-            value = int(
-                self.mass.config.get_raw_core_config_value(
-                    "streams",
-                    CONF_BACKGROUND_SCAN_START_HOUR,
-                    DEFAULT_BACKGROUND_SCAN_START_HOUR,
-                )
-            )
-        except Exception:
-            value = DEFAULT_BACKGROUND_SCAN_START_HOUR
-        return max(0, min(value, 23))
-
-    def _get_scan_end_hour(self) -> int:
-        """Read scan end hour from config, clamped to [0, 23].
-
-        :returns: Configured end hour, or DEFAULT_BACKGROUND_SCAN_END_HOUR on any read error.
-        """
-        try:
-            value = int(
-                self.mass.config.get_raw_core_config_value(
-                    "streams",
-                    CONF_BACKGROUND_SCAN_END_HOUR,
-                    DEFAULT_BACKGROUND_SCAN_END_HOUR,
-                )
-            )
-        except Exception:
-            value = DEFAULT_BACKGROUND_SCAN_END_HOUR
-        return max(0, min(value, 23))
-
-    def _compute_scan_deadline_monotonic(self) -> float:
-        """Return monotonic deadline for the next occurrence of end_hour in local time.
-
-        If end_hour is still in the future today, use today's end_hour.
-        Otherwise (already past end_hour, or wrap-around window), use tomorrow's.
-        When start_hour == end_hour the window is treated as 24 hours (deadline = now + 24h).
-
-        :returns: Monotonic timestamp of the scan deadline.
-        """
-        start_hour = self._get_scan_start_hour()
-        end_hour = self._get_scan_end_hour()
-        if start_hour == end_hour:
-            return time.monotonic() + 24 * 3600
-        now = datetime.datetime.now()
-        end_today = now.replace(hour=end_hour, minute=0, second=0, microsecond=0)
-        if end_today <= now:
-            end_today += datetime.timedelta(days=1)
-        seconds_until_deadline = (end_today - now).total_seconds()
-        return time.monotonic() + seconds_until_deadline
-
-    def _is_in_scan_window(self) -> bool:
-        """Return True if the current local hour falls within the configured scan window.
-
-        Same-day window (start_hour < end_hour): in-window iff start_hour <= now_hour < end_hour.
-        Wrap-around window (start_hour >= end_hour): in-window iff now_hour >= start_hour
-        or now_hour < end_hour. When start_hour == end_hour, always returns True (24-hour window).
-
-        :returns: True if the current time is within the scan window.
-        """
-        start_hour = self._get_scan_start_hour()
-        end_hour = self._get_scan_end_hour()
-        if start_hour == end_hour:
-            return True
-        now_hour = datetime.datetime.now().hour
-        if start_hour < end_hour:
-            return start_hour <= now_hour < end_hour
-        return now_hour >= start_hour or now_hour < end_hour

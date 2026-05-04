@@ -52,20 +52,14 @@ from music_assistant.constants import (
 )
 from music_assistant.controllers.players.helpers import AnnounceData
 from music_assistant.controllers.streams.audio import StreamsAudio
-from music_assistant.controllers.streams.audio_analysis import (
-    CONF_BACKGROUND_SCAN_CONCURRENCY,
-    CONF_BACKGROUND_SCAN_END_HOUR,
-    CONF_BACKGROUND_SCAN_START_HOUR,
-    DEFAULT_BACKGROUND_SCAN_CONCURRENCY,
-    DEFAULT_BACKGROUND_SCAN_END_HOUR,
-    DEFAULT_BACKGROUND_SCAN_START_HOUR,
-    AudioAnalysisController,
-)
+from music_assistant.controllers.streams.audio_analysis import AudioAnalysisController
 from music_assistant.controllers.streams.constants import (
     CONF_ALLOW_CROSSFADE_SAME_ALBUM,
+    CONF_BACKGROUND_SCAN_CONCURRENCY,
     CONF_BUFFER_SIZE,
     CONF_BUFFER_SIZE_DEFAULT,
     CONF_SMART_FADES_LOG_LEVEL,
+    DEFAULT_BACKGROUND_SCAN_CONCURRENCY,
     DEFAULT_PORT,
     BufferSize,
 )
@@ -271,29 +265,6 @@ class StreamsController(CoreController):
                 "concurrent torch/ffmpeg work.",
                 category="audio_analysis",
             ),
-            ConfigEntry(
-                key=CONF_BACKGROUND_SCAN_START_HOUR,
-                type=ConfigEntryType.INTEGER,
-                range=(0, 23),
-                default_value=DEFAULT_BACKGROUND_SCAN_START_HOUR,
-                label="Background analysis: start hour (local)",
-                description="Local hour (0-23) at which the background analysis scan starts each day. "
-                "When end hour is less than or equal to start hour, the window wraps to the next day "
-                "(e.g. start=22, end=6 means 10 PM through 6 AM the following morning).",
-                category="audio_analysis",
-            ),
-            ConfigEntry(
-                key=CONF_BACKGROUND_SCAN_END_HOUR,
-                type=ConfigEntryType.INTEGER,
-                range=(0, 23),
-                default_value=DEFAULT_BACKGROUND_SCAN_END_HOUR,
-                label="Background analysis: end hour (local)",
-                description="Local hour (0-23) after which no new tracks are accepted for analysis. "
-                "In-flight tracks are allowed to finish (up to a 5-minute budget each). "
-                "When end hour is less than or equal to start hour, the window wraps to the next day "
-                "(e.g. start=22, end=6 means 10 PM through 6 AM the following morning).",
-                category="audio_analysis",
-            ),
         )
 
     async def setup(self, config: CoreConfig) -> None:
@@ -355,6 +326,7 @@ class StreamsController(CoreController):
 
     async def close(self) -> None:
         """Cleanup on exit."""
+        await self._audio_analysis.close()
         await self._server.close()
 
     async def resolve_stream_url(self, player_id: str, media: PlayerMedia) -> str:
