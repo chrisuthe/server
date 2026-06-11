@@ -1304,6 +1304,10 @@ class LocalFileSystemProvider(MusicProvider):
             artist.mbid = mbid
         if not artist_path:
             return artist
+        if not await self.exists(artist_path):
+            # the stored artist path may be stale, e.g. when the folder
+            # on disk was renamed (such as to "Lastname, Firstname" style)
+            return artist
 
         # grab additional metadata within the Artist's folder
         nfo_file = os.path.join(artist_path, "artist.nfo")
