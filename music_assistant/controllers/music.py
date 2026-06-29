@@ -127,6 +127,9 @@ DB_SCHEMA_VERSION: Final[int] = 41
 RADIO_TRACK_MAX_DURATION_SECS: Final[int] = 20 * 60
 _DYNAMIC_RADIO_BASE_SAMPLE_SIZE: Final[int] = 5
 _DYNAMIC_RADIO_DYNAMIC_TARGET: Final[int] = 50
+# When this plugin is enabled, radio keeps provider order (its picks on top)
+# instead of the default shuffle, so other setups are unaffected.
+AUDIOMUSE_PLUGIN_DOMAIN: Final[str] = "audiomuse_ai"
 
 CACHE_CATEGORY_SEARCH_RESULTS: Final[int] = 10
 DATABASE_CLEANUP_TASK_ID: Final[str] = "music_database_cleanup"
@@ -944,8 +947,8 @@ class MusicController(CoreController):
             available_base_tracks,
             min(_DYNAMIC_RADIO_BASE_SAMPLE_SIZE, len(available_base_tracks)),
         )
-        # Collect similar tracks preserving provider order (AudioMuse-AI picks
-        # first, music-provider top-up after). No set, no shuffle.
+        # Collect similar tracks, keeping insertion order (used by the ordered
+        # assembly below when AudioMuse-AI is enabled).
         dynamic_tracks: list[Track] = []
         seen: set[Track] = set(base_tracks)
         for allow_lookup in (False, True):
@@ -969,10 +972,27 @@ class MusicController(CoreController):
                 if len(dynamic_tracks) >= _DYNAMIC_RADIO_DYNAMIC_TARGET:
                     break
 
-        # Seed track(s) on top (initial radio only), then dynamic tracks in
-        # provider order, capped at target_size. Order is preserved end-to-end.
-        result: list[Track] = list(base_tracks) if include_base_tracks else []
-        result += dynamic_tracks[:target_size]
+        # When AudioMuse-AI is enabled, preserve provider order (its picks on top,
+        # music-provider top-up below). Otherwise keep the original shuffled mix so
+        # non-AudioMuse setups are unaffected.
+        if any(prov.domain == AUDIOMUSE_PLUGIN_DOMAIN for prov in self.mass.providers):
+            ordered: list[Track] = list(base_tracks) if include_base_tracks else []
+            ordered += dynamic_tracks[:target_size]
+            return ordered
+
+        result: list[Track] = []
+        if include_base_tracks:
+            result.append(base_tracks[0])
+            if len(base_tracks) > 1:
+                for base_track in base_tracks[1:]:
+                    result.append(base_track)
+                    if len(dynamic_tracks) > 2:
+                        result += random.sample(dynamic_tracks, 2)
+                    else:
+                        result += dynamic_tracks
+        remaining_dynamic = [t for t in dynamic_tracks if t not in result]
+        if remaining_dynamic:
+            result += random.sample(remaining_dynamic, min(len(remaining_dynamic), target_size))
         return result
 
     @api_command("music/item")
