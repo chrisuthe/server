@@ -349,9 +349,10 @@ class TracksController(MediaControllerBase[Track]):
             for track in tracks:
                 if len(collected) >= limit:
                     return
-                if track.uri == ref_item.uri or track.uri in seen:
+                uri = track.uri
+                if uri is None or uri == ref_item.uri or uri in seen:
                     continue
-                seen.add(track.uri)
+                seen.add(uri)
                 collected.append(track)
 
         # Phase 1: plugin/metadata providers first (music providers do phase 2).
@@ -384,14 +385,14 @@ class TracksController(MediaControllerBase[Track]):
         for prov_mapping in sorted(ref_item.provider_mappings, key=sort_key):
             if len(collected) >= limit:
                 break
-            prov = self.mass.get_provider(prov_mapping.provider_instance)
-            if not isinstance(prov, MusicProvider):
+            mapped_prov = self.mass.get_provider(prov_mapping.provider_instance)
+            if not isinstance(mapped_prov, MusicProvider):
                 continue
-            if ProviderFeature.SIMILAR_TRACKS not in prov.supported_features:
+            if ProviderFeature.SIMILAR_TRACKS not in mapped_prov.supported_features:
                 continue
             try:
                 _add(
-                    await prov.get_similar_tracks(
+                    await mapped_prov.get_similar_tracks(
                         prov_track_id=prov_mapping.item_id, limit=limit
                     )
                 )

@@ -438,9 +438,7 @@ class JellyfinProvider(MusicProvider):
         # Newer Jellyfin servers reject the legacy ?api_key= query-string auth that
         # aiojellyfin embeds in the URL, so also pass the token to ffmpeg as a
         # MediaBrowser Authorization header (the scheme used for API calls).
-        auth_header = self._client._session_config.authentication_header(  # noqa: SLF001
-            self._client._access_token  # noqa: SLF001
-        )
+        auth_header = self._client._session_config.authentication_header(self._client._access_token)
         return StreamDetails(
             item_id=jellyfin_track[ITEM_KEY_ID],
             provider=self.instance_id,

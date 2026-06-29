@@ -950,7 +950,7 @@ class MusicController(CoreController):
         # Collect similar tracks, keeping insertion order (used by the ordered
         # assembly below when AudioMuse-AI is enabled).
         dynamic_tracks: list[Track] = []
-        seen: set[Track] = set(base_tracks)
+        seen_dynamic: set[Track] = set(base_tracks)
         for allow_lookup in (False, True):
             if len(dynamic_tracks) >= _DYNAMIC_RADIO_DYNAMIC_TARGET:
                 break
@@ -965,9 +965,9 @@ class MusicController(CoreController):
                 except MediaNotFoundError:
                     continue
                 for track in similar:
-                    if track in seen or track.duration > RADIO_TRACK_MAX_DURATION_SECS:
+                    if track in seen_dynamic or track.duration > RADIO_TRACK_MAX_DURATION_SECS:
                         continue
-                    seen.add(track)
+                    seen_dynamic.add(track)
                     dynamic_tracks.append(track)
                 if len(dynamic_tracks) >= _DYNAMIC_RADIO_DYNAMIC_TARGET:
                     break
