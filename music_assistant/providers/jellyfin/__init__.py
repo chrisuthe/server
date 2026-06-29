@@ -435,6 +435,12 @@ class JellyfinProvider(MusicProvider):
         url = self._client.audio_url(
             jellyfin_track[ITEM_KEY_ID], container=SUPPORTED_CONTAINER_FORMATS
         )
+        # Newer Jellyfin servers reject the legacy ?api_key= query-string auth that
+        # aiojellyfin embeds in the URL, so also pass the token to ffmpeg as a
+        # MediaBrowser Authorization header (the scheme used for API calls).
+        auth_header = self._client._session_config.authentication_header(  # noqa: SLF001
+            self._client._access_token  # noqa: SLF001
+        )
         return StreamDetails(
             item_id=jellyfin_track[ITEM_KEY_ID],
             provider=self.instance_id,
@@ -444,6 +450,7 @@ class JellyfinProvider(MusicProvider):
                 jellyfin_track[ITEM_KEY_RUNTIME_TICKS] / 10000000
             ),  # 10000000 ticks per millisecond)
             path=url,
+            extra_input_args=["-headers", f"Authorization: {auth_header}\r\n"],
             can_seek=True,
             allow_seek=True,
         )

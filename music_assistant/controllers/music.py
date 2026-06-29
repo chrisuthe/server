@@ -944,7 +944,10 @@ class MusicController(CoreController):
             available_base_tracks,
             min(_DYNAMIC_RADIO_BASE_SAMPLE_SIZE, len(available_base_tracks)),
         )
-        dynamic_tracks: set[Track] = set()
+        # Collect similar tracks preserving provider order (AudioMuse-AI picks
+        # first, music-provider top-up after). No set, no shuffle.
+        dynamic_tracks: list[Track] = []
+        seen: set[Track] = set(base_tracks)
         for allow_lookup in (False, True):
             if len(dynamic_tracks) >= _DYNAMIC_RADIO_DYNAMIC_TARGET:
                 break
@@ -959,25 +962,17 @@ class MusicController(CoreController):
                 except MediaNotFoundError:
                     continue
                 for track in similar:
-                    if track not in base_tracks and track.duration <= RADIO_TRACK_MAX_DURATION_SECS:
-                        dynamic_tracks.add(track)
+                    if track in seen or track.duration > RADIO_TRACK_MAX_DURATION_SECS:
+                        continue
+                    seen.add(track)
+                    dynamic_tracks.append(track)
                 if len(dynamic_tracks) >= _DYNAMIC_RADIO_DYNAMIC_TARGET:
                     break
 
-        result: list[Track] = []
-        dynamic_tracks_list = list(dynamic_tracks)
-        if include_base_tracks:
-            result.append(base_tracks[0])
-            if len(base_tracks) > 1:
-                for base_track in base_tracks[1:]:
-                    result.append(base_track)
-                    if len(dynamic_tracks_list) > 2:
-                        result += random.sample(dynamic_tracks_list, 2)
-                    else:
-                        result += dynamic_tracks_list
-        remaining_dynamic = [t for t in dynamic_tracks_list if t not in result]
-        if remaining_dynamic:
-            result += random.sample(remaining_dynamic, min(len(remaining_dynamic), target_size))
+        # Seed track(s) on top (initial radio only), then dynamic tracks in
+        # provider order, capped at target_size. Order is preserved end-to-end.
+        result: list[Track] = list(base_tracks) if include_base_tracks else []
+        result += dynamic_tracks[:target_size]
         return result
 
     @api_command("music/item")
