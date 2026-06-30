@@ -349,10 +349,11 @@ class TracksController(MediaControllerBase[Track]):
             for track in tracks:
                 if len(collected) >= limit:
                     return
-                uri = track.uri
-                if uri is None or uri == ref_item.uri or uri in seen:
-                    continue
-                seen.add(uri)
+                uri = getattr(track, "uri", None)
+                if uri is not None:
+                    if uri == ref_item.uri or uri in seen:
+                        continue
+                    seen.add(uri)
                 collected.append(track)
 
         # Phase 1: plugin/metadata providers first (music providers do phase 2).

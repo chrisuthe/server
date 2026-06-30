@@ -43,6 +43,12 @@ def _make_controller(
     tracks_ctrl.similar_tracks = AsyncMock(return_value=similar)
     ctrl.tracks = tracks_ctrl
 
+    # The controller checks mass.providers to decide whether AudioMuse-AI is
+    # enabled; with no providers it uses the default (shuffled) assembly path.
+    mass = MagicMock()
+    mass.providers = []
+    ctrl.mass = mass
+
     media_controllers: dict[MediaType, MagicMock] = {}
 
     def get_controller(media_type: MediaType) -> MagicMock:
