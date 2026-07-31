@@ -6,12 +6,41 @@ from music_assistant_models.enums import ExternalID
 from music_assistant_models.media_items import (
     Artist,
     AudioFormat,
+    Playlist,
     ProviderMapping,
     Track,
     UniqueList,
 )
 
 ISRC = "USRC17607839"
+
+
+def create_playlist(
+    provider_instance: str,
+    item_id: str,
+    name: str = "Test Playlist",
+) -> Playlist:
+    """
+    Create a Playlist as it would be received from a music provider.
+
+    :param provider_instance: The provider instance id the playlist originates from.
+    :param item_id: The item id of the playlist on the provider.
+    :param name: The playlist name.
+    """
+    return Playlist(
+        item_id=item_id,
+        provider=provider_instance,
+        name=name,
+        provider_mappings={
+            ProviderMapping(
+                item_id=item_id,
+                provider_domain=provider_instance.split("_", maxsplit=1)[0],
+                provider_instance=provider_instance,
+            )
+        },
+        owner="Music Assistant",
+        is_editable=False,
+    )
 
 
 def create_track(

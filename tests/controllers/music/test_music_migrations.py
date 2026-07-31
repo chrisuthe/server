@@ -13,6 +13,7 @@ from music_assistant_models.errors import MusicAssistantError
 from music_assistant.constants import (
     DB_TABLE_AUDIO_ANALYSIS,
     DB_TABLE_EXTERNAL_ID_LOOKUP,
+    DB_TABLE_PLAYLISTS,
     DB_TABLE_PLAYLOG,
     DB_TABLE_SETTINGS,
 )
@@ -21,7 +22,7 @@ from music_assistant.controllers.music.migrations import migrate_database
 from music_assistant.helpers.database import DatabaseConnection
 from music_assistant.mass import MusicAssistant
 
-from .helpers import ISRC, create_track
+from .helpers import ISRC, create_playlist, create_track
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -361,6 +362,61 @@ async def test_migration_populates_fts_tables(database: DatabaseConnection) -> N
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'albums_fts'"
     )
     assert not rows
+
+
+async def test_migration_adds_playlist_creator_column(database: DatabaseConnection) -> None:
+    """Migrating a v55 database adds created_by_userid, leaving existing playlists unowned."""
+    await database.execute(f"INSERT INTO {DB_TABLE_PLAYLISTS} (item_id) VALUES (1)")
+    await database.commit()
+
+    mass = MagicMock()
+    mass.cache.clear = AsyncMock()
+    creators_query = f"SELECT item_id, created_by_userid FROM {DB_TABLE_PLAYLISTS}"
+    for _ in range(2):
+        # the second run proves the step is idempotent against a db that already has the column
+        await migrate_database(
+            mass,
+            database,
+            MagicMock(),
+            prev_version=55,
+            create_tables=AsyncMock(),
+        )
+        rows = await database.get_rows_from_query(creators_query)
+        assert [(row["item_id"], row["created_by_userid"]) for row in rows] == [(1, None)]
+
+
+async def test_migration_to_playlist_creator_column_keeps_the_library(
+    mass_minimal: MusicAssistant,
+) -> None:
+    """A real v55 library gains the creator column without falling back to a fresh database."""
+    music = MusicController(mass_minimal)
+    mass_minimal.music = music
+    await music._setup_database()
+    library_playlist = await music.playlists.add_item_to_library(
+        create_playlist("builtin", "playlist_abc")
+    )
+    db_id = int(library_playlist.item_id)
+    # revert the database to its v55 state: no creator column, schema version 55
+    await music.database.execute(f"ALTER TABLE {DB_TABLE_PLAYLISTS} DROP COLUMN created_by_userid")
+    await music.database.insert_or_replace(
+        DB_TABLE_SETTINGS, {"key": "version", "value": "55", "type": "str"}
+    )
+    await music.database.commit()
+    await music.database.close()
+
+    # setting up the database again triggers the migration
+    mass_minimal.cache.clear = AsyncMock()  # type: ignore[method-assign]
+    await music._setup_database()
+
+    # the playlist survived the migration (a drop-and-rescan fallback would have lost it)
+    fetched = await music.playlists.get_library_item(db_id)
+    assert fetched.name == "Test Playlist"
+    creator_row = await music.database.get_rows_from_query(
+        f"SELECT created_by_userid FROM {DB_TABLE_PLAYLISTS} WHERE item_id = :item_id",
+        {"item_id": db_id},
+    )
+    assert creator_row[0]["created_by_userid"] is None
+    await music.database.close()
 
 
 async def test_migration_rewrites_apple_music_artwork_to_tokens(

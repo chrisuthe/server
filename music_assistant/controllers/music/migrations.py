@@ -978,6 +978,18 @@ async def migrate_database(  # noqa: PLR0915
         except Exception as err:
             logger.warning("Could not seed default podcast/audiobook genres: %s", err)
 
+    if prev_version <= 55:
+        # add created_by_userid column to the playlist table to record which MA user created
+        # a playlist. Existing rows stay NULL, which means household-wide, so nothing is
+        # attributed retroactively.
+        try:
+            await database.execute(
+                f"ALTER TABLE {DB_TABLE_PLAYLISTS} ADD COLUMN created_by_userid TEXT"
+            )
+        except Exception as err:
+            if "duplicate column" not in str(err):
+                raise
+
     # (re)build the FTS search tables so they are in sync with the content tables;
     # this both populates them on first migration to the FTS-enabled schema and
     # repairs them after any migration that rewrote rows without the sync triggers active

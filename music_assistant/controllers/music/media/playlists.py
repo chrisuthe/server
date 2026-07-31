@@ -221,8 +221,20 @@ class PlaylistController(MediaControllerBase[Playlist]):
         for prov_mapping in playlist.provider_mappings:
             # when manually creating a playlist, it's always in the library
             prov_mapping.in_library = True
-        # add the new playlist to the library
-        return await self.add_item_to_library(playlist, False)
+        # add the new playlist to the library and record who created it in one commit.
+        # A provider-initiated create (smart_playlist, ai_radio) has no session user,
+        # which leaves the playlist household-wide.
+        async with self.mass.music.database.deferred_commit():
+            library_playlist = await self.add_item_to_library(playlist, False)
+            if user := get_current_user():
+                # first creator wins: add_item_to_library can match a pre-existing row,
+                # and that row's creator must not be silently reassigned
+                await self.mass.music.database.execute(
+                    f"UPDATE {self.db_table} SET created_by_userid = :user_id "
+                    "WHERE item_id = :item_id AND created_by_userid IS NULL",
+                    {"user_id": user.user_id, "item_id": int(library_playlist.item_id)},
+                )
+        return library_playlist
 
     async def add_playlist_tracks(
         self, db_playlist_id: str | int, uris: list[str]
@@ -369,6 +381,21 @@ class PlaylistController(MediaControllerBase[Playlist]):
                 priority=True,
             )
         return db_playlist
+
+    async def clear_created_by_user(self, user_id: str) -> None:
+        """
+        Unset the creator on all playlists created by the given user, making them household-wide.
+
+        A user that created no playlists is a no-op.
+
+        :param user_id: The id of the user to clear from the library playlists.
+        """
+        await self.mass.music.database.execute(
+            f"UPDATE {self.db_table} SET created_by_userid = NULL "
+            "WHERE created_by_userid = :user_id",
+            {"user_id": user_id},
+        )
+        await self.mass.music.database.commit()
 
     def _verify_update_allowed(self, current_item: Playlist, update: Playlist) -> None:
         """

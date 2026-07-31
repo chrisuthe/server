@@ -8,7 +8,8 @@ import threading
 from collections.abc import AsyncGenerator
 from datetime import datetime, timedelta
 from sqlite3 import IntegrityError
-from typing import Any
+from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 from music_assistant_models.auth import AuthProviderType, Scope, User, UserRole
@@ -73,6 +74,10 @@ async def mass_minimal(tmp_path: pathlib.Path) -> AsyncGenerator[MusicAssistant]
     # Get webserver config and manually set it (avoids starting the server)
     webserver_config = await mass_instance.config.get_core_config("webserver")
     webserver.config = webserver_config
+
+    # stand-in for the music controller, which the auth manager reaches into to hand a
+    # deleted user's playlists back to the household
+    mass_instance.music = AsyncMock()
 
     # Setup auth manager only (not the full webserver with routes/sockets)
     await webserver.auth.setup()
@@ -655,6 +660,12 @@ async def test_delete_user(auth_manager: AuthenticationManager) -> None:
     # Verify user is deleted
     deleted_user = await auth_manager.get_user(user.user_id)
     assert deleted_user is None
+
+    # the playlists the deleted user created revert to household-wide
+    clear_created_by_user = cast(
+        "AsyncMock", auth_manager.mass.music.playlists.clear_created_by_user
+    )
+    clear_created_by_user.assert_awaited_once_with(user.user_id)
 
 
 async def test_cannot_delete_own_account(auth_manager: AuthenticationManager) -> None:

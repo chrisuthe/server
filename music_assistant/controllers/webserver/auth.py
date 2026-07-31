@@ -1139,6 +1139,10 @@ class AuthenticationManager:
         await self.database.delete("users", {"user_id": user_id})
         await self.database.commit()
 
+        # the deleted user's playlists would otherwise keep pointing at an id that
+        # no longer resolves, so hand them back to the household
+        await self.mass.music.playlists.clear_created_by_user(user_id)
+
         # Disconnect all WebSocket connections for this user
         self.webserver.disconnect_websockets_for_user(user_id)
 
