@@ -67,6 +67,9 @@ jobs:
           # Set repo/org variable REVIEW_MODEL to your exact Claude id (`copilot` -> /model to list).
           REVIEW_MODEL: ${{ vars.REVIEW_MODEL || 'claude-opus-4.8' }}
         run: |
+          # The step's `-e` does not fail on a command upstream of a pipe — the pipeline's status
+          # is tee's. pipefail makes a non-zero `copilot` exit fail the step, so the post step skips.
+          set -o pipefail
           cat > prompt.txt <<'EOF'
           You are an automated PR reviewer for this project. Read .github/pr-review/standards.md for
           the project's coding standards and the review protocol, then review the diff in ./pr.diff.

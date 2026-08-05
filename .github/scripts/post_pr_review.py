@@ -1,9 +1,12 @@
-# ruff: noqa: INP001  # standalone CI helper, not part of a package
+# ruff: noqa: INP001, T201  # standalone CI helper: not a package, and prints workflow commands
 """
 Post Automated PR Review findings (the JSON array the CLI printed to stdout) as a PR review.
 
 Falls back: inline review -> summary-only review -> plain PR comment (so it also works on
 closed/merged PRs while testing).
+
+Exits non-zero without posting anything when the output holds no parseable findings array, so a
+failed review run is never mistaken for a clean one.
 
 Env: ``REPO=owner/name``, ``PR_NUMBER=<n>``, ``GH_TOKEN`` with pull-requests:write.
 Usage: ``python post_pr_review.py findings.json``
@@ -18,6 +21,7 @@ import sys
 logger = logging.getLogger("pr_review")
 
 SEV = {"CRITICAL": 0, "PROBLEM": 1, "SUGGESTION": 2}
+EXCERPT_LIMIT = 500
 HEADER = (
     "## 🤖 Automated PR Review\n\n"
     "Reviewed against the project's coding standards. Each note links where the standard "
@@ -46,9 +50,13 @@ def extract_findings(raw):
     Return the first ``[...]`` in the output that parses as a JSON list of findings.
 
     Uses ``raw_decode`` (which honours JSON string quoting) rather than counting brackets,
-    so ``[``/``]`` inside a finding's text can't break detection. Trailing prose is ignored.
+    so ``[``/``]`` inside a finding's text can't break detection. Prose around it is ignored.
+
+    Raises ``ValueError`` when the output holds no such array — an empty list means the review
+    ran and found nothing, which is not the same as no review having run at all.
     """
     decoder = json.JSONDecoder()
+    empty_found = False
     for i, char in enumerate(raw):
         if char != "[":
             continue
@@ -56,9 +64,17 @@ def extract_findings(raw):
             data = decoder.raw_decode(raw[i:])[0]
         except json.JSONDecodeError:
             continue
-        if isinstance(data, list) and (not data or isinstance(data[0], dict)):
+        if not isinstance(data, list):
+            continue
+        if data and isinstance(data[0], dict):
             return data
-    return []
+        if not data:
+            # Keep scanning: a stray `[]` in prose must not mask real findings printed after it,
+            # since an empty result is reported to the PR as a clean review.
+            empty_found = True
+    if empty_found:
+        return []
+    raise ValueError("no parseable JSON array of findings in the review output")
 
 
 def summary_line(finding):
@@ -80,12 +96,21 @@ def post_review(repo, pr, payload):
 
 
 def main():
-    """Read findings JSON, post it as a PR review, falling back as needed."""
+    """
+    Read findings JSON, post it as a PR review, falling back as needed.
+
+    Exits 1 without posting when the file holds no findings array, so the workflow step fails
+    rather than reporting a review that never happened.
+    """
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     repo, pr = os.environ["REPO"], os.environ["PR_NUMBER"]
     with open(sys.argv[1], encoding="utf-8", errors="replace") as handle:
         raw = handle.read()
-    findings = sorted(extract_findings(raw), key=lambda f: SEV.get(f.get("severity"), 3))
+    try:
+        parsed = extract_findings(raw)
+    except ValueError as err:
+        _abort_without_posting(err, sys.argv[1], raw)
+    findings = sorted(parsed, key=lambda f: SEV.get(f.get("severity"), 3))
 
     intro = [
         HEADER,
@@ -156,6 +181,33 @@ def main():
         inp=json.dumps({"body": summary_only}),
     )
     logger.info("posted plain comment (reviews API unavailable — PR likely closed)")
+
+
+def _abort_without_posting(err, path, raw):
+    """Annotate the run with ``err`` and what ``path`` actually held, then exit non-zero."""
+    print(
+        f"::error title=Automated PR Review produced no parseable findings::{err} — "
+        f"{path} held: {_annotation_safe(raw)}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def _annotation_safe(raw):
+    """
+    Return an excerpt of ``raw`` that a workflow command can carry.
+
+    Capped at ``EXCERPT_LIMIT`` characters, with the characters that would otherwise terminate
+    or corrupt the command's message percent-escaped.
+    """
+    text = raw.strip()
+    if not text:
+        return "(nothing)"
+    excerpt = text[:EXCERPT_LIMIT] + ("…" if len(text) > EXCERPT_LIMIT else "")
+    # `%` first, or the escapes below get escaped again.
+    for char, escape in (("%", "%25"), ("\r", "%0D"), ("\n", "%0A")):
+        excerpt = excerpt.replace(char, escape)
+    return excerpt
 
 
 if __name__ == "__main__":
