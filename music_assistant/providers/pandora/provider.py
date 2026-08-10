@@ -23,6 +23,7 @@ from music_assistant_models.errors import (
     InvalidDataError,
     LoginFailed,
     MediaNotFoundError,
+    MusicAssistantError,
     ProviderUnavailableError,
 )
 from music_assistant_models.media_items import (
@@ -53,6 +54,7 @@ from music_assistant.models.music_provider import MusicProvider
 
 from .constants import (
     ACCOUNT_FLAG_HIGH_QUALITY,
+    ADD_SEED_ENDPOINT,
     CONF_ALLOW_STATION_DELETE,
     CONF_QUALITY,
     CONF_TAKEOVER_ACTION,
@@ -278,6 +280,35 @@ class PandoraProvider(MusicProvider):
         ask us to add is already there - there is no separate saved state to set.
         """
         return item.media_type == MediaType.PLAYLIST
+
+    async def add_playlist_tracks(self, prov_playlist_id: str, prov_track_ids: list[str]) -> None:
+        """
+        Seed a station with the given tracks.
+
+        A Pandora station holds seeds, not tracks, so adding a track adds a seed derived
+        from it - Pandora's own "add variety". The track will not appear in the station's
+        listing; it shifts what the station plays.
+        """
+        for prov_track_id in prov_track_ids:
+            await self._api_request(
+                "POST",
+                ADD_SEED_ENDPOINT,
+                data={"stationId": prov_playlist_id, "pandoraId": prov_track_id},
+            )
+
+    async def remove_playlist_tracks(
+        self, prov_playlist_id: str, positions_to_remove: tuple[int, ...]
+    ) -> None:
+        """
+        Refuse positional track removal, which a station cannot express.
+
+        MA addresses removal by position in the playlist's track list. For a station that
+        list is the live fragment, whose entries expire within minutes and have no
+        correspondence to the station's seeds - so there is no position to delete.
+        """
+        raise MusicAssistantError(
+            "Pandora stations hold seeds, not tracks - remove seeds in the Pandora app"
+        )
 
     async def get_track(self, prov_track_id: str) -> Track:
         """Get full track details by id."""

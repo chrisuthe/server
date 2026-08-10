@@ -9,6 +9,7 @@ PLAYBACK_RESUMED_ENDPOINT = f"{API_BASE}/station/playbackResumed"
 SEARCH_ENDPOINT = f"{API_BASE}/search/fullSearch"
 CREATE_STATION_ENDPOINT = f"{API_BASE}/station/createStation"
 REMOVE_STATION_ENDPOINT = f"{API_BASE}/station/removeStation"
+ADD_SEED_ENDPOINT = f"{API_BASE}/station/addSeed"
 
 # Type-prefixed Pandora ids that createStation accepts as a station seed.
 # fullSearch returns AR/CO/GE/TR on a Premium account; measured in probe 1.

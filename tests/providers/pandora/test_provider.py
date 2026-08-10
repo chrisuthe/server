@@ -8,11 +8,12 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from music_assistant_models.enums import MediaType, StreamType
-from music_assistant_models.errors import MediaNotFoundError
+from music_assistant_models.errors import MediaNotFoundError, MusicAssistantError
 from music_assistant_models.media_items import SearchResults
 
 from music_assistant.providers.pandora import provider as provider_module
 from music_assistant.providers.pandora.constants import (
+    ADD_SEED_ENDPOINT,
     CREATE_STATION_ENDPOINT,
     REMOVE_STATION_ENDPOINT,
     SEARCH_ENDPOINT,
@@ -676,3 +677,21 @@ async def test_authentication_leaves_a_free_account_unentitled(
     """A login without the flag must not leave it set from a previous account."""
     provider = await _login(monkeypatch, ["adSupportedSkip"])
     assert provider._high_quality_available is False
+
+
+async def test_add_playlist_tracks_seeds_the_station_with_each_track() -> None:
+    """A track id is already the seed id addSeed wants, so each one goes straight through."""
+    provider, calls = _removing_provider(allow_delete=False)
+    await provider.add_playlist_tracks(STATION_ID, ["TR:1", "TR:2"])
+    assert calls == [
+        (ADD_SEED_ENDPOINT, {"stationId": STATION_ID, "pandoraId": "TR:1"}),
+        (ADD_SEED_ENDPOINT, {"stationId": STATION_ID, "pandoraId": "TR:2"}),
+    ]
+
+
+async def test_remove_playlist_tracks_refuses_positional_removal() -> None:
+    """Positions address the live fragment, not the seed list, so removal cannot be honoured."""
+    provider, calls = _removing_provider(allow_delete=False)
+    with pytest.raises(MusicAssistantError):
+        await provider.remove_playlist_tracks(STATION_ID, (0, 2))
+    assert calls == []
