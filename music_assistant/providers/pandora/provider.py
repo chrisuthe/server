@@ -53,6 +53,7 @@ from music_assistant.models.music_provider import MusicProvider
 
 from .constants import (
     ACCOUNT_FLAG_HIGH_QUALITY,
+    CONF_ALLOW_STATION_DELETE,
     CONF_QUALITY,
     CONF_TAKEOVER_ACTION,
     CREATE_STATION_ENDPOINT,
@@ -61,6 +62,7 @@ from .constants import (
     PLAYLIST_FRAGMENT_ENDPOINT,
     QUALITY_HIGH,
     QUALITY_STANDARD,
+    REMOVE_STATION_ENDPOINT,
     RETRY_REASON_AUTH,
     RETRY_REASON_STREAM_VIOLATION,
     SEARCH_ENDPOINT,
@@ -119,6 +121,12 @@ class PandoraProvider(MusicProvider):
                 type=ConfigEntryType.ACTION,
                 action=CONF_TAKEOVER_ACTION,
                 required=False,
+            ),
+            ConfigEntry(
+                key=CONF_ALLOW_STATION_DELETE,
+                type=ConfigEntryType.BOOLEAN,
+                required=False,
+                default_value=False,
             ),
         )
 
@@ -239,6 +247,28 @@ class PandoraProvider(MusicProvider):
             data={"pandoraId": seed_id, "stationName": name},
         )
         return self._parse_station(response)
+
+    async def library_remove(self, prov_item_id: str, media_type: MediaType) -> bool:
+        """
+        Delete a station from the user's Pandora account, if the user opted in.
+
+        Pandora has no follow/unfollow distinction - a station in getStations is the
+        library - so removing one from the library deletes it outright, permanently.
+        Measured: getStationDetails afterwards returns STATION_DOES_NOT_EXIST, with no
+        tombstone and no way back. Library sync-back is on by default, so this stays
+        behind an explicit opt-in rather than firing on a routine library edit.
+        """
+        if media_type != MediaType.PLAYLIST:
+            return False
+        if not self.config.get_value(CONF_ALLOW_STATION_DELETE):
+            self.logger.info(
+                "Leaving Pandora station %s in place: deleting it is permanent and "
+                "'Allow deleting stations' is turned off for this provider.",
+                prov_item_id,
+            )
+            return False
+        await self._api_request("POST", REMOVE_STATION_ENDPOINT, data={"stationId": prov_item_id})
+        return True
 
     async def get_track(self, prov_track_id: str) -> Track:
         """Get full track details by id."""

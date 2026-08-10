@@ -27,6 +27,10 @@
     "takeover_stream": {
       "label": "Take over stream",
       "description": "Pandora only allows one active stream at a time per account. You can request that Pandora terminate any existing stream on other devices and allow streaming here. You must manually restart playback after performing this action."
+    },
+    "allow_station_delete": {
+      "label": "Allow deleting stations",
+      "description": "When enabled, removing a Pandora station from your Music Assistant library also deletes it from your Pandora account. Pandora deletions are permanent and cannot be undone, and the station's thumbs-up and thumbs-down history is lost with it. Leave this off to keep library removals local to Music Assistant."
     }
   },
   "setup_flow": {

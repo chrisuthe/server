@@ -14,6 +14,7 @@ from music_assistant_models.media_items import SearchResults
 from music_assistant.providers.pandora import provider as provider_module
 from music_assistant.providers.pandora.constants import (
     CREATE_STATION_ENDPOINT,
+    REMOVE_STATION_ENDPOINT,
     SEARCH_ENDPOINT,
     STATIONS_ENDPOINT,
 )
@@ -192,6 +193,59 @@ async def test_create_playlist_tolerates_a_null_items_list() -> None:
     provider, _ = _creating_provider(search_items=None)
     with pytest.raises(MediaNotFoundError):
         await provider.create_playlist("Nothing", {MediaType.TRACK})
+
+
+def _removing_provider(
+    allow_delete: bool = True,
+) -> tuple[PandoraProvider, list[tuple[str, dict[str, Any]]]]:
+    """
+    Build a provider that records every API call instead of making one.
+
+    :param allow_delete: Value the CONF_ALLOW_STATION_DELETE config entry reports.
+    """
+    provider = PandoraProvider.__new__(PandoraProvider)
+    provider.manifest = Mock(domain="pandora")
+    # a bare Mock would return a truthy Mock from get_value, silently passing the gate
+    provider.config = Mock(instance_id="pandora--test")
+    provider.config.get_value = Mock(return_value=allow_delete)
+    provider.logger = Mock()
+    provider._sessions = {}
+    provider._high_quality_available = False
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def _fake_api_request(
+        method: str,  # noqa: ARG001
+        url: str,
+        data: dict[str, Any] | None = None,
+        **kwargs: Any,  # noqa: ARG001
+    ) -> dict[str, Any]:
+        """Record the call and return an empty success payload."""
+        calls.append((url, data or {}))
+        return {}
+
+    provider._api_request = _fake_api_request  # type: ignore[method-assign, assignment]
+    return provider, calls
+
+
+async def test_library_remove_deletes_the_station_when_enabled() -> None:
+    """With the opt-in toggle on, removing a station playlist calls removeStation."""
+    provider, calls = _removing_provider(allow_delete=True)
+    assert await provider.library_remove("station-7", MediaType.PLAYLIST) is True
+    assert calls == [(REMOVE_STATION_ENDPOINT, {"stationId": "station-7"})]
+
+
+async def test_library_remove_does_nothing_when_the_toggle_is_off() -> None:
+    """The default is off, and off must mean no destructive call reaches Pandora at all."""
+    provider, calls = _removing_provider(allow_delete=False)
+    assert await provider.library_remove("station-7", MediaType.PLAYLIST) is False
+    assert calls == []
+
+
+async def test_library_remove_ignores_other_media_types() -> None:
+    """Only playlists are stations; anything else must not reach a destructive endpoint."""
+    provider, calls = _removing_provider(allow_delete=True)
+    assert await provider.library_remove("station-7", MediaType.TRACK) is False
+    assert calls == []
 
 
 async def test_search_returns_a_matching_station_as_a_playlist() -> None:

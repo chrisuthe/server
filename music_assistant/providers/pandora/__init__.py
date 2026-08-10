@@ -21,6 +21,7 @@ SUPPORTED_FEATURES = {
     ProviderFeature.SEARCH,
     ProviderFeature.LIBRARY_PLAYLISTS,
     ProviderFeature.PLAYLIST_CREATE_TRACKS,
+    ProviderFeature.LIBRARY_PLAYLISTS_EDIT,
 }
 
 

@@ -8,6 +8,7 @@ PLAYLIST_FRAGMENT_ENDPOINT = f"{API_BASE}/playlist/getFragment"
 PLAYBACK_RESUMED_ENDPOINT = f"{API_BASE}/station/playbackResumed"
 SEARCH_ENDPOINT = f"{API_BASE}/search/fullSearch"
 CREATE_STATION_ENDPOINT = f"{API_BASE}/station/createStation"
+REMOVE_STATION_ENDPOINT = f"{API_BASE}/station/removeStation"
 
 # Type-prefixed Pandora ids that createStation accepts as a station seed.
 # fullSearch returns AR/CO/GE/TR on a Premium account; measured in probe 1.
@@ -62,6 +63,7 @@ RETRY_REASON_STREAM_VIOLATION = "stream_violation"
 
 CONF_TAKEOVER_ACTION = "takeover_stream"
 CONF_QUALITY = "quality"
+CONF_ALLOW_STATION_DELETE = "allow_station_delete"
 QUALITY_HIGH = "high"
 QUALITY_STANDARD = "standard"
 
