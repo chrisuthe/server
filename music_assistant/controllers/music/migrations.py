@@ -992,6 +992,21 @@ async def migrate_database(  # noqa: PLR0915
                 if "duplicate column" not in str(err):
                     raise
 
+    if prev_version <= 57:
+        # pandora stations are dynamic playlists now, so the provider no longer reports them
+        # as library radios: the library sync's deletion pass never runs for a media type the
+        # provider dropped, and it would only unmark (not remove) a streaming provider's rows.
+        # Remove the stale radio entries here instead.
+        await database.execute(
+            f"DELETE FROM {DB_TABLE_RADIOS} WHERE item_id IN ("
+            f"  SELECT item_id FROM {DB_TABLE_PROVIDER_MAPPINGS}"
+            "   WHERE provider_domain = 'pandora' AND media_type = 'radio')"
+        )
+        await database.execute(
+            f"DELETE FROM {DB_TABLE_PROVIDER_MAPPINGS} "
+            "WHERE provider_domain = 'pandora' AND media_type = 'radio'"
+        )
+
     # NOTE: this genre restore runs after the <= 50 step on purpose: it inserts genres
     # with the current code/schema, so the external_ids column must be gone first.
     if prev_version <= 47:

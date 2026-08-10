@@ -63,6 +63,13 @@ async def database(tmp_path: Path) -> AsyncGenerator[DatabaseConnection]:
         "[external_id_type] TEXT NOT NULL, [external_id] TEXT NOT NULL, "
         "[item_id] INTEGER NOT NULL)"
     )
+    # stand-in for the table migration steps outside the one under test may touch
+    # unconditionally (e.g. the pandora radio cleanup); tests that need specific rows
+    # populate it themselves, which is safe since this uses IF NOT EXISTS
+    await db.execute(
+        "CREATE TABLE IF NOT EXISTS provider_mappings([media_type] TEXT, [item_id] INTEGER, "
+        "[provider_domain] TEXT, [provider_instance] TEXT, [provider_item_id] TEXT)"
+    )
     # tests that exercise a specific playlog layout replace this stand-in
     await db.execute(
         f"CREATE TABLE {DB_TABLE_PLAYLOG}([id] INTEGER PRIMARY KEY, [userid] TEXT NOT NULL, "
@@ -385,10 +392,6 @@ async def test_migration_rewrites_apple_music_artwork_to_tokens(
 ) -> None:
     """Persisted (expired) blobstore artwork URLs are rewritten to resolvable tokens."""
     await database.execute("ALTER TABLE albums ADD COLUMN metadata json")
-    await database.execute(
-        "CREATE TABLE provider_mappings([media_type] TEXT, [item_id] INTEGER, "
-        "[provider_domain] TEXT, [provider_instance] TEXT, [provider_item_id] TEXT)"
-    )
     signed_url = "https://store-033.blobstore.apple.com/pic/image?X-Amz-Signature=dead"
     metadata = {
         "images": [
