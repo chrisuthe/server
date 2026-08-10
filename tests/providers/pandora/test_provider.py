@@ -12,7 +12,11 @@ from music_assistant_models.errors import MediaNotFoundError
 from music_assistant_models.media_items import SearchResults
 
 from music_assistant.providers.pandora import provider as provider_module
-from music_assistant.providers.pandora.constants import STATIONS_ENDPOINT
+from music_assistant.providers.pandora.constants import (
+    CREATE_STATION_ENDPOINT,
+    SEARCH_ENDPOINT,
+    STATIONS_ENDPOINT,
+)
 from music_assistant.providers.pandora.fragments import (
     FRAGMENT_STALE_SECONDS,
     FRAGMENT_URL_TTL_SECONDS,
@@ -119,6 +123,75 @@ async def test_get_track_matches_playlist_tracks_identity() -> None:
     assert listed.album is not None
     assert looked_up.album.item_id == listed.album.item_id
     assert looked_up.artists[0].item_id == listed.artists[0].item_id
+
+
+def _creating_provider(
+    search_items: list[dict[str, Any]] | None = None,
+    created: dict[str, Any] | None = None,
+) -> tuple[PandoraProvider, list[dict[str, Any]]]:
+    """
+    Build a provider whose fullSearch/createStation calls return canned payloads.
+
+    Returns the provider and a list that records each createStation request body, so a
+    test can assert which seed was chosen rather than only what was returned.
+    """
+    provider = PandoraProvider.__new__(PandoraProvider)
+    provider.manifest = Mock(domain="pandora")
+    provider.config = Mock(instance_id="pandora--test")
+    provider.logger = Mock()
+    provider._sessions = {}
+    provider._high_quality_available = False
+    create_calls: list[dict[str, Any]] = []
+
+    async def _fake_api_request(
+        method: str,  # noqa: ARG001
+        url: str,
+        data: dict[str, Any] | None = None,
+        **kwargs: Any,  # noqa: ARG001
+    ) -> dict[str, Any]:
+        """Return canned search/create payloads instead of calling Pandora."""
+        if url == SEARCH_ENDPOINT:
+            return {"items": search_items}
+        if url == CREATE_STATION_ENDPOINT:
+            create_calls.append(data or {})
+            return created or {"stationId": "station-new", "name": "Radiohead Radio"}
+        raise AssertionError(f"unexpected endpoint {url}")
+
+    provider._api_request = _fake_api_request  # type: ignore[method-assign, assignment]
+    return provider, create_calls
+
+
+async def test_create_playlist_seeds_from_top_seedable_result() -> None:
+    """The first result with a seedable prefix wins, even if a non-seedable one ranks higher."""
+    provider, create_calls = _creating_provider(
+        search_items=[{"pandoraId": "AL:9"}, {"pandoraId": "AR:123"}, {"pandoraId": "TR:456"}]
+    )
+    await provider.create_playlist("Radiohead", {MediaType.TRACK})
+    assert create_calls[0]["pandoraId"] == "AR:123"
+
+
+async def test_create_playlist_returns_the_station_pandora_made() -> None:
+    """Pandora names the station itself; we return what it gives us."""
+    provider, _ = _creating_provider(search_items=[{"pandoraId": "AR:123"}])
+    playlist = await provider.create_playlist("Radiohead", {MediaType.TRACK})
+    assert playlist.item_id == "station-new"
+    assert playlist.name == "Radiohead Radio"
+    assert playlist.is_dynamic is True
+
+
+async def test_create_playlist_without_a_seedable_result_raises() -> None:
+    """A search that returns only non-seedable types cannot build a station."""
+    provider, create_calls = _creating_provider(search_items=[{"pandoraId": "AL:9"}])
+    with pytest.raises(MediaNotFoundError):
+        await provider.create_playlist("Nothing", {MediaType.TRACK})
+    assert create_calls == []
+
+
+async def test_create_playlist_tolerates_a_null_items_list() -> None:
+    """A present-but-null `items` must raise MediaNotFoundError, not TypeError."""
+    provider, _ = _creating_provider(search_items=None)
+    with pytest.raises(MediaNotFoundError):
+        await provider.create_playlist("Nothing", {MediaType.TRACK})
 
 
 async def test_search_returns_a_matching_station_as_a_playlist() -> None:

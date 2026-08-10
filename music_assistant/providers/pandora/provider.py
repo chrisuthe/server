@@ -55,6 +55,7 @@ from .constants import (
     ACCOUNT_FLAG_HIGH_QUALITY,
     CONF_QUALITY,
     CONF_TAKEOVER_ACTION,
+    CREATE_STATION_ENDPOINT,
     LOGIN_ENDPOINT,
     PLAYBACK_RESUMED_ENDPOINT,
     PLAYLIST_FRAGMENT_ENDPOINT,
@@ -62,6 +63,8 @@ from .constants import (
     QUALITY_STANDARD,
     RETRY_REASON_AUTH,
     RETRY_REASON_STREAM_VIOLATION,
+    SEARCH_ENDPOINT,
+    SEEDABLE_PREFIXES,
     STATIONS_ENDPOINT,
 )
 from .fragments import PandoraFragment, PandoraStationSession, should_fetch_fragment
@@ -220,6 +223,22 @@ class PandoraProvider(MusicProvider):
         # candidates against its unplayed tail, so a served track that scrolls out of that
         # tail would otherwise be re-added here and then fail once the fragment has moved on.
         return [self._parse_track(track) for track in fragment.pending]
+
+    async def create_playlist(self, name: str, media_types: set[MediaType]) -> Playlist:
+        """
+        Create a Pandora station seeded from the given name.
+
+        MA passes only a name, so the name doubles as the seed query - which is how
+        Pandora's own UI creates stations. The station Pandora returns will be named
+        after the seed it picked ("Radiohead Radio"), not after `name`.
+        """
+        seed_id = await self._resolve_seed(name)
+        response = await self._api_request(
+            "POST",
+            CREATE_STATION_ENDPOINT,
+            data={"pandoraId": seed_id, "stationName": name},
+        )
+        return self._parse_station(response)
 
     async def get_track(self, prov_track_id: str) -> Track:
         """Get full track details by id."""
@@ -654,3 +673,20 @@ class PandoraProvider(MusicProvider):
         high-quality streaming, while still respecting the user's preference if they are eligible.
         """
         return self._high_quality_available and self.config.get_value(CONF_QUALITY) == QUALITY_HIGH
+
+    async def _resolve_seed(self, query: str) -> str:
+        """
+        Return the highest-ranked Pandora id that createStation accepts as a seed.
+
+        :param query: Free-text station name, used verbatim as the search query.
+        :raises MediaNotFoundError: If nothing Pandora returned can seed a station.
+        """
+        response = await self._api_request(
+            "POST", SEARCH_ENDPOINT, data={"query": query, "count": 5}
+        )
+        for item in response.get("items") or []:
+            if not (pandora_id := item.get("pandoraId")):
+                continue
+            if pandora_id.split(":", 1)[0] in SEEDABLE_PREFIXES:
+                return str(pandora_id)
+        raise MediaNotFoundError(f"No Pandora seed matches '{query}'")

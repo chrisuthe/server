@@ -6,6 +6,12 @@ LOGIN_ENDPOINT = f"{API_BASE}/auth/login"
 STATIONS_ENDPOINT = f"{API_BASE}/station/getStations"
 PLAYLIST_FRAGMENT_ENDPOINT = f"{API_BASE}/playlist/getFragment"
 PLAYBACK_RESUMED_ENDPOINT = f"{API_BASE}/station/playbackResumed"
+SEARCH_ENDPOINT = f"{API_BASE}/search/fullSearch"
+CREATE_STATION_ENDPOINT = f"{API_BASE}/station/createStation"
+
+# Type-prefixed Pandora ids that createStation accepts as a station seed.
+# fullSearch returns AR/CO/GE/TR on a Premium account; measured in probe 1.
+SEEDABLE_PREFIXES = ("AR", "CO", "GE", "TR")
 
 # Pandora Error Code Categories
 # Authentication and authorization failures
