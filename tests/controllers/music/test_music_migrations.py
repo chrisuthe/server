@@ -528,3 +528,52 @@ async def test_migration_adds_columns_leapfrogged_by_the_stable_schema_version(
 
     assert {"translation_key", "translation_params"} <= await _table_columns(database, "playlists")
     assert "playback_speed" in await _table_columns(database, DB_TABLE_PLAYLOG)
+
+
+async def test_migration_removes_pandora_radios_except_rows_shared_with_other_providers(
+    database: DatabaseConnection,
+) -> None:
+    """The pandora radio cleanup keeps a row a second provider still maps to."""
+    # item 1: only a pandora mapping - the whole point of this migration, must go
+    # item 2: a pandora AND a radiobrowser mapping - match_providers attached both to the
+    #   same library row, so it must survive with only the pandora mapping removed
+    # item 3: only a radiobrowser mapping - untouched
+    await database.execute("INSERT INTO radios (item_id) VALUES (1), (2), (3)")
+    await database.execute(
+        "INSERT INTO provider_mappings "
+        "(item_id, media_type, provider_domain, provider_instance, provider_item_id) VALUES "
+        "(1, 'radio', 'pandora', 'pandora--1', 'station_1'), "
+        "(2, 'radio', 'pandora', 'pandora--1', 'station_2'), "
+        "(2, 'radio', 'radiobrowser', 'radiobrowser', 'station_2'), "
+        "(3, 'radio', 'radiobrowser', 'radiobrowser', 'station_3'), "
+        # a pandora *playlist* mapping (the new dynamic-playlist representation) - not a
+        # radio, must survive untouched even though it's a pandora mapping too
+        "(4, 'playlist', 'pandora', 'pandora--1', 'station_4')"
+    )
+    await database.commit()
+
+    mass = MagicMock()
+    mass.cache.clear = AsyncMock()
+    await migrate_database(
+        mass,
+        database,
+        MagicMock(),
+        prev_version=57,
+        create_tables=AsyncMock(),
+    )
+
+    # item 1's row and mapping are gone; items 2 and 3 survive
+    radio_ids = {row["item_id"] for row in await database.get_rows("radios")}
+    assert radio_ids == {2, 3}
+
+    mapping_keys = {
+        (row["item_id"], row["media_type"], row["provider_domain"])
+        for row in await database.get_rows("provider_mappings")
+    }
+    # item 2 keeps only its radiobrowser mapping; item 3's mapping is untouched;
+    # item 4's pandora playlist mapping is untouched
+    assert mapping_keys == {
+        (2, "radio", "radiobrowser"),
+        (3, "radio", "radiobrowser"),
+        (4, "playlist", "pandora"),
+    }

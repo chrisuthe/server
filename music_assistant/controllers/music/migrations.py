@@ -996,11 +996,16 @@ async def migrate_database(  # noqa: PLR0915
         # pandora stations are dynamic playlists now, so the provider no longer reports them
         # as library radios: the library sync's deletion pass never runs for a media type the
         # provider dropped, and it would only unmark (not remove) a streaming provider's rows.
-        # Remove the stale radio entries here instead.
+        # Remove the stale radio entries here instead, but keep any radio a second provider
+        # also maps to - match_providers can attach another provider's mapping to the same
+        # library row, and that radio is still legitimately in the library without pandora.
         await database.execute(
             f"DELETE FROM {DB_TABLE_RADIOS} WHERE item_id IN ("
             f"  SELECT item_id FROM {DB_TABLE_PROVIDER_MAPPINGS}"
-            "   WHERE provider_domain = 'pandora' AND media_type = 'radio')"
+            "   WHERE provider_domain = 'pandora' AND media_type = 'radio'"
+            ") AND item_id NOT IN ("
+            f"  SELECT item_id FROM {DB_TABLE_PROVIDER_MAPPINGS}"
+            "   WHERE provider_domain != 'pandora' AND media_type = 'radio')"
         )
         await database.execute(
             f"DELETE FROM {DB_TABLE_PROVIDER_MAPPINGS} "
