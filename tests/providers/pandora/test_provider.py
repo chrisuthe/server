@@ -248,6 +248,13 @@ async def test_library_remove_ignores_other_media_types() -> None:
     assert calls == []
 
 
+async def test_library_add_accepts_a_station_without_calling_pandora() -> None:
+    """Stations are already in the account library, so adding one is a no-op success."""
+    provider, calls = _removing_provider(allow_delete=False)
+    assert await provider.library_add(Mock(media_type=MediaType.PLAYLIST)) is True
+    assert calls == []
+
+
 async def test_search_returns_a_matching_station_as_a_playlist() -> None:
     """A station whose name matches the query comes back in the playlist results."""
     provider = _provider(stations=_stations(["Coldplay Radio", "Jazz Radio"]))

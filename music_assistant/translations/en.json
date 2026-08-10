@@ -1729,7 +1729,7 @@
   "provider.orf_radiothek.manifest.description": "Stream live radio and on-demand content from ORF Radiothek (Austrian public service broadcaster). Supports live streams from Ö1, Ö3, FM4, and regional stations, plus on-demand broadcasts and podcasts.",
   "provider.overcast.config_entries.username.description": "Your Overcast account email address.",
   "provider.overcast.manifest.description": "Import your podcast subscriptions and playback progress from Overcast.",
-  "provider.pandora.config_entries.allow_station_delete.description": "When enabled, removing a Pandora station from your Music Assistant library also deletes it from your Pandora account. Pandora deletions are permanent and cannot be undone, and the station's thumbs-up and thumbs-down history is lost with it. Leave this off to keep library removals local to Music Assistant.",
+  "provider.pandora.config_entries.allow_station_delete.description": "When enabled, removing a Pandora station from your Music Assistant library also deletes it from your Pandora account. Pandora deletions are permanent and cannot be undone. Leave this off to keep library removals local to Music Assistant.",
   "provider.pandora.config_entries.allow_station_delete.label": "Allow deleting stations",
   "provider.pandora.config_entries.password.description": "Your Pandora password",
   "provider.pandora.config_entries.quality.description": "Audio quality to request from Pandora. High quality is only available with an active Pandora subscription. If your account is not eligible for high-quality streaming, standard quality will be used regardless of this setting.",

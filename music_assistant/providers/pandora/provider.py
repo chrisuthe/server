@@ -270,6 +270,15 @@ class PandoraProvider(MusicProvider):
         await self._api_request("POST", REMOVE_STATION_ENDPOINT, data={"stationId": prov_item_id})
         return True
 
+    async def library_add(self, item: MediaItemType) -> bool:
+        """
+        Accept a station that is already part of the account's library.
+
+        Pandora exposes only the account's own stations, so anything Music Assistant can
+        ask us to add is already there - there is no separate saved state to set.
+        """
+        return item.media_type == MediaType.PLAYLIST
+
     async def get_track(self, prov_track_id: str) -> Track:
         """Get full track details by id."""
         if (track := self._find_track(prov_track_id)) is None:
