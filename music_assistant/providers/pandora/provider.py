@@ -632,6 +632,7 @@ class PandoraProvider(MusicProvider):
             provider=self.instance_id,
             name=station["name"],
             is_dynamic=True,
+            is_editable=bool(station.get("allowAddSeed")),
             provider_mappings={
                 ProviderMapping(
                     item_id=station["stationId"],

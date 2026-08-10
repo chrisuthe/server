@@ -298,6 +298,19 @@ async def test_search_without_playlist_media_type_skips_the_station_lookup() -> 
     assert results == SearchResults()
 
 
+async def test_station_is_editable_only_when_pandora_allows_seeding() -> None:
+    """Pandora reports per-station whether it accepts new seeds; mirror that in is_editable."""
+    provider = _provider(
+        stations=[
+            {"stationId": "s1", "name": "Artist Radio", "allowAddSeed": True},
+            {"stationId": "s2", "name": "Genre Radio", "allowAddSeed": False},
+        ]
+    )
+    playlists = {playlist.item_id: playlist async for playlist in provider.get_library_playlists()}
+    assert playlists["s1"].is_editable is True
+    assert playlists["s2"].is_editable is False
+
+
 async def test_pages_beyond_the_first_terminate_the_loop() -> None:
     """The core pages a playlist until it returns nothing; a station serves one batch."""
     provider = _provider()
