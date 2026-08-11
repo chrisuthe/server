@@ -8,10 +8,13 @@ from unittest.mock import Mock
 
 import pytest
 from music_assistant_models.enums import MediaType, StreamType
-from music_assistant_models.errors import MediaNotFoundError
+from music_assistant_models.errors import InvalidDataError, MediaNotFoundError
 from music_assistant_models.media_items import SearchResults
 
-from music_assistant.providers.pandora.constants import STATIONS_ENDPOINT
+from music_assistant.providers.pandora.constants import (
+    CATALOG_ANNOTATE_ENDPOINT,
+    STATIONS_ENDPOINT,
+)
 from music_assistant.providers.pandora.fragments import (
     FRAGMENT_STALE_SECONDS,
     FRAGMENT_URL_TTL_SECONDS,
@@ -77,6 +80,79 @@ def _provider(
 
     provider._api_request = _fake_api_request  # type: ignore[method-assign, assignment]
     return provider
+
+
+def _annotating_provider(
+    annotations: dict[str, Any] | None = None,
+    on_demand: bool = True,
+) -> tuple[PandoraProvider, list[dict[str, Any]]]:
+    """
+    Build a provider whose annotateObjects calls return a canned map.
+
+    Returns the provider and a list recording each annotate request body, so a test can
+    assert whether the call was made at all rather than only what came back.
+    """
+    provider = PandoraProvider.__new__(PandoraProvider)
+    provider.manifest = Mock(domain="pandora")
+    provider.config = Mock(instance_id="pandora--test")
+    provider.logger = Mock()
+    provider._sessions = {}
+    provider._high_quality_available = False
+    provider._on_demand_available = on_demand
+    annotate_calls: list[dict[str, Any]] = []
+
+    async def _fake_api_request(
+        method: str,  # noqa: ARG001
+        url: str,
+        data: dict[str, Any] | None = None,
+        **kwargs: Any,  # noqa: ARG001
+    ) -> dict[str, Any]:
+        """Return canned fragment/annotate payloads instead of calling Pandora."""
+        if url == CATALOG_ANNOTATE_ENDPOINT:
+            annotate_calls.append(data or {})
+            return dict(annotations or {})
+        return {"tracks": _tracks()}
+
+    provider._api_request = _fake_api_request  # type: ignore[method-assign, assignment]
+    return provider, annotate_calls
+
+
+async def test_entitled_account_hydrates_a_fragment() -> None:
+    """One batched annotate call per fragment carries the catalogue ids the payload lacks."""
+    records = {"TR:S0": {"pandoraId": "TR:S0", "albumId": "AL:1", "artistId": "AR:1"}}
+    provider, calls = _annotating_provider(records)
+    await provider.get_playlist_tracks(STATION_ID)
+    assert len(calls) == 1
+    assert calls[0]["pandoraIds"] == [f"TR:S{index}" for index in range(4)]
+    assert provider._sessions[STATION_ID].current.annotations == records
+
+
+async def test_unentitled_account_does_not_hydrate() -> None:
+    """Without on-demand, catalogue ids would only offer albums whose tracks cannot play."""
+    provider, calls = _annotating_provider({"TR:S0": {}}, on_demand=False)
+    await provider.get_playlist_tracks(STATION_ID)
+    assert calls == []
+    assert provider._sessions[STATION_ID].current.annotations == {}
+
+
+async def test_failed_hydration_still_serves_the_station() -> None:
+    """Hydration is metadata enrichment; losing it must not stop playback."""
+    provider, _ = _annotating_provider()
+
+    async def _failing_request(
+        method: str,  # noqa: ARG001
+        url: str,
+        data: dict[str, Any] | None = None,  # noqa: ARG001
+        **kwargs: Any,  # noqa: ARG001
+    ) -> dict[str, Any]:
+        if url == CATALOG_ANNOTATE_ENDPOINT:
+            raise InvalidDataError("annotate exploded")
+        return {"tracks": _tracks()}
+
+    provider._api_request = _failing_request  # type: ignore[method-assign, assignment]
+    tracks = await provider.get_playlist_tracks(STATION_ID)
+    assert len(tracks) == 4
+    assert provider._sessions[STATION_ID].current.annotations == {}
 
 
 async def test_search_returns_a_matching_station_as_a_playlist() -> None:

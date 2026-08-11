@@ -38,6 +38,9 @@ class PandoraFragment:
     last_activity_at: float
     spent: bool = False
     served: set[str] = field(default_factory=set)
+    annotations: dict[str, Any] = field(default_factory=dict)
+    """Pandora catalogue records for these tracks, keyed by pandoraId. Empty when the
+    account is not entitled to on-demand playback, which is when they buy nothing."""
 
     def find(self, pandora_id: str) -> dict[str, Any] | None:
         """Return the raw track data for the given Pandora id, if this fragment holds it."""
@@ -92,9 +95,19 @@ class PandoraStationSession:
         """Return the newest fragment: an older one's signed URL might already have expired."""
         return self.fragments[-1] if self.fragments else None
 
-    def add_fragment(self, tracks: list[dict[str, Any]], now: float) -> PandoraFragment:
+    def add_fragment(
+        self,
+        tracks: list[dict[str, Any]],
+        now: float,
+        annotations: dict[str, Any] | None = None,
+    ) -> PandoraFragment:
         """Retain a freshly fetched fragment as the station's live one."""
-        fragment = PandoraFragment(tracks=tracks, fetched_at=now, last_activity_at=now)
+        fragment = PandoraFragment(
+            tracks=tracks,
+            fetched_at=now,
+            last_activity_at=now,
+            annotations=annotations or {},
+        )
         self.fragments.append(fragment)
         return fragment
 

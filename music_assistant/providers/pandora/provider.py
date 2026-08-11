@@ -24,6 +24,7 @@ from music_assistant_models.errors import (
     LoginFailed,
     MediaNotFoundError,
     ProviderUnavailableError,
+    ResourceTemporarilyUnavailable,
 )
 from music_assistant_models.media_items import (
     Album,
@@ -54,6 +55,7 @@ from music_assistant.models.music_provider import MusicProvider
 from .constants import (
     ACCOUNT_FLAG_HIGH_QUALITY,
     ACCOUNT_FLAG_ON_DEMAND,
+    CATALOG_ANNOTATE_ENDPOINT,
     CONF_QUALITY,
     CONF_TAKEOVER_ACTION,
     LOGIN_ENDPOINT,
@@ -493,7 +495,43 @@ class PandoraProvider(MusicProvider):
             raise MediaNotFoundError(
                 f"Pandora returned no playable tracks for {session.station_id}"
             )
-        return session.add_fragment(tracks, time.time())
+        return session.add_fragment(tracks, time.time(), await self._hydrate(tracks))
+
+    async def _hydrate(self, tracks: list[dict[str, Any]]) -> dict[str, Any]:
+        """
+        Return Pandora's catalogue records for the given tracks, keyed by pandoraId.
+
+        Empty for an account without on-demand entitlement: these records exist to make
+        albums and artists addressable, and a listener who cannot play a catalogue track
+        must not be offered one.
+
+        :param tracks: Retained fragment tracks, each carrying a `pandoraId`.
+        """
+        if not self._on_demand_available:
+            return {}
+        try:
+            response = await self._api_request(
+                "POST",
+                CATALOG_ANNOTATE_ENDPOINT,
+                data={
+                    "pandoraIds": [track["pandoraId"] for track in tracks],
+                    "annotateAlbumTracks": False,
+                },
+            )
+        except (
+            InvalidDataError,
+            MediaNotFoundError,
+            ProviderUnavailableError,
+            ResourceTemporarilyUnavailable,
+        ) as err:
+            # enrichment only: without it a track keeps its name, art and audio, so a
+            # station must keep playing rather than fail on a metadata call. Auth errors
+            # are deliberately NOT caught here - _api_request already re-authenticates once
+            # on a 401, so anything still raising past that must surface rather than degrade
+            # into a silently unhydrated station.
+            self.logger.warning("Could not annotate Pandora fragment tracks: %s", err)
+            return {}
+        return {key: value for key, value in response.items() if isinstance(value, dict)}
 
     async def _get_stations(self) -> AsyncGenerator[Playlist]:
         """Retrieve the user's stations from the provider."""
