@@ -223,29 +223,38 @@ class PandoraProvider(MusicProvider):
         # Already-served tracks are withheld: the queue controller only de-duplicates refill
         # candidates against its unplayed tail, so a served track that scrolls out of that
         # tail would otherwise be re-added here and then fail once the fragment has moved on.
-        return [self._parse_track(track) for track in fragment.pending]
+        return [self._parse_track(track, fragment.annotations) for track in fragment.pending]
 
     async def get_track(self, prov_track_id: str) -> Track:
         """Get full track details by id."""
         if (track := self._find_track(prov_track_id)) is None:
             raise MediaNotFoundError(f"Track {prov_track_id} not found")
-        return self._parse_track(track)
+        return self._parse_track(track, {})
 
     async def get_album(self, prov_album_id: str) -> Album:
         """
-        Get the album a station track belongs to.
+        Get an album by id.
 
-        Fragments carry no album identifier of their own, so an album is addressed by the id of
-        one of its tracks - see `_parse_album`, which mints the album that way.
+        A catalogue album is looked up directly. A station track's album has no catalogue
+        identity, so it is addressed by the id of one of its tracks - see `_parse_album`.
         """
+        if prov_album_id.startswith("AL:"):
+            return self._parse_album_record(await self._annotate(prov_album_id))
         if (track := self._find_track(prov_album_id)) and (
-            album := self._parse_album(track, prov_album_id)
+            album := self._parse_album(track, prov_album_id, {})
         ):
             return album
         raise MediaNotFoundError(f"Album {prov_album_id} not found")
 
     async def get_artist(self, prov_artist_id: str) -> Artist:
-        """Get artist details; Pandora identifies station artists by name only."""
+        """
+        Get an artist by id.
+
+        A catalogue artist is looked up directly; a station artist is identified by name.
+        """
+        if prov_artist_id.startswith("AR:"):
+            record = await self._annotate(prov_artist_id)
+            return self._parse_artist(str(record.get("name") or prov_artist_id), prov_artist_id)
         return self._parse_artist(prov_artist_id)
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
@@ -533,6 +542,22 @@ class PandoraProvider(MusicProvider):
             return {}
         return {key: value for key, value in response.items() if isinstance(value, dict)}
 
+    async def _annotate(self, pandora_id: str) -> dict[str, Any]:
+        """
+        Return Pandora's catalogue record for one id.
+
+        :raises MediaNotFoundError: If Pandora holds no record for the id.
+        """
+        response = await self._api_request(
+            "POST",
+            CATALOG_ANNOTATE_ENDPOINT,
+            data={"pandoraIds": [pandora_id], "annotateAlbumTracks": False},
+        )
+        record = response.get(pandora_id)
+        if not isinstance(record, dict):
+            raise MediaNotFoundError(f"Pandora has no record for {pandora_id}")
+        return record
+
     async def _get_stations(self) -> AsyncGenerator[Playlist]:
         """Retrieve the user's stations from the provider."""
         response = await self._api_request("POST", STATIONS_ENDPOINT, data={"pageSize": 250})
@@ -594,10 +619,17 @@ class PandoraProvider(MusicProvider):
                 )
         return playlist
 
-    def _parse_track(self, obj: dict[str, Any]) -> Track:
-        """Parse a raw fragment track into a Track."""
+    def _parse_track(self, obj: dict[str, Any], annotations: dict[str, Any]) -> Track:
+        """
+        Parse a raw fragment track into a Track.
+
+        :param obj: One raw track from a Pandora fragment.
+        :param annotations: Catalogue records keyed by pandoraId, empty when the account is
+            not entitled to on-demand playback.
+        """
         name, version = parse_title_and_version(obj.get("songTitle") or "Unknown Song")
         track_id = obj["pandoraId"]
+        record = annotations.get(track_id) or {}
         track = Track(
             item_id=track_id,
             provider=self.instance_id,
@@ -629,23 +661,32 @@ class PandoraProvider(MusicProvider):
                     )
                 )
         if artist_name := obj.get("artistName"):
-            track.artists = UniqueList([self._parse_artist(artist_name)])
-        track.album = self._parse_album(obj, track_id)
+            track.artists = UniqueList([self._parse_artist(artist_name, record.get("artistId"))])
+        track.album = self._parse_album(obj, track_id, record)
         return track
 
-    def _parse_album(self, obj: dict[str, Any], track_id: str) -> Album | None:
-        """Parse the album a fragment track belongs to, if the API named one."""
+    def _parse_album(
+        self, obj: dict[str, Any], track_id: str, record: dict[str, Any]
+    ) -> Album | None:
+        """
+        Parse the album a fragment track belongs to, if the API named one.
+
+        A hydrated track names its album in Pandora's catalogue, which is the id that album
+        carries everywhere else. A fragment on its own names no album at all, so the track's
+        own id stands in - the two cannot be confused, since they carry different prefixes.
+        """
         if not (url := obj.get("albumDetailURL")):
             return None
+        album_id = str(record.get("albumId") or track_id)
         name, version = parse_title_and_version(obj.get("albumTitle") or "Unknown Album")
         return Album(
-            item_id=track_id,
+            item_id=album_id,
             provider=self.instance_id,
             name=name,
             version=version,
             provider_mappings={
                 ProviderMapping(
-                    item_id=track_id,
+                    item_id=album_id,
                     provider_domain=self.domain,
                     provider_instance=self.instance_id,
                     url=url,
@@ -653,15 +694,38 @@ class PandoraProvider(MusicProvider):
             },
         )
 
-    def _parse_artist(self, artist_name: str) -> Artist:
-        """Parse an artist; Pandora fragments identify artists by name only."""
+    def _parse_artist(self, name: str, artist_id: str | None = None) -> Artist:
+        """
+        Parse an artist.
+
+        Without a catalogue id, a Pandora fragment identifies its artist by name only.
+        """
+        item_id = artist_id or name
         return Artist(
-            item_id=artist_name,
-            name=artist_name,
+            item_id=item_id,
+            name=name,
             provider=self.instance_id,
             provider_mappings={
                 ProviderMapping(
-                    item_id=artist_name,
+                    item_id=item_id,
+                    provider_domain=self.domain,
+                    provider_instance=self.instance_id,
+                )
+            },
+        )
+
+    def _parse_album_record(self, record: dict[str, Any]) -> Album:
+        """Parse an album from a Pandora catalogue record."""
+        album_id = str(record["pandoraId"])
+        name, version = parse_title_and_version(str(record.get("name") or "Unknown Album"))
+        return Album(
+            item_id=album_id,
+            provider=self.instance_id,
+            name=name,
+            version=version,
+            provider_mappings={
+                ProviderMapping(
+                    item_id=album_id,
                     provider_domain=self.domain,
                     provider_instance=self.instance_id,
                 )

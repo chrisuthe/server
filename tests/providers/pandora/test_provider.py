@@ -155,6 +155,54 @@ async def test_failed_hydration_still_serves_the_station() -> None:
     assert provider._sessions[STATION_ID].current.annotations == {}
 
 
+_HYDRATED = {
+    "TR:S0": {"pandoraId": "TR:S0", "albumId": "AL:900", "artistId": "AR:800"},
+    "AL:900": {"pandoraId": "AL:900", "name": "Some Album"},
+    "AR:800": {"pandoraId": "AR:800", "name": "Some Artist"},
+}
+
+
+async def test_hydrated_track_uses_catalogue_album_and_artist_ids() -> None:
+    """An entitled account's album and artist are the ids the catalogue uses everywhere."""
+    provider, _ = _annotating_provider(_HYDRATED)
+    tracks = await provider.get_playlist_tracks(STATION_ID)
+    assert tracks[0].album is not None
+    assert tracks[0].album.item_id == "AL:900"
+    assert tracks[0].artists[0].item_id == "AR:800"
+
+
+async def test_unhydrated_track_keeps_todays_album_and_artist() -> None:
+    """Without entitlement the album stays track-scoped and the artist name-keyed."""
+    provider, _ = _annotating_provider({}, on_demand=False)
+    tracks = await provider.get_playlist_tracks(STATION_ID)
+    assert tracks[0].album is not None
+    assert tracks[0].album.item_id == "TR:S0"
+    assert tracks[0].artists[0].item_id == "Some Artist"
+
+
+async def test_catalogue_album_is_resolvable_by_id() -> None:
+    """An AL: id offered on a track must resolve, or the track offers a dead link."""
+    provider, _ = _annotating_provider(_HYDRATED)
+    album = await provider.get_album("AL:900")
+    assert album.item_id == "AL:900"
+    assert album.name == "Some Album"
+
+
+async def test_catalogue_artist_is_resolvable_by_id() -> None:
+    """An AR: id must resolve to the artist's name, not to the id as a name."""
+    provider, _ = _annotating_provider(_HYDRATED)
+    artist = await provider.get_artist("AR:800")
+    assert artist.item_id == "AR:800"
+    assert artist.name == "Some Artist"
+
+
+async def test_unknown_catalogue_id_is_refused() -> None:
+    """Pandora returning no record is a missing item, not an empty one."""
+    provider, _ = _annotating_provider({})
+    with pytest.raises(MediaNotFoundError):
+        await provider.get_artist("AR:does-not-exist")
+
+
 async def test_search_returns_a_matching_station_as_a_playlist() -> None:
     """A station whose name matches the query comes back in the playlist results."""
     provider = _provider(stations=_stations(["Coldplay Radio", "Jazz Radio"]))
