@@ -40,7 +40,7 @@ class PandoraFragment:
     served: set[str] = field(default_factory=set)
     annotations: dict[str, Any] = field(default_factory=dict)
     """Pandora catalogue records for these tracks, keyed by pandoraId. Empty when the
-    account is not entitled to on-demand playback, which is when they buy nothing."""
+    account is not entitled to on-demand playback."""
 
     def find(self, pandora_id: str) -> dict[str, Any] | None:
         """Return the raw track data for the given Pandora id, if this fragment holds it."""

@@ -17,7 +17,7 @@ NOW = 1_000_000.0
 
 
 def _tracks(count: int = 4, prefix: str = "S") -> list[dict[str, Any]]:
-    """Build `count` raw Pandora track dicts with distinct music ids."""
+    """Build `count` raw Pandora track dicts with distinct Pandora ids."""
     return [
         {
             "musicId": f"{prefix}{index}",
@@ -175,7 +175,7 @@ def test_fragment_with_every_track_served_is_spent() -> None:
     assert fragment.pending == []
 
 
-def test_find_returns_track_by_music_id() -> None:
+def test_find_returns_track_by_pandora_id() -> None:
     """find() looks a raw track dict up by its Pandora id."""
     fragment = _fragment()
     found = fragment.find("TR:S2")

@@ -505,8 +505,6 @@ class PandoraProvider(MusicProvider):
             for track in result.get("tracks", [])
             if track.get("audioURL")
             and track.get("pandoraId")
-            and track.get("musicId")
-            and track.get("stationId")
             and "curator message" not in (track.get("songTitle") or "").lower()
         ]
         if not tracks:

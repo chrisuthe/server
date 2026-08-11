@@ -28,7 +28,7 @@ STATION_ID = "4360491625318318161"
 
 
 def _tracks(count: int = 4, prefix: str = "S") -> list[dict[str, Any]]:
-    """Build `count` raw Pandora track dicts with distinct music ids."""
+    """Build `count` raw Pandora track dicts with distinct Pandora ids."""
     return [
         {
             "musicId": f"{prefix}{index}",
@@ -248,6 +248,10 @@ async def test_hydrated_track_uses_catalogue_album_and_artist_ids() -> None:
     assert tracks[0].album is not None
     assert tracks[0].album.item_id == "AL:900"
     assert tracks[0].artists[0].item_id == "AR:800"
+    # only TR:S0 was annotated: the rest keep the unhydrated fallbacks, track by track
+    fallbacks = [track.album.item_id for track in tracks[1:] if track.album]
+    assert fallbacks == ["TR:S1", "TR:S2", "TR:S3"]
+    assert {track.artists[0].item_id for track in tracks[1:]} == {"Some Artist"}
 
 
 async def test_unhydrated_track_keeps_todays_album_and_artist() -> None:
@@ -530,25 +534,6 @@ async def test_track_with_null_album_title_gets_a_fallback_name() -> None:
     assert result[0].album.name == "Unknown Album"
 
 
-async def test_track_missing_station_id_is_dropped_not_crashed() -> None:
-    """A track without a stationId can't form a track id; drop it instead of raising."""
-    tracks = _tracks()
-    del tracks[0]["stationId"]
-    provider = _provider([tracks])
-    result = await provider.get_playlist_tracks(STATION_ID)
-    assert [track.item_id for track in result] == [f"TR:S{i}" for i in range(1, 4)]
-
-
-async def test_fragment_of_only_malformed_tracks_raises_media_not_found() -> None:
-    """If every track in a fragment is dropped, that's the empty-fragment error, not a crash."""
-    tracks = _tracks()
-    for track in tracks:
-        del track["stationId"]
-    provider = _provider([tracks])
-    with pytest.raises(MediaNotFoundError):
-        await provider.get_playlist_tracks(STATION_ID)
-
-
 async def test_track_with_a_sized_art_entry_missing_url_does_not_crash() -> None:
     """A size-500 art entry without a url key must not raise KeyError while parsing album art."""
     tracks = _tracks()
@@ -736,3 +721,52 @@ async def test_get_track_unknown_raises() -> None:
     provider = _provider()
     with pytest.raises(MediaNotFoundError):
         await provider.get_track("TR:nope")
+
+
+class _LoginResponse:
+    """Stand-in for the aiohttp POST `_authenticate` reads the login payload from."""
+
+    status = 200
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = payload
+
+    def post(self, *args: Any, **kwargs: Any) -> Self:
+        return self
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    async def json(self) -> dict[str, Any]:
+        return self._payload
+
+
+async def _login(monkeypatch: pytest.MonkeyPatch, flags: list[str]) -> PandoraProvider:
+    """Run a real _authenticate against a canned login payload carrying the given flags."""
+    provider = _provider()
+    provider.http_session = _LoginResponse(  # type: ignore[assignment]
+        {"authToken": "token", "listenerId": "listener", "config": {"flags": flags}}
+    )
+    monkeypatch.setattr(provider_module, "get_csrf_token", AsyncMock(return_value="csrf"))
+    await provider._authenticate("user", "secret")
+    return provider
+
+
+async def test_authentication_records_the_on_demand_entitlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole hydration gate hangs on this one assignment out of the login payload."""
+    provider = await _login(monkeypatch, ["onDemand", "highQualityStreamingAvailable"])
+    assert provider._on_demand_available is True
+    assert provider._high_quality_available is True
+
+
+async def test_authentication_leaves_a_free_account_unentitled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A login without onDemand must not leave the flag set from a previous account."""
+    provider = await _login(monkeypatch, ["adSupportedSkip"])
+    assert provider._on_demand_available is False
