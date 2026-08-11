@@ -65,6 +65,7 @@ def _provider(
     provider.manifest = Mock(domain="pandora")
     provider.config = Mock(instance_id="pandora--test")
     provider.logger = Mock()
+    provider.http_session = Mock(closed=False)
     provider._sessions = {}
     provider._high_quality_available = False
     pending = list(payloads or [_tracks()])
@@ -99,6 +100,7 @@ def _annotating_provider(
     provider.manifest = Mock(domain="pandora")
     provider.config = Mock(instance_id="pandora--test")
     provider.logger = Mock()
+    provider.http_session = Mock(closed=False)
     provider._sessions = {}
     provider._high_quality_available = False
     provider._on_demand_available = on_demand
@@ -162,6 +164,74 @@ async def test_failed_hydration_still_serves_the_station() -> None:
     fragment = provider._sessions[STATION_ID].current
     assert fragment is not None
     assert fragment.annotations == {}
+
+
+async def test_hydration_failure_over_a_closed_session_is_not_masked() -> None:
+    """
+    Degrading past a closed transport would report success over a connection that is gone.
+
+    Several _api_request paths close the session before raising; the next call would then
+    fail with a bare RuntimeError somewhere unrelated instead of here.
+    """
+    provider, _ = _annotating_provider(_HYDRATED)
+    provider.http_session = Mock(closed=True)
+
+    async def _failing_request(
+        method: str,  # noqa: ARG001
+        url: str,
+        data: dict[str, Any] | None = None,  # noqa: ARG001
+        **kwargs: Any,  # noqa: ARG001
+    ) -> dict[str, Any]:
+        if url == CATALOG_ANNOTATE_ENDPOINT:
+            raise InvalidDataError("annotate exploded after closing the session")
+        return {"tracks": _tracks()}
+
+    provider._api_request = _failing_request  # type: ignore[method-assign, assignment]
+    with pytest.raises(InvalidDataError):
+        await provider.get_playlist_tracks(STATION_ID)
+
+
+async def test_hydration_does_not_swallow_an_auth_failure() -> None:
+    """A login failure must surface, not degrade into a silently unhydrated station."""
+    provider, _ = _annotating_provider(_HYDRATED)
+
+    async def _failing_request(
+        method: str,  # noqa: ARG001
+        url: str,
+        data: dict[str, Any] | None = None,  # noqa: ARG001
+        **kwargs: Any,  # noqa: ARG001
+    ) -> dict[str, Any]:
+        if url == CATALOG_ANNOTATE_ENDPOINT:
+            raise LoginFailed("Pandora authentication failed after retry")
+        return {"tracks": _tracks()}
+
+    provider._api_request = _failing_request  # type: ignore[method-assign, assignment]
+    with pytest.raises(LoginFailed):
+        await provider.get_playlist_tracks(STATION_ID)
+
+
+async def test_hydration_never_takes_the_stream_over() -> None:
+    """Enrichment must not fight the concurrent-stream limit: that stops another device."""
+    provider, _ = _annotating_provider(_HYDRATED)
+    reasons: list[frozenset[str]] = []
+
+    async def _recording_request(
+        method: str,  # noqa: ARG001
+        url: str,
+        data: dict[str, Any] | None = None,
+        exhausted_retry_reasons: frozenset[str] = frozenset(),
+    ) -> dict[str, Any]:
+        if url == CATALOG_ANNOTATE_ENDPOINT:
+            reasons.append(exhausted_retry_reasons)
+            requested = (data or {}).get("pandoraIds") or []
+            return {item_id: {"name": "Some Artist"} for item_id in requested}
+        return {"tracks": _tracks()}
+
+    provider._api_request = _recording_request  # type: ignore[method-assign]
+    await provider.get_playlist_tracks(STATION_ID)
+    # an id no fragment annotated is the only route left that still calls out
+    await provider.get_artist("AR:not-in-any-fragment")
+    assert reasons == [frozenset({RETRY_REASON_STREAM_VIOLATION})] * 2
 
 
 _HYDRATED = {

@@ -537,6 +537,10 @@ class PandoraProvider(MusicProvider):
                     "pandoraIds": [track["pandoraId"] for track in tracks],
                     "annotateAlbumTracks": False,
                 },
+                # enrichment must never fight the concurrent-stream limit: taking the stream
+                # over would stop playback on the user's other device as a side effect of
+                # fetching metadata.
+                exhausted_retry_reasons=frozenset({RETRY_REASON_STREAM_VIOLATION}),
             )
         except (
             InvalidDataError,
@@ -544,11 +548,21 @@ class PandoraProvider(MusicProvider):
             ProviderUnavailableError,
             ResourceTemporarilyUnavailable,
         ) as err:
+            if self.http_session.closed:
+                # several _api_request error paths close the transport before raising, and
+                # for a socks user that is this provider's own session. Degrading past that
+                # would report a healthy fragment fetch and leave the next call failing with
+                # a bare "Session is closed" RuntimeError from somewhere unrelated, so only
+                # degrade while the connection is still usable.
+                raise
             # enrichment only: without it a track keeps its name, art and audio, so a
-            # station must keep playing rather than fail on a metadata call. Auth errors
-            # are deliberately NOT caught here - _api_request already re-authenticates once
-            # on a 401, so anything still raising past that must surface rather than degrade
-            # into a silently unhydrated station.
+            # station must keep playing rather than fail on a metadata call. The cost is
+            # that this fragment's songs fall back to track-scoped album and name-keyed
+            # artist identities, so they can pick up a second album or artist row alongside
+            # the catalogue ones - accepted, because serving no album at all is worse. Auth
+            # errors are deliberately NOT caught here - _api_request already re-authenticates
+            # once on a 401, so anything still raising past that must surface rather than
+            # degrade into a silently unhydrated station.
             self.logger.warning("Could not annotate Pandora fragment tracks: %s", err)
             return {}
         return {key: value for key, value in response.items() if isinstance(value, dict)}
@@ -563,6 +577,9 @@ class PandoraProvider(MusicProvider):
             "POST",
             CATALOG_ANNOTATE_ENDPOINT,
             data={"pandoraIds": [pandora_id], "annotateAlbumTracks": False},
+            # as in _hydrate: a metadata lookup must not take the stream over and stop
+            # playback on another device.
+            exhausted_retry_reasons=frozenset({RETRY_REASON_STREAM_VIOLATION}),
         )
         record = response.get(pandora_id)
         if not isinstance(record, dict):
