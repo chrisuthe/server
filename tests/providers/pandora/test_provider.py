@@ -274,7 +274,7 @@ async def test_the_same_song_from_two_stations_is_one_item() -> None:
 
 
 async def test_a_track_without_a_pandora_id_is_not_served() -> None:
-    """pandoraId is identity now, so a track lacking one cannot be handed to the queue."""
+    """A track lacking a pandoraId cannot be handed to the queue: the id is identity now."""
     usable = _tracks(count=2)
     unusable = _tracks(count=2, prefix="X")
     for track in unusable:

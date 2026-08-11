@@ -44,9 +44,7 @@ class PandoraFragment:
 
     def find(self, pandora_id: str) -> dict[str, Any] | None:
         """Return the raw track data for the given Pandora id, if this fragment holds it."""
-        return next(
-            (track for track in self.tracks if track.get("pandoraId") == pandora_id), None
-        )
+        return next((track for track in self.tracks if track.get("pandoraId") == pandora_id), None)
 
     def mark_resolved(self, pandora_id: str, now: float) -> None:
         """Record that the given track has been handed to the audio pipeline."""
