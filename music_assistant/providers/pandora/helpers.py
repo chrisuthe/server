@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import secrets
 from typing import Any
 
@@ -110,6 +111,23 @@ def create_auth_headers(csrf_token: str, auth_token: str | None = None) -> dict[
         headers["X-AuthToken"] = auth_token
 
     return headers
+
+
+async def raise_if_no_entitlements(response: aiohttp.ClientResponse) -> None:
+    """
+    Raise MediaNotFoundError if a 400 response reports the account lacks on-demand rights.
+
+    Returns silently for any other body, including one that fails to parse as JSON, so the
+    caller can fall back to its own handling of the response.
+
+    :param response: The still-open aiohttp response for a Pandora 400 status.
+    """
+    try:
+        error_body = await response.json()
+    except aiohttp.ContentTypeError, json.JSONDecodeError:
+        return
+    if error_body.get("errorString") == "NO_ENTITLEMENTS":
+        raise MediaNotFoundError("On-demand playback is not available on this Pandora account")
 
 
 def read_account_flags(response_data: dict[str, Any]) -> set[str]:

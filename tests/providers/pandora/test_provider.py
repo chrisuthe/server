@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any, Self, cast
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from music_assistant_models.enums import MediaType, StreamType
-from music_assistant_models.errors import MediaNotFoundError, MusicAssistantError
+from music_assistant_models.errors import InvalidDataError, MediaNotFoundError, MusicAssistantError
 from music_assistant_models.media_items import SearchResults
 
 from music_assistant.constants import CONF_PASSWORD, CONF_USERNAME
@@ -786,3 +787,80 @@ async def test_remove_playlist_tracks_refuses_positional_removal() -> None:
     with pytest.raises(MusicAssistantError):
         await provider.remove_playlist_tracks(STATION_ID, (0, 2))
     assert calls == []
+
+
+class _ApiResponse:
+    """Stand-in for the aiohttp session+response `_api_request` reads status and body from."""
+
+    def __init__(self, status: int, payload: Any = None, *, bad_json: bool = False) -> None:
+        self.status = status
+        self._payload = payload
+        self._bad_json = bad_json
+        self.close = AsyncMock()
+
+    def request(self, *args: Any, **kwargs: Any) -> Self:
+        return self
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    async def json(self) -> Any:
+        if self._bad_json:
+            raise json.JSONDecodeError("bad json", "", 0)
+        return self._payload
+
+
+def _api_provider(response: _ApiResponse) -> PandoraProvider:
+    """Build a bare provider whose http_session is the given canned response stand-in."""
+    provider = PandoraProvider.__new__(PandoraProvider)
+    provider._csrf_token = "csrf"
+    provider._auth_token = "auth"
+    provider._socks_proxy = True
+    provider.http_session = response  # type: ignore[assignment]
+    return provider
+
+
+async def test_no_entitlements_400_names_the_refusal_and_leaves_session_open() -> None:
+    """A free account's on-demand refusal must be legible, not a generic close-and-raise."""
+    response = _ApiResponse(
+        400,
+        {
+            "message": "Listener does not have rights to play source AP:16722:15160249",
+            "errorCode": 0,
+            "errorString": "NO_ENTITLEMENTS",
+        },
+    )
+    provider = _api_provider(response)
+    with pytest.raises(MediaNotFoundError, match="not available"):
+        await provider._api_request("GET", "https://example.com/x")
+    response.close.assert_not_called()
+
+
+async def test_other_400_body_still_raises_the_generic_api_error() -> None:
+    """A 400 that isn't the entitlement refusal keeps the pre-existing behaviour."""
+    response = _ApiResponse(400, {"errorString": "SOME_OTHER_ERROR"})
+    provider = _api_provider(response)
+    with pytest.raises(InvalidDataError):
+        await provider._api_request("GET", "https://example.com/x")
+    response.close.assert_called_once()
+
+
+async def test_non_json_400_body_does_not_crash() -> None:
+    """A 400 whose body isn't JSON must still raise cleanly, not a parse error."""
+    response = _ApiResponse(400, bad_json=True)
+    provider = _api_provider(response)
+    with pytest.raises(InvalidDataError):
+        await provider._api_request("GET", "https://example.com/x")
+    response.close.assert_called_once()
+
+
+async def test_404_still_closes_the_session() -> None:
+    """Other status branches keep closing the session; only the 400 refusal path changed."""
+    response = _ApiResponse(404)
+    provider = _api_provider(response)
+    with pytest.raises(MediaNotFoundError):
+        await provider._api_request("GET", "https://example.com/x")
+    response.close.assert_called_once()
