@@ -60,3 +60,7 @@ QUALITY_HIGH = "high"
 QUALITY_STANDARD = "standard"
 
 ACCOUNT_FLAG_HIGH_QUALITY = "highQualityStreamingAvailable"
+# Premium-only: the account may play a chosen track without an ad. Free accounts carry
+# adSupportedReplay/adSupportedSkip instead and can play on demand only after an ad
+# exchange, which Music Assistant cannot present.
+ACCOUNT_FLAG_ON_DEMAND = "onDemand"

@@ -53,6 +53,7 @@ from music_assistant.models.music_provider import MusicProvider
 
 from .constants import (
     ACCOUNT_FLAG_HIGH_QUALITY,
+    ACCOUNT_FLAG_ON_DEMAND,
     CONF_QUALITY,
     CONF_TAKEOVER_ACTION,
     LOGIN_ENDPOINT,
@@ -65,7 +66,12 @@ from .constants import (
     STATIONS_ENDPOINT,
 )
 from .fragments import PandoraFragment, PandoraStationSession, should_fetch_fragment
-from .helpers import create_auth_headers, get_csrf_token, handle_pandora_error
+from .helpers import (
+    create_auth_headers,
+    get_csrf_token,
+    handle_pandora_error,
+    read_account_flags,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Sequence
@@ -84,6 +90,7 @@ class PandoraProvider(MusicProvider):
     _sessions: dict[str, PandoraStationSession]
     _socks_proxy: bool = False
     _high_quality_available: bool = False
+    _on_demand_available: bool = False
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return Config entries to configure this provider."""
@@ -328,17 +335,17 @@ class PandoraProvider(MusicProvider):
 
                 self._user_id = response_data.get("listenerId")
 
-                # Check whether the account is eligible for high-quality streaming.
-                try:
-                    flags: list[str] = response_data.get("config", {}).get("flags", [])
-                    self._high_quality_available = ACCOUNT_FLAG_HIGH_QUALITY in flags
-                except AttributeError, TypeError:
-                    self._high_quality_available = False
+                # What this account is entitled to. Pandora sends config and flags as null
+                # on some accounts, so read through them rather than guarding after the fact.
+                flags = read_account_flags(response_data)
+                self._high_quality_available = ACCOUNT_FLAG_HIGH_QUALITY in flags
+                self._on_demand_available = ACCOUNT_FLAG_ON_DEMAND in flags
 
                 self.logger.info(
                     "Successfully authenticated with Pandora "
-                    "(high-quality streaming available: %s)",
+                    "(high-quality streaming: %s, on-demand: %s)",
                     self._high_quality_available,
+                    self._on_demand_available,
                 )
 
         except aiohttp.ClientError as err:
