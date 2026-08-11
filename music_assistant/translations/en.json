@@ -2107,6 +2107,7 @@
   "provider.sendspin.setup_flow.select_method.title": "Pair this device",
   "provider.sendspin.setup_flow.verify_pin.description": "Enter the device's PIN to confirm it is the physical device in front of you.",
   "provider.sendspin.setup_flow.verify_pin.title": "Verify device presence",
+  "provider.sendspin_sync.manifest.description": "Experimental synchronization plugin built on the Sendspin protocol.",
   "provider.siriusxm.config_entries.sxm_region.label": "Region",
   "provider.siriusxm.config_entries.sxm_region.options.CA": "Canada",
   "provider.siriusxm.config_entries.sxm_region.options.US": "United States",

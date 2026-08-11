@@ -1,0 +1,12 @@
+{
+  "type": "plugin",
+  "stage": "experimental",
+  "domain": "sendspin_sync",
+  "name": "Sendspin Sync",
+  "description": "Experimental synchronization plugin built on the Sendspin protocol.",
+  "codeowners": ["@chrisuthe"],
+  "depends_on": "sendspin",
+  "requirements": [],
+  "multi_instance": false,
+  "builtin": false
+}
