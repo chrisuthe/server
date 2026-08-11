@@ -203,6 +203,17 @@ async def test_unknown_catalogue_id_is_refused() -> None:
         await provider.get_artist("AR:does-not-exist")
 
 
+async def test_get_track_matches_playlist_tracks_identity() -> None:
+    """A hydrated track resolves to the same album and artist by either entry point."""
+    provider, _ = _annotating_provider(_HYDRATED)
+    listed = (await provider.get_playlist_tracks(STATION_ID))[0]
+    looked_up = await provider.get_track("TR:S0")
+    assert looked_up.album is not None
+    assert listed.album is not None
+    assert looked_up.album.item_id == listed.album.item_id
+    assert looked_up.artists[0].item_id == listed.artists[0].item_id
+
+
 async def test_search_returns_a_matching_station_as_a_playlist() -> None:
     """A station whose name matches the query comes back in the playlist results."""
     provider = _provider(stations=_stations(["Coldplay Radio", "Jazz Radio"]))

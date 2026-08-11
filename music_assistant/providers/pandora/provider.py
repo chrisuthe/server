@@ -227,9 +227,10 @@ class PandoraProvider(MusicProvider):
 
     async def get_track(self, prov_track_id: str) -> Track:
         """Get full track details by id."""
-        if (track := self._find_track(prov_track_id)) is None:
+        if (found := self._find_track_with_annotations(prov_track_id)) is None:
             raise MediaNotFoundError(f"Track {prov_track_id} not found")
-        return self._parse_track(track, {})
+        track, annotations = found
+        return self._parse_track(track, annotations)
 
     async def get_album(self, prov_album_id: str) -> Album:
         """
@@ -587,6 +588,21 @@ class PandoraProvider(MusicProvider):
         for session in self._sessions.values():
             if (track := session.find_track(prov_track_id)) is not None:
                 return track
+        return None
+
+    def _find_track_with_annotations(
+        self, prov_track_id: str
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """
+        Return raw track data and its owning fragment's annotations, from any retained fragment.
+
+        Mirrors `_find_track`, but also returns the annotations a hydrated fragment carries for
+        the track, so a track resolves to the same album and artist identity whether it is
+        reached through a station listing or looked up directly by id.
+        """
+        for session in self._sessions.values():
+            if (found := session.find_track_with_annotations(prov_track_id)) is not None:
+                return found
         return None
 
     def _parse_station(self, station: dict[str, Any]) -> Playlist:
