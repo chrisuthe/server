@@ -39,17 +39,19 @@ class PandoraFragment:
     spent: bool = False
     served: set[str] = field(default_factory=set)
 
-    def find(self, music_id: str) -> dict[str, Any] | None:
-        """Return the raw track data for the given Pandora musicId, if this fragment holds it."""
-        return next((track for track in self.tracks if track.get("musicId") == music_id), None)
+    def find(self, pandora_id: str) -> dict[str, Any] | None:
+        """Return the raw track data for the given Pandora id, if this fragment holds it."""
+        return next(
+            (track for track in self.tracks if track.get("pandoraId") == pandora_id), None
+        )
 
-    def mark_resolved(self, music_id: str, now: float) -> None:
+    def mark_resolved(self, pandora_id: str, now: float) -> None:
         """Record that the given track has been handed to the audio pipeline."""
-        if self.find(music_id) is None:
+        if self.find(pandora_id) is None:
             return
         self.last_activity_at = now
-        self.served.add(music_id)
-        if self.tracks[-1].get("musicId") == music_id:
+        self.served.add(pandora_id)
+        if self.tracks[-1].get("pandoraId") == pandora_id:
             self.spent = True
 
     def is_stale(self, now: float) -> bool:
@@ -72,7 +74,7 @@ class PandoraFragment:
         which matters because `get_playlist_tracks` treats an empty list as "this station has
         ended".
         """
-        return [track for track in self.tracks if track.get("musicId") not in self.served]
+        return [track for track in self.tracks if track.get("pandoraId") not in self.served]
 
 
 @dataclass
@@ -96,10 +98,10 @@ class PandoraStationSession:
         self.fragments.append(fragment)
         return fragment
 
-    def find_track(self, music_id: str) -> dict[str, Any] | None:
+    def find_track(self, pandora_id: str) -> dict[str, Any] | None:
         """Return raw track data from any retained fragment, newest first."""
         for fragment in reversed(self.fragments):
-            if (track := fragment.find(music_id)) is not None:
+            if (track := fragment.find(pandora_id)) is not None:
                 return track
         return None
 
