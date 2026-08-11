@@ -30,7 +30,7 @@
     },
     "allow_station_delete": {
       "label": "Allow deleting stations",
-      "description": "When enabled, removing a Pandora station from your Music Assistant library also deletes it from your Pandora account. Pandora deletions are permanent and cannot be undone. Leave this off to keep library removals local to Music Assistant."
+      "description": "When enabled, removing a Pandora station from your Music Assistant library also deletes it from your Pandora account. Pandora deletions are permanent and cannot be undone. Leave this off and the station stays on your Pandora account, so it reappears in Music Assistant on the next library sync."
     }
   },
   "setup_flow": {

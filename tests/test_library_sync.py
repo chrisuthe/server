@@ -10,7 +10,13 @@ from unittest.mock import AsyncMock, Mock, PropertyMock, patch
 import pytest
 from music_assistant_models.enums import EventType, MediaType, ProviderType
 from music_assistant_models.errors import InsufficientPermissions
-from music_assistant_models.media_items import Album, AudioFormat, ProviderMapping, UniqueList
+from music_assistant_models.media_items import (
+    Album,
+    AudioFormat,
+    Playlist,
+    ProviderMapping,
+    UniqueList,
+)
 
 from music_assistant.constants import CONF_ENTRY_LIBRARY_SYNC_BACK
 from music_assistant.controllers.music import MusicController
@@ -1199,3 +1205,75 @@ async def test_provider_sync_suppresses_per_item_events() -> None:
     assert SUPPRESS_MEDIA_ITEM_UPDATES.get() is False
     await ctrl.add_item_to_library(create_mock_album(provider="spotify"))
     assert events == [EventType.MUSIC_SYNC_COMPLETED, EventType.MEDIA_ITEM_ADDED]
+
+
+# --- Group 8: _library_item_needs_update playlist is_editable ---
+
+
+def _create_provider_for_needs_update_tests() -> Mock:
+    """Create a mock MusicProvider with the real needs-update/mapping-check methods bound."""
+    provider = Mock(spec=MusicProvider)
+    provider.instance_id = "pandora_1"
+    provider._library_item_needs_update = MusicProvider._library_item_needs_update.__get__(provider)
+    provider._check_provider_mappings = MusicProvider._check_provider_mappings.__get__(provider)
+    return provider
+
+
+def _create_playlist_pair(
+    *, library_is_editable: bool, prov_is_editable: bool
+) -> tuple[Playlist, Playlist]:
+    """Build a matching library/provider Playlist pair differing only in is_editable."""
+    library_mapping = create_provider_mapping(
+        provider_instance="pandora_1",
+        provider_domain="pandora",
+        item_id="station_1",
+        in_library=True,
+    )
+    library_mapping.is_unique = True
+    prov_mapping = create_provider_mapping(
+        provider_instance="pandora_1",
+        provider_domain="pandora",
+        item_id="station_1",
+        in_library=True,
+    )
+    prov_mapping.is_unique = True
+
+    library_item = Playlist(
+        item_id="1",
+        provider="library",
+        name="Test Station",
+        provider_mappings={library_mapping},
+        is_editable=library_is_editable,
+    )
+    prov_item = Playlist(
+        item_id="station_1",
+        provider="pandora_1",
+        name="Test Station",
+        provider_mappings={prov_mapping},
+        is_editable=prov_is_editable,
+    )
+    return library_item, prov_item
+
+
+def test_library_item_needs_update_true_when_is_editable_differs() -> None:
+    """
+    Test that a changed is_editable flag triggers a library update.
+
+    Pandora reports allowAddSeed per station without a date_added change, so a stored
+    is_editable that no longer matches the provider must be detected on its own,
+    otherwise the playlist edit gate keeps answering for the stale value forever.
+    """
+    provider = _create_provider_for_needs_update_tests()
+    library_item, prov_item = _create_playlist_pair(
+        library_is_editable=False, prov_is_editable=True
+    )
+
+    assert provider._library_item_needs_update(library_item, prov_item) is True
+
+
+def test_library_item_needs_update_false_when_identical() -> None:
+    """Test that identical playlists (including is_editable) do not need an update."""
+    provider = _create_provider_for_needs_update_tests()
+    library_item, prov_item = _create_playlist_pair(library_is_editable=True, prov_is_editable=True)
+
+    assert provider._library_item_needs_update(library_item, prov_item) is False

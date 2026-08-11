@@ -1549,6 +1549,15 @@ class MusicProvider(Provider):
         if not self._check_provider_mappings(library_item, prov_item, True):
             # provider mapping doesn't match the library item
             return True
+        if (
+            isinstance(prov_item, Playlist)
+            and isinstance(library_item, Playlist)
+            and prov_item.is_editable != library_item.is_editable
+        ):
+            # a provider can start or stop allowing edits on a playlist it already exposed;
+            # without this the stored flag never changes and the edit gate keeps answering
+            # for the old value
+            return True
         # the item's date_added changed on the provider
         return bool(prov_item.date_added and library_item.date_added != prov_item.date_added)
 
