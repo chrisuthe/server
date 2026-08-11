@@ -625,19 +625,23 @@ class PandoraProvider(MusicProvider):
 
     def _find_annotation(self, pandora_id: str) -> dict[str, Any] | None:
         """
-        Return a catalogue record a retained fragment already holds for the given id, or None.
+        Return the catalogue record the freshest retained fragment holds for the given id.
 
         Hydration annotates a whole fragment in one call, albums and artists included, so the
         record an album or artist lookup wants is usually in hand already. Music Assistant
         resolves those per item, so refetching them here would put the provider back to one
-        network call per album and per artist in a listing.
+        network call per album and per artist in a listing. Fragments overlap the same way
+        tracks do, so the freshest one holding the id decides, consistent with
+        `_find_track_with_fragment` above.
         """
-        for session in self._sessions.values():
-            for fragment in session.fragments:
-                if pandora_id in fragment.annotations:
-                    record: dict[str, Any] = fragment.annotations[pandora_id]
-                    return record
-        return None
+        holders = [
+            fragment
+            for session in self._sessions.values()
+            for fragment in session.fragments
+            if pandora_id in fragment.annotations
+        ]
+        freshest = max(holders, key=lambda fragment: fragment.fetched_at, default=None)
+        return freshest.annotations[pandora_id] if freshest is not None else None
 
     def _parse_station(self, station: dict[str, Any]) -> Playlist:
         """Parse a station object into a dynamic playlist."""

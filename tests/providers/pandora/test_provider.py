@@ -691,6 +691,27 @@ async def test_get_track_uses_the_freshest_fragments_annotations() -> None:
     assert track.artists[0].item_id == "AR:800"
 
 
+async def test_freshest_fragment_wins_regardless_of_session_order() -> None:
+    """
+    Freshest-fragment selection must not coincide only with insertion order.
+
+    The tests above always make the first-inserted session, station-a, the degraded one,
+    so a regression to any insertion-order rule would still pass them. Here station-a is
+    inserted first but holds the freshest fragment - a station refetching after another
+    was opened - while station-b, inserted second, is the one that has gone stale.
+    """
+    stale_tracks = _tracks()
+    stale_tracks[0] = {**stale_tracks[0], "songTitle": "Stale Song 0"}
+    provider = _provider(payloads=[_tracks(), stale_tracks])
+    await provider.get_playlist_tracks("station-a")
+    await provider.get_playlist_tracks("station-b")
+    stale = provider._sessions["station-b"].current
+    assert stale is not None
+    stale.fetched_at -= 60
+    track = await provider.get_track("TR:S0")
+    assert track.name == "Song 0"
+
+
 async def test_stream_details_rejects_other_media_types() -> None:
     """Stations expose tracks only; radio is gone."""
     provider = _provider()
