@@ -216,20 +216,20 @@ def test_session_retains_a_bounded_number_of_fragments() -> None:
     assert len(session.fragments) == MAX_RETAINED_FRAGMENTS
 
 
-def test_session_find_track_searches_retained_fragments() -> None:
+def test_session_keeps_played_fragments_resolvable() -> None:
     """Recently played tracks stay resolvable for queue history."""
     session = PandoraStationSession("4360491625318318161")
     session.add_fragment(_tracks(prefix="old"), NOW)
     session.add_fragment(_tracks(prefix="new"), NOW)
-    assert session.find_track("TR:old1") is not None
-    assert session.find_track("TR:new1") is not None
-    assert session.find_track("gone") is None
+    assert any(fragment.find("TR:old1") for fragment in session.fragments)
+    assert any(fragment.find("TR:new1") for fragment in session.fragments)
+    assert not any(fragment.find("gone") for fragment in session.fragments)
 
 
-def test_session_find_track_drops_evicted_fragments() -> None:
+def test_session_drops_evicted_fragments() -> None:
     """A fragment pushed out of the deque is no longer resolvable."""
     session = PandoraStationSession("4360491625318318161")
     session.add_fragment(_tracks(prefix="first"), NOW)
     for index in range(MAX_RETAINED_FRAGMENTS):
         session.add_fragment(_tracks(prefix=f"later{index}_"), NOW)
-    assert session.find_track("TR:first1") is None
+    assert not any(fragment.find("TR:first1") for fragment in session.fragments)

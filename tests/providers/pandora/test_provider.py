@@ -3,21 +3,24 @@
 from __future__ import annotations
 
 import time
-from typing import Any
-from unittest.mock import Mock
+from typing import Any, Self
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from music_assistant_models.enums import MediaType, StreamType
-from music_assistant_models.errors import InvalidDataError, MediaNotFoundError
+from music_assistant_models.errors import InvalidDataError, LoginFailed, MediaNotFoundError
 from music_assistant_models.media_items import SearchResults
 
+from music_assistant.providers.pandora import provider as provider_module
 from music_assistant.providers.pandora.constants import (
     CATALOG_ANNOTATE_ENDPOINT,
+    RETRY_REASON_STREAM_VIOLATION,
     STATIONS_ENDPOINT,
 )
 from music_assistant.providers.pandora.fragments import (
     FRAGMENT_STALE_SECONDS,
     FRAGMENT_URL_TTL_SECONDS,
+    MAX_RETAINED_FRAGMENTS,
 )
 from music_assistant.providers.pandora.provider import PandoraProvider
 
@@ -207,6 +210,64 @@ async def test_unknown_catalogue_id_is_refused() -> None:
     provider, _ = _annotating_provider({})
     with pytest.raises(MediaNotFoundError):
         await provider.get_artist("AR:does-not-exist")
+
+
+async def test_catalogue_album_reuses_a_hydrated_fragments_record() -> None:
+    """Hydration already fetched this record; MA resolves albums per item, so do not refetch."""
+    provider, calls = _annotating_provider(_HYDRATED)
+    await provider.get_playlist_tracks(STATION_ID)
+    calls.clear()
+    album = await provider.get_album("AL:900")
+    assert album.item_id == "AL:900"
+    assert album.name == "Some Album"
+    assert calls == []
+
+
+async def test_catalogue_artist_reuses_a_hydrated_fragments_record() -> None:
+    """Same for artists: one batched call per fragment must not become one call per item."""
+    provider, calls = _annotating_provider(_HYDRATED)
+    await provider.get_playlist_tracks(STATION_ID)
+    calls.clear()
+    artist = await provider.get_artist("AR:800")
+    assert artist.item_id == "AR:800"
+    assert artist.name == "Some Artist"
+    assert calls == []
+
+
+async def test_catalogue_album_keeps_the_requested_id() -> None:
+    """A record without a pandoraId field must not break the lookup or rename the album."""
+    provider, _ = _annotating_provider({"AL:900": {"name": "Some Album"}})
+    album = await provider.get_album("AL:900")
+    assert album.item_id == "AL:900"
+
+
+async def test_unentitled_album_is_addressed_by_its_tracks_id() -> None:
+    """Without entitlement this is the only album route there is, and the id must round-trip."""
+    provider, _ = _annotating_provider({}, on_demand=False)
+    await provider.get_playlist_tracks(STATION_ID)
+    album = await provider.get_album("TR:S0")
+    assert album.item_id == "TR:S0"
+    assert album.name == "Some Album"
+
+
+async def test_unentitled_album_is_gone_once_its_track_ages_out() -> None:
+    """A track-keyed album only exists while the fragment naming it is still retained."""
+    prefixes = [chr(ord("A") + index) for index in range(MAX_RETAINED_FRAGMENTS + 1)]
+    provider = _provider([_tracks(prefix=prefix) for prefix in prefixes])
+    for prefix in prefixes:
+        await provider.get_playlist_tracks(STATION_ID)
+        await provider.get_stream_details(f"TR:{prefix}3", MediaType.TRACK)
+    with pytest.raises(MediaNotFoundError):
+        await provider.get_album("TR:A0")
+
+
+async def test_unentitled_artist_is_identified_by_name() -> None:
+    """A name-keyed artist resolves without a catalogue lookup: there is no id to look up."""
+    provider, calls = _annotating_provider({}, on_demand=False)
+    artist = await provider.get_artist("Some Artist")
+    assert artist.item_id == "Some Artist"
+    assert artist.name == "Some Artist"
+    assert calls == []
 
 
 async def test_get_track_matches_playlist_tracks_identity() -> None:
@@ -489,6 +550,90 @@ async def test_stream_details_after_an_ordinary_pause_still_serves() -> None:
     assert fragment.is_stale(time.time()) is True
     details = await provider.get_stream_details("TR:S0", MediaType.TRACK)
     assert details.path == "https://audio-sv5-t3-2.pandora.com/access/0.mp4"
+
+
+async def test_a_fresher_session_serves_a_track_another_holds_expired() -> None:
+    """
+    Stations overlap: one station's expired copy must not fail a track another can still play.
+
+    Refusing on the first match made playback failure depend on which station was browsed
+    first, which is not something the user can see or influence.
+    """
+    provider = _provider()
+    await provider.get_playlist_tracks("station-a")
+    await provider.get_playlist_tracks("station-b")
+    stale = provider._sessions["station-a"].current
+    assert stale is not None
+    stale.fetched_at -= FRAGMENT_URL_TTL_SECONDS + 1
+    details = await provider.get_stream_details("TR:S0", MediaType.TRACK)
+    assert details.item_id == "TR:S0"
+    assert details.path == "https://audio-sv5-t3-2.pandora.com/access/0.mp4"
+
+
+async def test_every_copy_expired_still_raises_the_named_error() -> None:
+    """With no session able to serve it, the failure is still the paused-too-long one."""
+    provider = _provider()
+    await provider.get_playlist_tracks("station-a")
+    await provider.get_playlist_tracks("station-b")
+    for station in ("station-a", "station-b"):
+        fragment = provider._sessions[station].current
+        assert fragment is not None
+        fragment.fetched_at -= FRAGMENT_URL_TTL_SECONDS + 1
+    with pytest.raises(MediaNotFoundError, match="expired while playback was stopped"):
+        await provider.get_stream_details("TR:S0", MediaType.TRACK)
+
+
+async def test_the_serving_session_is_the_one_marked_as_having_served() -> None:
+    """
+    Recording the hand-out on another station's fragment corrupts both stations' refills.
+
+    The served track stays pending where it played and is re-offered, while the fragment
+    that never served it is driven towards spent.
+    """
+    provider = _provider()
+    await provider.get_playlist_tracks("station-a")
+    await provider.get_playlist_tracks("station-b")
+    older = provider._sessions["station-a"].current
+    newer = provider._sessions["station-b"].current
+    assert older is not None
+    assert newer is not None
+    older.fetched_at -= 60
+    await provider.get_stream_details("TR:S0", MediaType.TRACK)
+    assert newer.served == {"TR:S0"}
+    assert older.served == set()
+
+
+async def test_get_track_uses_the_freshest_fragments_annotations() -> None:
+    """
+    A song must not resolve to two different albums depending on session insertion order.
+
+    One station's hydration failing while another's succeeded used to decide the identity by
+    dict order; the freshest fetch is Pandora's latest answer and decides it now.
+    """
+    provider, _ = _annotating_provider(_HYDRATED)
+    records: dict[str, Any] = {}
+
+    async def _switchable_request(
+        method: str,  # noqa: ARG001
+        url: str,
+        data: dict[str, Any] | None = None,  # noqa: ARG001
+        **kwargs: Any,  # noqa: ARG001
+    ) -> dict[str, Any]:
+        if url == CATALOG_ANNOTATE_ENDPOINT:
+            return dict(records)
+        return {"tracks": _tracks()}
+
+    provider._api_request = _switchable_request  # type: ignore[method-assign, assignment]
+    await provider.get_playlist_tracks("station-a")  # hydration came back empty here
+    records = _HYDRATED
+    await provider.get_playlist_tracks("station-b")
+    unhydrated = provider._sessions["station-a"].current
+    assert unhydrated is not None
+    unhydrated.fetched_at -= 60
+    track = await provider.get_track("TR:S0")
+    assert track.album is not None
+    assert track.album.item_id == "AL:900"
+    assert track.artists[0].item_id == "AR:800"
 
 
 async def test_stream_details_rejects_other_media_types() -> None:

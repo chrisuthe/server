@@ -109,22 +109,6 @@ class PandoraStationSession:
         self.fragments.append(fragment)
         return fragment
 
-    def find_track(self, pandora_id: str) -> dict[str, Any] | None:
-        """Return raw track data from any retained fragment, newest first."""
-        for fragment in reversed(self.fragments):
-            if (track := fragment.find(pandora_id)) is not None:
-                return track
-        return None
-
-    def find_track_with_annotations(
-        self, pandora_id: str
-    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
-        """Return raw track data and its owning fragment's annotations, newest first."""
-        for fragment in reversed(self.fragments):
-            if (track := fragment.find(pandora_id)) is not None:
-                return track, fragment.annotations
-        return None
-
 
 def should_fetch_fragment(fragment: PandoraFragment | None, now: float) -> bool:
     """
