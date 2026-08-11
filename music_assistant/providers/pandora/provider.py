@@ -16,7 +16,6 @@ from music_assistant_models.config_entries import (
 from music_assistant_models.enums import (
     ConfigEntryType,
     ContentType,
-    ImageType,
     MediaType,
     StreamType,
 )
@@ -33,15 +32,12 @@ from music_assistant_models.media_items import (
     AudioFormat,
     BrowseFolder,
     ItemMapping,
-    MediaItemImage,
     MediaItemType,
     Playlist,
-    ProviderMapping,
     SearchResults,
     Track,
 )
 from music_assistant_models.streamdetails import StreamDetails
-from music_assistant_models.unique_list import UniqueList
 
 from music_assistant.constants import (
     CONF_ENTRY_UNOFFICIAL_PROVIDER,
@@ -50,7 +46,6 @@ from music_assistant.constants import (
     CONF_USERNAME,
 )
 from music_assistant.helpers.aiohttp_client import create_clientsession, get_socks5_url
-from music_assistant.helpers.util import parse_title_and_version
 from music_assistant.models.music_provider import MusicProvider
 
 from .constants import (
@@ -82,6 +77,7 @@ from .helpers import (
     raise_if_no_entitlements,
     read_account_flags,
 )
+from .parsers import parse_album, parse_artist, parse_station, parse_track
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Sequence
@@ -245,7 +241,7 @@ class PandoraProvider(MusicProvider):
         # Already-served tracks are withheld: the queue controller only de-duplicates refill
         # candidates against its unplayed tail, so a served track that scrolls out of that
         # tail would otherwise be re-added here and then fail once the fragment has moved on.
-        return [self._parse_track(track) for track in fragment.pending]
+        return [parse_track(self, track) for track in fragment.pending]
 
     async def create_playlist(self, name: str, media_types: set[MediaType]) -> Playlist:
         """
@@ -261,7 +257,7 @@ class PandoraProvider(MusicProvider):
             CREATE_STATION_ENDPOINT,
             data={"pandoraId": seed_id, "stationName": name},
         )
-        return self._parse_station(response)
+        return parse_station(self, response)
 
     async def library_remove(self, prov_item_id: str, media_type: MediaType) -> bool:
         """
@@ -327,24 +323,24 @@ class PandoraProvider(MusicProvider):
         """Get full track details by id."""
         if (track := self._find_track(prov_track_id)) is None:
             raise MediaNotFoundError(f"Track {prov_track_id} not found")
-        return self._parse_track(track)
+        return parse_track(self, track)
 
     async def get_album(self, prov_album_id: str) -> Album:
         """
         Get the album a station track belongs to.
 
         Fragments carry no album identifier of their own, so an album is addressed by the id of
-        one of its tracks - see `_parse_album`, which mints the album that way.
+        one of its tracks - see `parse_album`, which mints the album that way.
         """
         if (track := self._find_track(prov_album_id)) and (
-            album := self._parse_album(track, prov_album_id)
+            album := parse_album(self, track, prov_album_id)
         ):
             return album
         raise MediaNotFoundError(f"Album {prov_album_id} not found")
 
     async def get_artist(self, prov_artist_id: str) -> Artist:
         """Get artist details; Pandora identifies station artists by name only."""
-        return self._parse_artist(prov_artist_id)
+        return parse_artist(self, prov_artist_id)
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Get streamdetails for a station track."""
@@ -612,7 +608,7 @@ class PandoraProvider(MusicProvider):
         """Retrieve the user's stations from the provider."""
         response = await self._api_request("POST", STATIONS_ENDPOINT, data={"pageSize": 250})
         for station in response.get("stations", []):
-            yield self._parse_station(station)
+            yield parse_station(self, station)
 
     def _get_or_create_session(self, station_id: str) -> PandoraStationSession:
         """Get or create a station session, with LRU eviction if needed."""
@@ -645,111 +641,6 @@ class PandoraProvider(MusicProvider):
         ]
         freshest = max(holders, key=lambda holder: holder[0].fetched_at, default=None)
         return freshest[1] if freshest is not None else None
-
-    def _parse_station(self, station: dict[str, Any]) -> Playlist:
-        """Parse a station object into a dynamic playlist."""
-        playlist = Playlist(
-            item_id=station["stationId"],
-            provider=self.instance_id,
-            name=station["name"],
-            is_dynamic=True,
-            is_editable=bool(station.get("allowAddSeed")),
-            provider_mappings={
-                ProviderMapping(
-                    item_id=station["stationId"],
-                    provider_domain=self.domain,
-                    provider_instance=self.instance_id,
-                )
-            },
-        )
-        if art := station.get("art"):
-            art_url = next(
-                (item.get("url") for item in art if item.get("size") == 500), art[-1].get("url")
-            )
-            if art_url:
-                playlist.metadata.add_image(
-                    MediaItemImage(
-                        type=ImageType.THUMB,
-                        path=art_url,
-                        provider=self.instance_id,
-                        remotely_accessible=True,
-                    )
-                )
-        return playlist
-
-    def _parse_track(self, obj: dict[str, Any]) -> Track:
-        """Parse a raw fragment track into a Track."""
-        name, version = parse_title_and_version(obj.get("songTitle") or "Unknown Song")
-        track_id = obj["pandoraId"]
-        track = Track(
-            item_id=track_id,
-            provider=self.instance_id,
-            name=name,
-            version=version,
-            duration=int(obj.get("trackLength") or 0),
-            provider_mappings={
-                ProviderMapping(
-                    item_id=track_id,
-                    provider_domain=self.domain,
-                    provider_instance=self.instance_id,
-                    audio_format=self._audio_format(),
-                    url=obj.get("songDetailURL"),
-                )
-            },
-        )
-        if album_art := obj.get("albumArt"):
-            art_url = next(
-                (art.get("url") for art in album_art if art.get("size") == 500),
-                album_art[-1].get("url"),
-            )
-            if art_url:
-                track.metadata.add_image(
-                    MediaItemImage(
-                        provider=self.instance_id,
-                        type=ImageType.THUMB,
-                        path=art_url,
-                        remotely_accessible=True,
-                    )
-                )
-        if artist_name := obj.get("artistName"):
-            track.artists = UniqueList([self._parse_artist(artist_name)])
-        track.album = self._parse_album(obj, track_id)
-        return track
-
-    def _parse_album(self, obj: dict[str, Any], track_id: str) -> Album | None:
-        """Parse the album a fragment track belongs to, if the API named one."""
-        if not (url := obj.get("albumDetailURL")):
-            return None
-        name, version = parse_title_and_version(obj.get("albumTitle") or "Unknown Album")
-        return Album(
-            item_id=track_id,
-            provider=self.instance_id,
-            name=name,
-            version=version,
-            provider_mappings={
-                ProviderMapping(
-                    item_id=track_id,
-                    provider_domain=self.domain,
-                    provider_instance=self.instance_id,
-                    url=url,
-                )
-            },
-        )
-
-    def _parse_artist(self, artist_name: str) -> Artist:
-        """Parse an artist; Pandora fragments identify artists by name only."""
-        return Artist(
-            item_id=artist_name,
-            name=artist_name,
-            provider=self.instance_id,
-            provider_mappings={
-                ProviderMapping(
-                    item_id=artist_name,
-                    provider_domain=self.domain,
-                    provider_instance=self.instance_id,
-                )
-            },
-        )
 
     def _audio_format(self) -> AudioFormat:
         """Return the audio format the fragments are requested in."""
