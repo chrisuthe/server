@@ -69,3 +69,10 @@ QUALITY_HIGH = "high"
 QUALITY_STANDARD = "standard"
 
 ACCOUNT_FLAG_HIGH_QUALITY = "highQualityStreamingAvailable"
+# The account may play a chosen track without watching an ad. Free accounts carry
+# adSupportedReplay/adSupportedSkip instead and can play on demand only after an ad
+# value-exchange, which Music Assistant cannot present - so this gate means "can play
+# without an ad", not "is Premium".
+ACCOUNT_FLAG_ON_DEMAND = "onDemand"
+
+CONF_DEVICE_UUID = "device_uuid"

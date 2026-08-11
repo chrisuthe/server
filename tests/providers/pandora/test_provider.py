@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Self
+from typing import Any, Self, cast
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -11,9 +11,11 @@ from music_assistant_models.enums import MediaType, StreamType
 from music_assistant_models.errors import MediaNotFoundError, MusicAssistantError
 from music_assistant_models.media_items import SearchResults
 
+from music_assistant.constants import CONF_PASSWORD, CONF_USERNAME
 from music_assistant.providers.pandora import provider as provider_module
 from music_assistant.providers.pandora.constants import (
     ADD_SEED_ENDPOINT,
+    CONF_DEVICE_UUID,
     CREATE_STATION_ENDPOINT,
     REMOVE_STATION_ENDPOINT,
     SEARCH_ENDPOINT,
@@ -690,6 +692,82 @@ async def test_authentication_leaves_a_free_account_unentitled(
     """A login without the flag must not leave it set from a previous account."""
     provider = await _login(monkeypatch, ["adSupportedSkip"])
     assert provider._high_quality_available is False
+
+
+async def test_authentication_records_the_on_demand_entitlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The measured Premium flag set must set the on-demand playback gate."""
+    provider = await _login(
+        monkeypatch,
+        [
+            "adFreeReplay",
+            "adFreeSkip",
+            "highQualityStreamingAvailable",
+            "onDemand",
+            "seenWebPremiumWelcome",
+        ],
+    )
+    assert provider._on_demand_available is True
+
+
+async def test_authentication_leaves_a_free_account_without_on_demand(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The measured free-tier flag set carries no onDemand flag and must stay unentitled."""
+    provider = await _login(monkeypatch, ["adSupportedReplay", "adSupportedSkip"])
+    assert provider._on_demand_available is False
+
+
+def _init_provider(
+    stored_setup: dict[str, Any] | None = None,
+) -> tuple[PandoraProvider, dict[str, Any]]:
+    """
+    Build a provider ready for handle_async_init, with auth and setup storage stubbed.
+
+    setup_data starts pre-seeded with credentials so the login guard passes; a caller
+    seeding CONF_DEVICE_UUID simulates a provider reloading with an identity already stored.
+    """
+    provider = PandoraProvider.__new__(PandoraProvider)
+    provider.manifest = Mock(domain="pandora")
+    provider.mass = Mock()
+    provider.config = Mock(instance_id="pandora--test")
+    provider.config.get_value = Mock(return_value="")
+    provider.logger = Mock()
+    provider._authenticate = AsyncMock()  # type: ignore[method-assign]
+    setup_data: dict[str, Any] = {CONF_USERNAME: "user", CONF_PASSWORD: "secret"}
+    setup_data.update(stored_setup or {})
+
+    def _get_setup_value(key: str, default: Any = None) -> Any:
+        return setup_data.get(key, default)
+
+    def _update_setup_data(key: str, value: Any, immediate: bool = True) -> None:  # noqa: ARG001
+        setup_data[key] = value
+
+    provider.get_setup_value = _get_setup_value  # type: ignore[method-assign]
+    provider._update_setup_data = _update_setup_data  # type: ignore[method-assign]
+    return provider, setup_data
+
+
+async def test_device_uuid_is_generated_once_and_reused_across_loads() -> None:
+    """A restart must not look like a new device to an account limited to one stream."""
+    provider, setup_data = _init_provider()
+    await provider.handle_async_init()
+    first_uuid = provider._device_uuid
+    assert setup_data[CONF_DEVICE_UUID] == first_uuid
+
+    reloaded, _ = _init_provider(stored_setup={CONF_DEVICE_UUID: first_uuid})
+    await reloaded.handle_async_init()
+    assert reloaded._device_uuid == first_uuid
+
+
+async def test_device_uuid_never_appears_in_a_log_call() -> None:
+    """The device identity must never be logged, even incidentally."""
+    provider, _ = _init_provider()
+    await provider.handle_async_init()
+    device_uuid = provider._device_uuid
+    for call in cast("Mock", provider.logger).mock_calls:
+        assert device_uuid not in str(call)
 
 
 async def test_add_playlist_tracks_seeds_the_station_with_each_track() -> None:

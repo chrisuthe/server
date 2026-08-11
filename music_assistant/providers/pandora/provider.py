@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import aiohttp
 from music_assistant_models.config_entries import (
@@ -54,8 +55,10 @@ from music_assistant.models.music_provider import MusicProvider
 
 from .constants import (
     ACCOUNT_FLAG_HIGH_QUALITY,
+    ACCOUNT_FLAG_ON_DEMAND,
     ADD_SEED_ENDPOINT,
     CONF_ALLOW_STATION_DELETE,
+    CONF_DEVICE_UUID,
     CONF_QUALITY,
     CONF_TAKEOVER_ACTION,
     CREATE_STATION_ENDPOINT,
@@ -96,6 +99,8 @@ class PandoraProvider(MusicProvider):
     _sessions: dict[str, PandoraStationSession]
     _socks_proxy: bool = False
     _high_quality_available: bool = False
+    _on_demand_available: bool = False
+    _device_uuid: str
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return Config entries to configure this provider."""
@@ -160,6 +165,13 @@ class PandoraProvider(MusicProvider):
         else:
             self.http_session = self.mass.http_session
         await self._authenticate(username, password)
+
+        # A stable per-install identity for playback/source, generated once and reused so
+        # every restart does not look like a new device to a single-stream account.
+        if not (device_uuid := self.get_setup_value(CONF_DEVICE_UUID)):
+            device_uuid = str(uuid4())
+            self._update_setup_data(CONF_DEVICE_UUID, device_uuid)
+        self._device_uuid = str(device_uuid)
 
     async def unload(self, is_removed: bool = False) -> None:
         """Handle unload/close of the provider."""
@@ -433,11 +445,13 @@ class PandoraProvider(MusicProvider):
                 # on some accounts, so read through them rather than guarding after the fact.
                 flags = read_account_flags(response_data)
                 self._high_quality_available = ACCOUNT_FLAG_HIGH_QUALITY in flags
+                self._on_demand_available = ACCOUNT_FLAG_ON_DEMAND in flags
 
                 self.logger.info(
                     "Successfully authenticated with Pandora "
-                    "(high-quality streaming available: %s)",
+                    "(high-quality streaming available: %s, on-demand playback available: %s)",
                     self._high_quality_available,
+                    self._on_demand_available,
                 )
 
         except aiohttp.ClientError as err:
