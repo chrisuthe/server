@@ -124,7 +124,9 @@ async def test_entitled_account_hydrates_a_fragment() -> None:
     await provider.get_playlist_tracks(STATION_ID)
     assert len(calls) == 1
     assert calls[0]["pandoraIds"] == [f"TR:S{index}" for index in range(4)]
-    assert provider._sessions[STATION_ID].current.annotations == records
+    fragment = provider._sessions[STATION_ID].current
+    assert fragment is not None
+    assert fragment.annotations == records
 
 
 async def test_unentitled_account_does_not_hydrate() -> None:
@@ -132,7 +134,9 @@ async def test_unentitled_account_does_not_hydrate() -> None:
     provider, calls = _annotating_provider({"TR:S0": {}}, on_demand=False)
     await provider.get_playlist_tracks(STATION_ID)
     assert calls == []
-    assert provider._sessions[STATION_ID].current.annotations == {}
+    fragment = provider._sessions[STATION_ID].current
+    assert fragment is not None
+    assert fragment.annotations == {}
 
 
 async def test_failed_hydration_still_serves_the_station() -> None:
@@ -152,7 +156,9 @@ async def test_failed_hydration_still_serves_the_station() -> None:
     provider._api_request = _failing_request  # type: ignore[method-assign, assignment]
     tracks = await provider.get_playlist_tracks(STATION_ID)
     assert len(tracks) == 4
-    assert provider._sessions[STATION_ID].current.annotations == {}
+    fragment = provider._sessions[STATION_ID].current
+    assert fragment is not None
+    assert fragment.annotations == {}
 
 
 _HYDRATED = {
