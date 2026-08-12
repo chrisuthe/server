@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import secrets
+from math import isfinite
 from typing import Any
 
 import aiohttp
@@ -15,7 +16,12 @@ from music_assistant_models.errors import (
     ResourceTemporarilyUnavailable,
 )
 
-from .constants import AUTH_ERRORS, NOT_FOUND_ERRORS, UNAVAILABLE_ERRORS
+from .constants import (
+    AUTH_ERRORS,
+    NOT_FOUND_ERRORS,
+    REPLAY_GAIN_REFERENCE_LUFS,
+    UNAVAILABLE_ERRORS,
+)
 
 
 def generate_csrf_token() -> str:
@@ -128,6 +134,24 @@ async def raise_if_no_entitlements(response: aiohttp.ClientResponse) -> None:
         return
     if isinstance(error_body, dict) and error_body.get("errorString") == "NO_ENTITLEMENTS":
         raise MediaNotFoundError("On-demand playback is not available on this Pandora account")
+
+
+def loudness_from_file_gain(file_gain: Any) -> float | None:
+    """
+    Return the integrated loudness Pandora's gain figure describes, in LUFS.
+
+    None whenever Pandora sent no usable figure, so Music Assistant measures the track
+    itself rather than normalising against a number that means nothing.
+
+    :param file_gain: A `fileGain` from a playback/source item; measured as a string.
+    """
+    try:
+        gain = float(file_gain)
+    except TypeError, ValueError:
+        return None
+    if not isfinite(gain):
+        return None
+    return REPLAY_GAIN_REFERENCE_LUFS - gain
 
 
 def read_account_flags(response_data: dict[str, Any]) -> set[str]:

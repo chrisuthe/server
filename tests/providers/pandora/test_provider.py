@@ -8,7 +8,7 @@ from typing import Any, Self, cast
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from music_assistant_models.enums import MediaType, StreamType
+from music_assistant_models.enums import ContentType, MediaType, StreamType
 from music_assistant_models.errors import (
     InvalidDataError,
     LoginFailed,
@@ -26,6 +26,7 @@ from music_assistant.providers.pandora.constants import (
     CATALOG_ANNOTATE_ENDPOINT,
     CONF_DEVICE_UUID,
     CREATE_STATION_ENDPOINT,
+    PLAYBACK_SOURCE_ENDPOINT,
     REMOVE_STATION_ENDPOINT,
     RETRY_REASON_STREAM_VIOLATION,
     SEARCH_ENDPOINT,
@@ -994,6 +995,184 @@ async def test_unknown_track_id_is_refused() -> None:
     await provider.get_playlist_tracks(STATION_ID)
     with pytest.raises(MediaNotFoundError):
         await provider.get_stream_details("TR:not-a-real-track", MediaType.TRACK)
+
+
+MINTED_URL = "https://audio-dc6-t3-1.pandora.com/access/minted.mp4"
+DEVICE_UUID = "1f1c5d0e-2a3b-4c5d-8e9f-0a1b2c3d4e5f"
+
+_MINTED_ITEM = {
+    "pandoraId": "TR:S0",
+    "audioUrl": MINTED_URL,
+    "duration": 214,
+    "encoding": "aacplus",
+    "fileGain": "2.45",
+    "interactions": ["SKIP", "SEEK"],
+    "playerStyle": "on_demand",
+    "trackToken": "a-track-token",
+}
+
+
+def _minting_provider(
+    item: dict[str, Any] | None = None,
+    on_demand: bool = True,
+    payloads: list[list[dict[str, Any]]] | None = None,
+) -> tuple[PandoraProvider, list[tuple[str, dict[str, Any]]]]:
+    """
+    Build a provider whose playback/source calls return a canned minted item.
+
+    Returns the provider and a list recording every API call it made, so a test can assert
+    that a route which must not call Pandora made no call at all.
+    """
+    provider = PandoraProvider.__new__(PandoraProvider)
+    provider.manifest = Mock(domain="pandora")
+    provider.config = Mock(instance_id="pandora--test")
+    provider.logger = Mock()
+    provider.http_session = Mock(closed=False)
+    provider._sessions = {}
+    provider._high_quality_available = False
+    provider._on_demand_available = on_demand
+    provider._device_uuid = DEVICE_UUID
+    pending = list(payloads or [])
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def _fake_api_request(
+        method: str,  # noqa: ARG001
+        url: str,
+        data: dict[str, Any] | None = None,
+        **kwargs: Any,  # noqa: ARG001
+    ) -> dict[str, Any]:
+        """Return canned fragment/mint payloads instead of calling Pandora."""
+        calls.append((url, data or {}))
+        if url == PLAYBACK_SOURCE_ENDPOINT:
+            return {"item": _MINTED_ITEM if item is None else item}
+        if url == CATALOG_ANNOTATE_ENDPOINT:
+            return {}
+        return {"tracks": pending.pop(0) if pending else _tracks()}
+
+    provider._api_request = _fake_api_request  # type: ignore[method-assign, assignment]
+    return provider, calls
+
+
+async def test_a_live_fragment_plays_without_minting() -> None:
+    """The URL a fragment already carries is free; minting one instead would cost a play."""
+    provider, calls = _minting_provider()
+    await provider.get_playlist_tracks(STATION_ID)
+    calls.clear()
+    details = await provider.get_stream_details("TR:S0", MediaType.TRACK)
+    assert details.path == "https://audio-sv5-t3-2.pandora.com/access/0.mp4"
+    assert calls == []
+
+
+async def test_a_catalogue_track_is_minted_per_play() -> None:
+    """A track no fragment holds is playable, and the mint body is what Pandora was measured to want."""
+    provider, calls = _minting_provider()
+    details = await provider.get_stream_details("TR:1809020", MediaType.TRACK)
+    assert details.stream_type is StreamType.HTTP
+    assert details.path == MINTED_URL
+    assert details.duration == 214
+    # the mint names its own encoding; it is never asked for the account's preferred one
+    assert details.audio_format.content_type is ContentType.AAC
+    assert [url for url, _ in calls] == [PLAYBACK_SOURCE_ENDPOINT]
+    assert calls[0][1] == {
+        "sourceId": "TR:1809020",
+        "includeItem": True,
+        "includeSource": True,
+        "deviceUuid": DEVICE_UUID,
+    }
+
+
+async def test_a_minted_stream_carries_pandoras_loudness_and_seekability() -> None:
+    """Both are things the fragment path cannot know and Music Assistant would otherwise guess."""
+    provider, _ = _minting_provider()
+    details = await provider.get_stream_details("TR:1809020", MediaType.TRACK)
+    assert details.loudness == pytest.approx(-20.45)
+    assert details.can_seek is True
+    assert details.allow_seek is True
+
+
+async def test_a_source_that_may_not_be_seeked_is_not_seekable() -> None:
+    """Seekability follows Pandora's answer, not the presence of a duration."""
+    provider, _ = _minting_provider({**_MINTED_ITEM, "interactions": ["SKIP"]})
+    details = await provider.get_stream_details("TR:1809020", MediaType.TRACK)
+    assert details.duration == 214
+    assert details.can_seek is False
+    assert details.allow_seek is False
+
+
+@pytest.mark.parametrize("file_gain", [None, "", "loud", "NaN", {}, []], ids=repr)
+async def test_an_unusable_file_gain_yields_no_loudness(file_gain: Any) -> None:
+    """A gain Pandora sent in a shape we cannot read must leave the track unmeasured, not crash."""
+    provider, _ = _minting_provider({**_MINTED_ITEM, "fileGain": file_gain})
+    details = await provider.get_stream_details("TR:1809020", MediaType.TRACK)
+    assert details.loudness is None
+    assert details.path == MINTED_URL
+
+
+async def test_a_missing_file_gain_yields_no_loudness() -> None:
+    """Not every item carries a gain, and its absence is not a playback failure."""
+    item = {key: value for key, value in _MINTED_ITEM.items() if key != "fileGain"}
+    provider, _ = _minting_provider(item)
+    details = await provider.get_stream_details("TR:1809020", MediaType.TRACK)
+    assert details.loudness is None
+
+
+async def test_a_mint_without_an_audio_url_is_refused() -> None:
+    """A 200 naming no URL must fail here, not hand ffmpeg a None to open."""
+    provider, _ = _minting_provider({**_MINTED_ITEM, "audioUrl": None})
+    with pytest.raises(MediaNotFoundError):
+        await provider.get_stream_details("TR:1809020", MediaType.TRACK)
+
+
+async def test_an_unentitled_account_is_refused_before_the_mint() -> None:
+    """The refusal is certain, so it costs no round trip and no NO_ENTITLEMENTS answer."""
+    provider, calls = _minting_provider(on_demand=False)
+    with pytest.raises(MediaNotFoundError, match="no longer available from Pandora"):
+        await provider.get_stream_details("TR:1809020", MediaType.TRACK)
+    assert calls == []
+
+
+async def test_an_aged_out_station_track_is_minted_again_when_entitled() -> None:
+    """
+    A track that has scrolled out of the live fragment plays again, deliberately.
+
+    It used to raise, which made every walk of recently-played history noisy. Re-minting
+    spends an interactive play rather than a radio play, so it is Premium-only.
+    """
+    provider, calls = _minting_provider(payloads=[_tracks(prefix="A"), _tracks(prefix="B")])
+    await provider.get_playlist_tracks(STATION_ID)
+    await provider.get_stream_details("TR:A3", MediaType.TRACK)
+    await provider.get_playlist_tracks(STATION_ID)
+    calls.clear()
+    details = await provider.get_stream_details("TR:A0", MediaType.TRACK)
+    assert details.path == MINTED_URL
+    assert [url for url, _ in calls] == [PLAYBACK_SOURCE_ENDPOINT]
+
+
+async def test_an_aged_out_station_track_still_raises_without_entitlement() -> None:
+    """Today's behaviour is unchanged for an account that cannot play on demand."""
+    provider, calls = _minting_provider(
+        on_demand=False, payloads=[_tracks(prefix="A"), _tracks(prefix="B")]
+    )
+    await provider.get_playlist_tracks(STATION_ID)
+    await provider.get_stream_details("TR:A3", MediaType.TRACK)
+    await provider.get_playlist_tracks(STATION_ID)
+    calls.clear()
+    with pytest.raises(MediaNotFoundError):
+        await provider.get_stream_details("TR:A0", MediaType.TRACK)
+    assert calls == []
+
+
+async def test_an_expired_fragment_track_is_minted_again_when_entitled() -> None:
+    """A pause long enough to outlive the signed URLs resumes by minting a fresh one."""
+    provider, calls = _minting_provider()
+    await provider.get_playlist_tracks(STATION_ID)
+    fragment = provider._sessions[STATION_ID].current
+    assert fragment is not None
+    fragment.fetched_at -= FRAGMENT_URL_TTL_SECONDS + 1
+    calls.clear()
+    details = await provider.get_stream_details("TR:S0", MediaType.TRACK)
+    assert details.path == MINTED_URL
+    assert [url for url, _ in calls] == [PLAYBACK_SOURCE_ENDPOINT]
 
 
 async def test_get_track_resolves_from_retained_fragments() -> None:

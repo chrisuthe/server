@@ -11,6 +11,7 @@ STATIONS_ENDPOINT = f"{API_BASE}/station/getStations"
 PLAYLIST_FRAGMENT_ENDPOINT = f"{API_BASE}/playlist/getFragment"
 PLAYBACK_RESUMED_ENDPOINT = f"{API_BASE}/station/playbackResumed"
 SEARCH_ENDPOINT = f"{API_BASE}/search/fullSearch"
+PLAYBACK_SOURCE_ENDPOINT = f"{API_BASE}/playback/source"
 CREATE_STATION_ENDPOINT = f"{API_BASE}/station/createStation"
 REMOVE_STATION_ENDPOINT = f"{API_BASE}/station/removeStation"
 ADD_SEED_ENDPOINT = f"{API_BASE}/station/addSeed"
@@ -80,3 +81,8 @@ ACCOUNT_FLAG_HIGH_QUALITY = "highQualityStreamingAvailable"
 ACCOUNT_FLAG_ON_DEMAND = "onDemand"
 
 CONF_DEVICE_UUID = "device_uuid"
+
+# Reference level a ReplayGain-style adjustment is measured against, so a gain can be
+# expressed as the integrated loudness Music Assistant normalises on. Same figure the
+# core uses for a REPLAYGAIN_TRACK_GAIN tag - see helpers/tags.py.
+REPLAY_GAIN_REFERENCE_LUFS = -18.0
