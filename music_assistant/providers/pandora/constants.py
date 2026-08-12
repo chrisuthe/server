@@ -6,6 +6,9 @@ API_BASE = f"{API_HOST}/v1"
 # The music catalogue lives on v4. Note v1/aesop/annotateObjects is the *podcast* annotator
 # and does not answer for TR:/AL:/AR: ids.
 CATALOG_ANNOTATE_ENDPOINT = f"{API_HOST}/v4/catalog/annotateObjects"
+# getDetails answers for one id and returns an annotations map alongside a per-type detail
+# block. Measured on a TR: id, where the map carried the track plus its album and artist.
+CATALOG_DETAILS_ENDPOINT = f"{API_HOST}/v4/catalog/getDetails"
 LOGIN_ENDPOINT = f"{API_BASE}/auth/login"
 STATIONS_ENDPOINT = f"{API_BASE}/station/getStations"
 PLAYLIST_FRAGMENT_ENDPOINT = f"{API_BASE}/playlist/getFragment"

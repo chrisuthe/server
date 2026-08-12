@@ -195,6 +195,9 @@ def parse_track_record(
         name=name,
         version=version,
         duration=int(record.get("duration") or 0),
+        # Pandora numbers a track within its album but never names a disc, so a multi-disc
+        # release numbers straight through rather than restarting per disc.
+        track_number=int(record.get("trackNumber") or 0),
         provider_mappings={
             ProviderMapping(
                 item_id=track_id,

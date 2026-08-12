@@ -54,6 +54,7 @@ from .constants import (
     ACCOUNT_FLAG_ON_DEMAND,
     ADD_SEED_ENDPOINT,
     CATALOG_ANNOTATE_ENDPOINT,
+    CATALOG_DETAILS_ENDPOINT,
     CONF_ALLOW_STATION_DELETE,
     CONF_DEVICE_UUID,
     CONF_QUALITY,
@@ -367,6 +368,55 @@ class PandoraProvider(MusicProvider):
         ):
             return album
         raise MediaNotFoundError(f"Album {prov_album_id} not found")
+
+    async def get_album_tracks(self, prov_album_id: str) -> list[Track]:
+        """
+        Get a catalogue album's playable tracks, in the order Pandora lists them.
+
+        Only a catalogue album has a tracklist. A station track's album is addressed by the id
+        of one of its tracks (see `parse_album`) and Pandora holds no album record for it, so
+        there is nothing there to enumerate and nothing to gain by asking.
+
+        Gated on the account's on-demand entitlement for the reason `_annotate_ids` gives. A
+        track the account may not play interactively is dropped, as it is in search: a listing
+        entry that fails on click is worse than no entry.
+
+        :raises MediaNotFoundError: If the id names no catalogue album, or the account may not
+            play on demand.
+        """
+        if not prov_album_id.startswith("AL:"):
+            raise MediaNotFoundError(f"Album {prov_album_id} has no Pandora tracklist")
+        if not self._on_demand_available:
+            raise MediaNotFoundError("On-demand playback is not available on this Pandora account")
+        response = await self._api_request(
+            "POST",
+            CATALOG_DETAILS_ENDPOINT,
+            data={"pandoraId": prov_album_id},
+            # as in _annotate_ids: a metadata lookup must not take the stream over and stop
+            # playback on another device.
+            exhausted_retry_reasons=frozenset({RETRY_REASON_STREAM_VIOLATION}),
+        )
+        annotations: dict[str, Any] = response.get("annotations") or {}
+        if not isinstance(album := annotations.get(prov_album_id), dict):
+            raise MediaNotFoundError(f"Pandora has no record for {prov_album_id}")
+        track_ids = [str(track_id) for track_id in album.get("tracks") or []]
+        # whether getDetails hydrates an album's own tracks is unmeasured: the one measured
+        # call is on a `TR:` id, and it described that track's album without describing the
+        # album's tracks. Whatever is missing is fetched in one further batched call - the
+        # annotator takes a list of ids, so this widens rather than becoming a call per track.
+        if missing := [
+            track_id for track_id in track_ids if not isinstance(annotations.get(track_id), dict)
+        ]:
+            annotations = {**annotations, **await self._annotate_ids(missing)}
+        tracks: list[Track] = []
+        for track_id in track_ids:
+            if not isinstance(record := annotations.get(track_id), dict):
+                # neither call answered for it, so it can be neither described nor played
+                continue
+            if not (record.get("rightsInfo") or {}).get("hasInteractive"):
+                continue
+            tracks.append(parse_track_record(self, record, track_id, annotations))
+        return tracks
 
     async def get_artist(self, prov_artist_id: str) -> Artist:
         """
@@ -703,9 +753,12 @@ class PandoraProvider(MusicProvider):
             return {}
         return {key: value for key, value in response.items() if isinstance(value, dict)}
 
-    async def _annotate(self, pandora_id: str) -> dict[str, Any]:
+    async def _annotate_ids(self, pandora_ids: list[str]) -> dict[str, Any]:
         """
-        Return Pandora's catalogue record for one id.
+        Return Pandora's catalogue records for the given ids, keyed by pandoraId.
+
+        One request answers every id, so anything needing records for a listing widens this
+        call rather than repeating it per item.
 
         Gated on the account's on-demand entitlement: Music Assistant persists library rows,
         so an `AL:`/`AR:` id minted while an account was entitled can still be looked up after
@@ -713,21 +766,29 @@ class PandoraProvider(MusicProvider):
         return a navigable album or artist whose tracks cannot play - exactly what the
         entitlement check exists to prevent.
 
-        :raises MediaNotFoundError: If the account is not entitled to on-demand playback, or
-            Pandora holds no record for the id.
+        :raises MediaNotFoundError: If the account is not entitled to on-demand playback.
         """
         if not self._on_demand_available:
             raise MediaNotFoundError("On-demand playback is not available on this Pandora account")
         response = await self._api_request(
             "POST",
             CATALOG_ANNOTATE_ENDPOINT,
-            data={"pandoraIds": [pandora_id], "annotateAlbumTracks": False},
+            data={"pandoraIds": pandora_ids, "annotateAlbumTracks": False},
             # as in _hydrate: a metadata lookup must not take the stream over and stop
             # playback on another device.
             exhausted_retry_reasons=frozenset({RETRY_REASON_STREAM_VIOLATION}),
         )
-        record = response.get(pandora_id)
-        if not isinstance(record, dict):
+        return {key: value for key, value in response.items() if isinstance(value, dict)}
+
+    async def _annotate(self, pandora_id: str) -> dict[str, Any]:
+        """
+        Return Pandora's catalogue record for one id.
+
+        :raises MediaNotFoundError: If the account is not entitled to on-demand playback, or
+            Pandora holds no record for the id.
+        """
+        records = await self._annotate_ids([pandora_id])
+        if not isinstance(record := records.get(pandora_id), dict):
             raise MediaNotFoundError(f"Pandora has no record for {pandora_id}")
         return record
 
