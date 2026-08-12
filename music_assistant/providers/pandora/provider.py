@@ -350,8 +350,8 @@ class PandoraProvider(MusicProvider):
         if (found := self._find_track_with_fragment(prov_track_id)) is not None:
             track, fragment = found
             return parse_track(self, track, fragment.annotations)
-        record = self._find_annotation(prov_track_id) or await self._annotate(prov_track_id)
-        return parse_track_record(self, record, prov_track_id)
+        records = self._find_annotations(prov_track_id) or await self._annotate_one(prov_track_id)
+        return parse_track_record(self, records[prov_track_id], prov_track_id, records)
 
     async def get_album(self, prov_album_id: str) -> Album:
         """
@@ -361,8 +361,10 @@ class PandoraProvider(MusicProvider):
         identity, so it is addressed by the id of one of its tracks - see `parse_album`.
         """
         if prov_album_id.startswith("AL:"):
-            record = self._find_annotation(prov_album_id) or await self._annotate(prov_album_id)
-            return parse_album_record(self, record, prov_album_id)
+            records = self._find_annotations(prov_album_id) or await self._annotate_one(
+                prov_album_id
+            )
+            return parse_album_record(self, records[prov_album_id], prov_album_id)
         if (found := self._find_track_with_fragment(prov_album_id)) and (
             album := parse_album(self, found[0], prov_album_id)
         ):
@@ -425,8 +427,10 @@ class PandoraProvider(MusicProvider):
         A catalogue artist is looked up directly; a station artist is identified by name.
         """
         if prov_artist_id.startswith("AR:"):
-            record = self._find_annotation(prov_artist_id) or await self._annotate(prov_artist_id)
-            return parse_artist_record(self, record, prov_artist_id)
+            records = self._find_annotations(prov_artist_id) or await self._annotate_one(
+                prov_artist_id
+            )
+            return parse_artist_record(self, records[prov_artist_id], prov_artist_id)
         return parse_artist(self, prov_artist_id)
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
@@ -780,17 +784,21 @@ class PandoraProvider(MusicProvider):
         )
         return {key: value for key, value in response.items() if isinstance(value, dict)}
 
-    async def _annotate(self, pandora_id: str) -> dict[str, Any]:
+    async def _annotate_one(self, pandora_id: str) -> dict[str, Any]:
         """
-        Return Pandora's catalogue record for one id.
+        Return the catalogue records Pandora answers one id with, keyed by pandoraId.
+
+        The map always holds the requested id, and carries whatever siblings Pandora returned
+        alongside it - an album and an artist for a track - so the item's own identity and the
+        identities it leads to all come out of this one call.
 
         :raises MediaNotFoundError: If the account is not entitled to on-demand playback, or
             Pandora holds no record for the id.
         """
         records = await self._annotate_ids([pandora_id])
-        if not isinstance(record := records.get(pandora_id), dict):
+        if not isinstance(records.get(pandora_id), dict):
             raise MediaNotFoundError(f"Pandora has no record for {pandora_id}")
-        return record
+        return records
 
     async def _mint_stream_details(self, source_id: str) -> StreamDetails:
         """
@@ -921,16 +929,17 @@ class PandoraProvider(MusicProvider):
         ]
         return max(holders, key=lambda holder: holder[1].fetched_at, default=None)
 
-    def _find_annotation(self, pandora_id: str) -> dict[str, Any] | None:
+    def _find_annotations(self, pandora_id: str) -> dict[str, Any] | None:
         """
-        Return the catalogue record the freshest retained fragment holds for the given id.
+        Return the annotations of the freshest retained fragment holding the given id, or None.
 
         Hydration annotates a whole fragment in one call, albums and artists included, so the
         record an album or artist lookup wants is usually in hand already. Music Assistant
         resolves those per item, so refetching them here would put the provider back to one
-        network call per album and per artist in a listing. Fragments overlap the same way
-        tracks do, so the freshest one holding the id decides, consistent with
-        `_find_track_with_fragment` above.
+        network call per album and per artist in a listing. The whole map is returned rather
+        than the one record, because an item's album and artist live in it as siblings.
+        Fragments overlap the same way tracks do, so the freshest one holding the id decides,
+        consistent with `_find_track_with_fragment` above.
         """
         holders = [
             fragment
@@ -939,7 +948,7 @@ class PandoraProvider(MusicProvider):
             if pandora_id in fragment.annotations
         ]
         freshest = max(holders, key=lambda fragment: fragment.fetched_at, default=None)
-        return freshest.annotations[pandora_id] if freshest is not None else None
+        return freshest.annotations if freshest is not None else None
 
     def _audio_format(self) -> AudioFormat:
         """Return the audio format the fragments are requested in."""

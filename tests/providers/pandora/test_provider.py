@@ -428,15 +428,63 @@ async def test_get_track_from_a_fragment_makes_no_catalogue_call() -> None:
     assert calls == []
 
 
+# A catalogue track and the siblings annotateObjects returns alongside it, unasked: the
+# measured response carried 18 records for 6 requested track ids.
+_CATALOGUE_TRACK: dict[str, Any] = {
+    "TR:1809020": {
+        "pandoraId": "TR:1809020",
+        "name": "Catalogue Song",
+        "duration": 214,
+        "albumId": "AL:157378",
+        "artistId": "AR:346031",
+    },
+    "AL:157378": {
+        "pandoraId": "AL:157378",
+        "name": "Catalogue Album",
+        "artistId": "AR:346031",
+    },
+    "AR:346031": {"pandoraId": "AR:346031", "name": "Catalogue Artist"},
+}
+
+
 async def test_get_track_resolves_a_catalogue_id_no_fragment_holds() -> None:
     """A track found by search is addressed by id alone, so this is its only route to resolve."""
-    provider, _ = _annotating_provider(
-        {"TR:1809020": {"pandoraId": "TR:1809020", "name": "Catalogue Song", "duration": 214}}
-    )
+    provider, _ = _annotating_provider(_CATALOGUE_TRACK)
     track = await provider.get_track("TR:1809020")
     assert track.item_id == "TR:1809020"
     assert track.name == "Catalogue Song"
     assert track.duration == 214
+
+
+async def test_a_looked_up_catalogue_track_carries_its_album_and_artist() -> None:
+    """
+    Music Assistant refuses to add an artist-less track to the library, so this decides
+    whether a Pandora search result can be favourited at all.
+
+    The siblings are already in the response the lookup made, so reading them costs no
+    second request.
+    """
+    provider, calls = _annotating_provider(_CATALOGUE_TRACK)
+    track = await provider.get_track("TR:1809020")
+    assert track.album is not None
+    assert track.album.item_id == "AL:157378"
+    assert track.album.name == "Catalogue Album"
+    assert [artist.item_id for artist in track.artists] == ["AR:346031"]
+    assert track.artists[0].name == "Catalogue Artist"
+    assert len(calls) == 1
+
+
+async def test_a_cached_catalogue_track_carries_its_album_and_artist() -> None:
+    """The record already in hand came with its siblings, and must resolve to the same track."""
+    provider, calls = _annotating_provider({**_HYDRATED, **_CATALOGUE_TRACK})
+    await provider.get_playlist_tracks(STATION_ID)
+    calls.clear()
+    track = await provider.get_track("TR:1809020")
+    assert track.album is not None
+    assert track.album.item_id == "AL:157378"
+    assert track.album.name == "Catalogue Album"
+    assert [artist.item_id for artist in track.artists] == ["AR:346031"]
+    assert calls == []
 
 
 async def test_get_track_reuses_an_already_fetched_record() -> None:
