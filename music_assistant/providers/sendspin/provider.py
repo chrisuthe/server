@@ -54,7 +54,12 @@ from music_assistant_models.enums import (
     PlayerType,
     ProviderFeature,
 )
-from music_assistant_models.errors import AlreadyRegisteredError, SetupFailedError
+from music_assistant_models.errors import (
+    AlreadyRegisteredError,
+    InvalidDataError,
+    SetupFailedError,
+    UnsupportedFeaturedException,
+)
 
 from music_assistant.constants import (
     CONF_ENABLED,
@@ -82,6 +87,8 @@ from music_assistant.providers.sendspin.constants import (
     CONF_SENDSPIN_STATIC_DELAY,
     CONF_VIRTUAL_PLAYER_OWNER,
     DEFAULT_MIN_PIN_LENGTH,
+    MAX_SENDSPIN_STATIC_DELAY,
+    MIN_SENDSPIN_STATIC_DELAY,
     VIRTUAL_PLAYER_ID_PREFIX,
 )
 from music_assistant.providers.sendspin.helpers import (
@@ -488,6 +495,52 @@ class SendspinProvider(PlayerProvider):
                 self.mass.create_task(existing._apply_static_delay())
             return
         self._bridge_static_delay_defaults[client_id] = default_ms
+
+    async def set_player_static_delay(self, player_id: str, delay_ms: int) -> None:
+        """
+        Set a Sendspin player's static delay and push it to the device.
+
+        Published so that a measured audio output latency can be applied from outside
+        this provider, without another provider writing to this player's config itself.
+
+        Mind the sign: a static delay *advances* a player rather than holding it back,
+        because the client subtracts it from the server timestamp. A larger value makes
+        the sound leave that speaker earlier. To equalise a group, give the
+        earliest-arriving player 0 and pull each other player forward by the difference
+        between its own arrival time and that earliest one.
+
+        Applying the value a player already has is a no-op; this cannot be used to force
+        a re-push to the device.
+
+        :param player_id: Player id of the Sendspin player to adjust.
+        :param delay_ms: Delay to apply, in whole milliseconds. Must fall within
+            0-5000 inclusive; the protocol carries no negative offset. Out-of-range
+            input is rejected rather than clamped, so a bad measurement reaches the
+            caller instead of being silently turned into a plausible-looking correction.
+        :raises PlayerUnavailableError: No available player with this id exists.
+        :raises UnsupportedFeaturedException: The player is not a Sendspin player, or its
+            player role does not accept a static delay.
+        :raises InvalidDataError: delay_ms falls outside the supported range.
+        """
+        player = self.mass.players.get_player(player_id, raise_unavailable=True)
+        if not isinstance(player, SendspinPlayer):
+            msg = f"Player {player_id} is not a Sendspin player"
+            raise UnsupportedFeaturedException(msg)
+        # A player whose role won't take a static delay has no config entry for it, so
+        # the save below would report success while changing nothing at all.
+        if not player.supports_static_delay:
+            msg = f"Player {player_id} does not accept a Sendspin static delay"
+            raise UnsupportedFeaturedException(msg)
+        if not MIN_SENDSPIN_STATIC_DELAY <= delay_ms <= MAX_SENDSPIN_STATIC_DELAY:
+            msg = (
+                f"Static delay {delay_ms} ms for player {player_id} is outside the supported "
+                f"range of {MIN_SENDSPIN_STATIC_DELAY}-{MAX_SENDSPIN_STATIC_DELAY} ms"
+            )
+            raise InvalidDataError(msg)
+        self.logger.info("Applying static delay of %s ms to %s", delay_ms, player.display_name)
+        # Must go through the config controller: it fires on_player_config_change, which
+        # lands in the player's on_config_updated and pushes the delay to the client.
+        await self.mass.config.save_player_config(player_id, {CONF_SENDSPIN_STATIC_DELAY: delay_ms})
 
     def register_headless_client(self, client_id: str) -> None:
         """

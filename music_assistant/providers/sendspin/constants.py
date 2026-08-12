@@ -9,6 +9,10 @@ CONF_CAST_AUDIO_UNSUPPORTED = "cast_audio_unsupported"
 CONF_SENDSPIN_STATIC_DELAY = "sendspin_static_delay"
 CONF_VIRTUAL_PLAYER_OWNER = "virtual_player_owner"
 DEFAULT_SENDSPIN_STATIC_DELAY = 0
+# The protocol carries a static delay as an unsigned millisecond offset, so it can only
+# advance a player, never hold it back.
+MIN_SENDSPIN_STATIC_DELAY = 0
+MAX_SENDSPIN_STATIC_DELAY = 5000
 
 CONF_ALLOW_UNENCRYPTED = "allow_unencrypted"
 CONF_MIN_PIN_LENGTH = "min_pin_length"
