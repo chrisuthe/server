@@ -678,8 +678,17 @@ class PandoraProvider(MusicProvider):
         """
         Return Pandora's catalogue record for one id.
 
-        :raises MediaNotFoundError: If Pandora holds no record for the id.
+        Gated on the account's on-demand entitlement: Music Assistant persists library rows,
+        so an `AL:`/`AR:` id minted while an account was entitled can still be looked up after
+        the subscription lapses. Without this gate that would fire a live catalogue call and
+        return a navigable album or artist whose tracks cannot play - exactly what the
+        entitlement check exists to prevent.
+
+        :raises MediaNotFoundError: If the account is not entitled to on-demand playback, or
+            Pandora holds no record for the id.
         """
+        if not self._on_demand_available:
+            raise MediaNotFoundError("On-demand playback is not available on this Pandora account")
         response = await self._api_request(
             "POST",
             CATALOG_ANNOTATE_ENDPOINT,

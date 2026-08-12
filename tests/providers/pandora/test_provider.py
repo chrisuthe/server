@@ -330,6 +330,28 @@ async def test_unknown_catalogue_id_is_refused() -> None:
         await provider.get_artist("AR:does-not-exist")
 
 
+async def test_unentitled_account_is_refused_a_persisted_catalogue_album() -> None:
+    """
+    A library row can outlive the entitlement that created it.
+
+    Music Assistant persists library rows, so an `AL:` id minted while an account was
+    entitled can still be requested after the subscription lapses. No fragment holds it in
+    this fresh provider, so the lookup would otherwise fall through to a live annotate call.
+    """
+    provider, calls = _annotating_provider(_HYDRATED, on_demand=False)
+    with pytest.raises(MediaNotFoundError):
+        await provider.get_album("AL:900")
+    assert calls == []
+
+
+async def test_unentitled_account_is_refused_a_persisted_catalogue_artist() -> None:
+    """Same as the album case above, but for a persisted `AR:` id."""
+    provider, calls = _annotating_provider(_HYDRATED, on_demand=False)
+    with pytest.raises(MediaNotFoundError):
+        await provider.get_artist("AR:800")
+    assert calls == []
+
+
 async def test_catalogue_album_reuses_a_hydrated_fragments_record() -> None:
     """Hydration already fetched this record; MA resolves albums per item, so do not refetch."""
     provider, calls = _annotating_provider(_HYDRATED)
