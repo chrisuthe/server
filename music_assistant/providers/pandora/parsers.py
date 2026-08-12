@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from music_assistant_models.enums import ImageType
+from music_assistant_models.enums import ExternalID, ImageType
 from music_assistant_models.media_items import (
     Album,
     Artist,
@@ -169,6 +169,52 @@ def parse_artist(provider: PandoraProvider, name: str, artist_id: str | None = N
             )
         },
     )
+
+
+def parse_track_record(
+    provider: PandoraProvider,
+    record: dict[str, Any],
+    track_id: str,
+    annotations: dict[str, Any] | None = None,
+) -> Track:
+    """
+    Parse a track from a Pandora catalogue record.
+
+    No image is set: a record's `icon.artUrl` is a relative path whose CDN base is unmeasured.
+
+    :param record: The catalogue record Pandora returned for the track.
+    :param track_id: The id the track was requested by, which it keeps.
+    :param annotations: The records that came back alongside this one, keyed by pandoraId.
+        The track's album and artist are read from those siblings; a record whose siblings
+        are absent still yields a playable track, carrying neither.
+    """
+    name, version = parse_title_and_version(str(record.get("name") or "Unknown Track"))
+    track = Track(
+        item_id=track_id,
+        provider=provider.instance_id,
+        name=name,
+        version=version,
+        duration=int(record.get("duration") or 0),
+        provider_mappings={
+            ProviderMapping(
+                item_id=track_id,
+                provider_domain=provider.domain,
+                provider_instance=provider.instance_id,
+                # no audio format: a catalogue track is minted per play and Pandora names the
+                # encoding it made then, which the fragment quality preference does not describe
+            )
+        },
+    )
+    if isrc := record.get("isrc"):
+        track.external_ids.add((ExternalID.ISRC, str(isrc)))
+    siblings = annotations or {}
+    album_id = record.get("albumId")
+    if album_id and isinstance(album_record := siblings.get(album_id), dict):
+        track.album = parse_album_record(provider, album_record, str(album_id))
+    artist_id = record.get("artistId")
+    if artist_id and isinstance(artist_record := siblings.get(artist_id), dict):
+        track.artists = UniqueList([parse_artist_record(provider, artist_record, str(artist_id))])
+    return track
 
 
 def parse_album_record(provider: PandoraProvider, record: dict[str, Any], album_id: str) -> Album:

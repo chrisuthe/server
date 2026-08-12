@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import Mock
 
+from music_assistant_models.enums import ExternalID
+
 from music_assistant.providers.pandora.parsers import (
     parse_album,
     parse_album_record,
@@ -12,6 +14,7 @@ from music_assistant.providers.pandora.parsers import (
     parse_artist_record,
     parse_station,
     parse_track,
+    parse_track_record,
 )
 from music_assistant.providers.pandora.provider import PandoraProvider
 
@@ -130,6 +133,74 @@ def test_track_tolerates_a_present_but_null_annotation() -> None:
     track = parse_track(_provider(), _track(), {"TR:S0": None})
     assert track.album is not None
     assert track.album.item_id == "TR:S0"
+
+
+_CATALOGUE: dict[str, dict[str, Any]] = {
+    "TR:100": {
+        "pandoraId": "TR:100",
+        "name": "Some Song",
+        "albumId": "AL:157378",
+        "artistId": "AR:346031",
+        "duration": 232,
+        "isrc": "GBAYE0601498",
+        "rightsInfo": {"hasInteractive": True},
+    },
+    "AL:157378": {"pandoraId": "AL:157378", "name": "Some Album"},
+    "AR:346031": {"pandoraId": "AR:346031", "name": "Some Artist"},
+}
+
+
+def test_track_record_builds_its_album_and_artist_from_the_siblings() -> None:
+    """A catalogue track names its album and artist by id; their names come from the map."""
+    track = parse_track_record(_provider(), _CATALOGUE["TR:100"], "TR:100", _CATALOGUE)
+    assert track.item_id == "TR:100"
+    assert track.name == "Some Song"
+    assert track.album is not None
+    assert track.album.item_id == "AL:157378"
+    assert track.album.name == "Some Album"
+    assert track.artists[0].item_id == "AR:346031"
+    assert track.artists[0].name == "Some Artist"
+
+
+def test_track_record_duration_is_seconds() -> None:
+    """Pandora reports a catalogue track's length in seconds, as MA expects it."""
+    assert parse_track_record(_provider(), _CATALOGUE["TR:100"], "TR:100").duration == 232
+
+
+def test_track_record_carries_its_isrc() -> None:
+    """The ISRC is what lets the same recording match across providers."""
+    track = parse_track_record(_provider(), _CATALOGUE["TR:100"], "TR:100")
+    assert track.get_external_id(ExternalID.ISRC) == "GBAYE0601498"
+
+
+def test_track_record_without_siblings_is_still_usable() -> None:
+    """
+    A record whose album and artist are absent from the map still plays.
+
+    Omitted, empty, and a map holding some other id's records must all land here: an album
+    built from a missing sibling would carry a real id under the name "Unknown Album".
+    """
+    unusable: list[dict[str, Any] | None] = [
+        None,
+        {},
+        {"AL:OTHER": {"name": "Some Other Album"}},
+        {"AL:157378": None},
+    ]
+    for annotations in unusable:
+        track = parse_track_record(_provider(), _CATALOGUE["TR:100"], "TR:100", annotations)
+        assert track.item_id == "TR:100"
+        assert track.name == "Some Song"
+        assert track.album is None
+        assert list(track.artists) == []
+
+
+def test_track_record_tolerates_present_but_null_fields() -> None:
+    """Pandora really does send JSON nulls; every read must degrade rather than crash."""
+    record = {"pandoraId": "TR:100", "name": None, "duration": None, "isrc": None}
+    track = parse_track_record(_provider(), record, "TR:100", _CATALOGUE)
+    assert track.name == "Unknown Track"
+    assert track.duration == 0
+    assert track.get_external_id(ExternalID.ISRC) is None
 
 
 def test_album_record_keeps_the_id_it_was_requested_by() -> None:
