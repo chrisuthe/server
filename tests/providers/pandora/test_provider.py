@@ -14,6 +14,8 @@ from music_assistant_models.errors import (
     LoginFailed,
     MediaNotFoundError,
     MusicAssistantError,
+    ProviderUnavailableError,
+    ResourceTemporarilyUnavailable,
 )
 from music_assistant_models.media_items import SearchResults
 
@@ -234,6 +236,32 @@ async def test_hydration_drops_a_non_record_value() -> None:
 async def test_failed_hydration_still_serves_the_station() -> None:
     """Hydration is metadata enrichment; losing it must not stop playback."""
     provider = _breaking_provider(InvalidDataError("annotate exploded"))
+    tracks = await provider.get_playlist_tracks(STATION_ID)
+    assert len(tracks) == 4
+    fragment = provider._sessions[STATION_ID].current
+    assert fragment is not None
+    assert fragment.annotations == {}
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        InvalidDataError("annotate exploded"),
+        MediaNotFoundError("Pandora has no record for the id"),
+        ProviderUnavailableError("Pandora server error"),
+        ResourceTemporarilyUnavailable("Pandora service issue"),
+    ],
+    ids=lambda error: type(error).__name__,
+)
+async def test_hydration_degrades_for_each_caught_annotate_error(error: Exception) -> None:
+    """
+    Every type in _hydrate's except clause must degrade the station, not fail it.
+
+    Only InvalidDataError was ever exercised on this path before, so narrowing the clause
+    to drop any of the other three would break no existing test while letting a 500 or a
+    rate limit during hydration propagate and stop the station instead of degrading past it.
+    """
+    provider = _breaking_provider(error)
     tracks = await provider.get_playlist_tracks(STATION_ID)
     assert len(tracks) == 4
     fragment = provider._sessions[STATION_ID].current
