@@ -5,6 +5,12 @@ Declares a dependency on the Sendspin player provider, so it only loads once
 Sendspin is up. It exposes a single AudioSource - the calibration chirp track -
 which plays through the regular playback path so the latency measured from it
 matches the latency of real music on the same player.
+
+On top of that source it orchestrates calibration sessions: a set of Sendspin
+speakers is grouped onto a hidden anchor, the chirp train runs once for the whole
+session, and the API commands registered here walk the speakers one at a time
+while a phone-side probe measures each arrival. See session.py for the session
+itself.
 """
 
 from __future__ import annotations
@@ -13,20 +19,38 @@ import asyncio
 from itertools import cycle
 from typing import TYPE_CHECKING
 
-from music_assistant_models.enums import ContentType, MediaType, ProviderFeature, StreamType
-from music_assistant_models.errors import MediaNotFoundError
+from music_assistant_models.auth import Scope
+from music_assistant_models.enums import (
+    ContentType,
+    MediaType,
+    ProviderFeature,
+    StreamType,
+)
+from music_assistant_models.errors import (
+    ActionUnavailable,
+    MediaNotFoundError,
+    ResourceBusyError,
+)
 from music_assistant_models.media_items import AudioSource, ProviderMapping
 from music_assistant_models.media_items.audio_format import AudioFormat
 from music_assistant_models.streamdetails import StreamDetails, StreamMetadata
 
 from music_assistant.constants import CONF_ENTRY_WARN_PREVIEW
 from music_assistant.controllers.streams.audio import AUDIO_SOURCE_CHUNK_SECONDS
+from music_assistant.helpers.shared_playback import SENDSPIN_DOMAIN
 from music_assistant.models.plugin import PluginProvider
 
 from .chirp import BIT_DEPTH, CHANNELS, SAMPLE_RATE, build_chirp_period
+from .session import (
+    CalibrationPlayer,
+    CalibrationSession,
+    CalibrationSessionState,
+    is_busy,
+    is_eligible,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Callable
 
     from music_assistant_models.config_entries import ConfigEntry, ProviderConfig
     from music_assistant_models.provider import ProviderManifest
@@ -40,6 +64,11 @@ SUPPORTED_FEATURES = {ProviderFeature.AUDIO_SOURCE}
 # stable id of the single AudioSource this provider exposes; combined with the
 # provider instance_id it forms the persistent browse/play uri
 AUDIO_SOURCE_ID = "calibration"
+
+# A session holds a user's speakers muted and regrouped, so it may never outlive
+# the phone that is driving it. The timeout is generous enough to walk a large
+# house and is re-armed on every solo.
+SESSION_TIMEOUT_SECONDS = 900
 
 
 async def setup(
@@ -64,6 +93,19 @@ class SendspinSyncProvider(PluginProvider):
     _audio_format: AudioFormat
     _audio_source: AudioSource
     _period_chunks: list[bytes]
+
+    def __init__(
+        self,
+        mass: MusicAssistant,
+        manifest: ProviderManifest,
+        config: ProviderConfig,
+        supported_features: set[ProviderFeature] | None = None,
+    ) -> None:
+        """Initialize the Sendspin Sync plugin."""
+        super().__init__(mass, manifest, config, supported_features)
+        self._unregister_handles: list[Callable[[], None]] = []
+        self._session: CalibrationSession | None = None
+        self._session_lock = asyncio.Lock()
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return the (options) config entries for this provider instance."""
@@ -109,6 +151,38 @@ class SendspinSyncProvider(PluginProvider):
         self._period_chunks = [
             period[offset : offset + chunk_size] for offset in range(0, len(period), chunk_size)
         ]
+
+    async def loaded_in_mass(self) -> None:
+        """Call after the provider has been loaded."""
+        api_handlers = (
+            ("sendspin_sync/eligible_players", self.get_eligible_players, Scope.PLAYERS_READ),
+            ("sendspin_sync/session", self.get_session, Scope.PLAYERS_READ),
+            ("sendspin_sync/start_session", self.start_session, Scope.PLAYERS_CONTROL),
+            ("sendspin_sync/solo_player", self.solo_player, Scope.PLAYERS_CONTROL),
+            ("sendspin_sync/stop_session", self.stop_session, Scope.PLAYERS_CONTROL),
+        )
+        for command, handler, required_scope in api_handlers:
+            self._unregister_handles.append(
+                self.mass.register_api_command(command, handler, required_scope=required_scope)
+            )
+
+    async def unload(self, is_removed: bool = False) -> None:
+        """
+        Call when the provider is being unloaded.
+
+        :param is_removed: Whether the provider is being removed (vs just reloaded).
+        """
+        for unregister in self._unregister_handles:
+            unregister()
+        self._unregister_handles.clear()
+        # call_later timers are not swept by mass.stop(), so the pending timeout is
+        # cancelled explicitly before the session it would have torn down is stopped
+        self._cancel_session_timeout()
+        async with self._session_lock:
+            if self._session is not None:
+                await self._session.stop()
+                self._session = None
+        await super().unload(is_removed)
 
     async def get_audio_sources(self) -> list[AudioSource]:
         """Return the AudioSources this plugin currently exposes."""
@@ -180,3 +254,161 @@ class SendspinSyncProvider(PluginProvider):
         self._active_session_id = None
         if self._in_use_by_queue == queue_id:
             self._in_use_by_queue = None
+        # The stream carries the phase reference, so a calibration session can not
+        # outlive it. It may end without us asking - every client disconnecting tears
+        # the group's playback down - and the session must then restore the speakers
+        # instead of sitting there believing it is still live.
+        session = self._session
+        if session is not None and queue_id == session.queue_id and not session.stopped:
+            self.logger.debug("Calibration stream ended externally, stopping the session")
+            self.mass.create_task(self._stop_session(), task_id=self._session_teardown_id)
+
+    async def get_eligible_players(self) -> list[CalibrationPlayer]:
+        """
+        Return the players a calibration session can be run against.
+
+        Only Sendspin speakers qualify, and only those that can be taken out of the
+        mix - a player with neither a mute nor a volume control can never be isolated.
+        """
+        return [
+            CalibrationPlayer(
+                player_id=player.player_id,
+                name=player.state.name,
+                busy=is_busy(player),
+            )
+            # all_players (not iter_players) so a non-admin user is only offered the
+            # speakers they are allowed to see
+            for player in self.mass.players.all_players(
+                return_unavailable=False, provider_filter=SENDSPIN_DOMAIN
+            )
+            if is_eligible(self.mass, player)
+        ]
+
+    async def get_session(self) -> CalibrationSessionState | None:
+        """Return the state of the running calibration session, or None if there is none."""
+        if self._session is None:
+            return None
+        return self._session.state
+
+    async def start_session(
+        self, player_ids: list[str], force: bool = False
+    ) -> CalibrationSessionState:
+        """
+        Start a calibration session over the given Sendspin players.
+
+        The calibration track starts once and runs for the whole session; use
+        ``solo_player`` to walk the speakers without restarting it. The session is
+        torn down automatically after a period of inactivity, so a phone that goes
+        away can not leave the speakers muted.
+
+        :param player_ids: The Sendspin players to calibrate, in the order given.
+        :param force: Take over players that are busy playing the user's own content.
+        :raises ResourceBusyError: If a calibration session is already running.
+        :raises InvalidDataError: If no players were given, or the same player twice.
+        :raises PlayerUnavailableError: If a given player is unknown or unavailable.
+        :raises UnsupportedFeaturedException: If a given player is not a Sendspin
+            speaker, or can not be silenced.
+        :raises ActionUnavailable: If a player is already muted or turned all the way
+            down, or is playing and ``force`` was not set.
+        :return: The state of the started session.
+        """
+        async with self._session_lock:
+            if self._session is not None:
+                raise ResourceBusyError(
+                    "A calibration session is already running",
+                    translation_key="session_already_running",
+                    translation_owner=self.translation_owner,
+                )
+            session = await CalibrationSession.create(
+                self.mass,
+                self.logger,
+                self.translation_owner,
+                owner_instance_id=self.instance_id,
+                player_ids=player_ids,
+                force=force,
+            )
+            # Registered before the stream starts: starting it fires the source
+            # lifecycle hooks, and on_source_unselected can only tear the session
+            # down again if it can already see it.
+            self._session = session
+            self._arm_session_timeout()
+            try:
+                await session.begin(self._audio_source)
+            except Exception:
+                self._session = None
+                self._cancel_session_timeout()
+                await session.stop()
+                raise
+            return session.state
+
+    async def solo_player(self, player_id: str) -> CalibrationSessionState:
+        """
+        Isolate one speaker in the running session so only it is audible.
+
+        Mutes every other member of the session and never mutes the target itself.
+        Leaves the calibration stream running.
+
+        :param player_id: The session member to isolate.
+        :raises ActionUnavailable: If no calibration session is running.
+        :raises InvalidDataError: If the given player is not part of the session.
+        :return: The state of the session.
+        """
+        async with self._session_lock:
+            if self._session is None:
+                raise ActionUnavailable(
+                    "No calibration session is running",
+                    translation_key="no_session",
+                    translation_owner=self.translation_owner,
+                )
+            await self._session.solo(player_id)
+            self._arm_session_timeout()
+            return self._session.state
+
+    async def stop_session(self) -> None:
+        """
+        Stop the running calibration session and restore every speaker it took over.
+
+        Does nothing when no session is running.
+        """
+        await self._stop_session()
+
+    def _arm_session_timeout(self) -> None:
+        """(Re)start the inactivity timeout that tears a forgotten session down."""
+        self.mass.call_later(
+            SESSION_TIMEOUT_SECONDS,
+            self._handle_session_timeout,
+            task_id=self._session_timeout_id,
+        )
+
+    def _cancel_session_timeout(self) -> None:
+        """Cancel a pending session timeout."""
+        self.mass.cancel_timer(self._session_timeout_id)
+
+    async def _handle_session_timeout(self) -> None:
+        """Tear down a session that has not been driven for a while."""
+        if self._session is None:
+            return
+        self.logger.warning(
+            "Calibration session timed out after %s seconds without activity, restoring players",
+            SESSION_TIMEOUT_SECONDS,
+        )
+        await self._stop_session()
+
+    async def _stop_session(self) -> None:
+        """Stop and clear the running session, if any."""
+        self._cancel_session_timeout()
+        async with self._session_lock:
+            if self._session is None:
+                return
+            await self._session.stop()
+            self._session = None
+
+    @property
+    def _session_timeout_id(self) -> str:
+        """Return the timer id of this instance's session timeout."""
+        return f"{self.instance_id}_calibration_timeout"
+
+    @property
+    def _session_teardown_id(self) -> str:
+        """Return the task id that dedupes teardowns triggered by the stream ending."""
+        return f"{self.instance_id}_calibration_teardown"
