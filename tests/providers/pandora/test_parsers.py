@@ -211,6 +211,40 @@ def test_album_record_keeps_the_id_it_was_requested_by() -> None:
     assert next(iter(album.provider_mappings)).item_id == "AL:900"
 
 
+def test_album_record_builds_its_artist_from_the_siblings() -> None:
+    """
+    An artist-less album can never match the same album from another provider.
+
+    `compare_album` ends in an artist comparison that fails on an empty list, and
+    `match_providers` skips an album with no artists at all.
+    """
+    record = {**_CATALOGUE["AL:157378"], "artistId": "AR:346031"}
+    album = parse_album_record(_provider(), record, "AL:157378", _CATALOGUE)
+    assert [artist.item_id for artist in album.artists] == ["AR:346031"]
+    assert album.artists[0].name == "Some Artist"
+
+
+def test_album_record_without_siblings_is_still_usable() -> None:
+    """
+    A record whose artist is absent from the map still yields an album.
+
+    Omitted, empty, a map holding some other id's records, and a present-but-null value
+    must all land here rather than raise.
+    """
+    record = {**_CATALOGUE["AL:157378"], "artistId": "AR:346031"}
+    unusable: list[dict[str, Any] | None] = [
+        None,
+        {},
+        {"AR:OTHER": {"name": "Some Other Artist"}},
+        {"AR:346031": None},
+    ]
+    for annotations in unusable:
+        album = parse_album_record(_provider(), record, "AL:157378", annotations)
+        assert album.item_id == "AL:157378"
+        assert album.name == "Some Album"
+        assert list(album.artists) == []
+
+
 def test_album_record_carries_no_image() -> None:
     """A record's icon.artUrl is a relative path whose CDN base is unmeasured."""
     record = {"name": "Some Album", "icon": {"artUrl": "images/abc/500W_500H.jpg"}}

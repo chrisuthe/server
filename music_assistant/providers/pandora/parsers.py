@@ -213,14 +213,19 @@ def parse_track_record(
     siblings = annotations or {}
     album_id = record.get("albumId")
     if album_id and isinstance(album_record := siblings.get(album_id), dict):
-        track.album = parse_album_record(provider, album_record, str(album_id))
+        track.album = parse_album_record(provider, album_record, str(album_id), siblings)
     artist_id = record.get("artistId")
     if artist_id and isinstance(artist_record := siblings.get(artist_id), dict):
         track.artists = UniqueList([parse_artist_record(provider, artist_record, str(artist_id))])
     return track
 
 
-def parse_album_record(provider: PandoraProvider, record: dict[str, Any], album_id: str) -> Album:
+def parse_album_record(
+    provider: PandoraProvider,
+    record: dict[str, Any],
+    album_id: str,
+    annotations: dict[str, Any] | None = None,
+) -> Album:
     """
     Parse an album from a Pandora catalogue record.
 
@@ -228,9 +233,12 @@ def parse_album_record(provider: PandoraProvider, record: dict[str, Any], album_
 
     :param record: The catalogue record Pandora returned for the album.
     :param album_id: The id the album was requested by, which it keeps.
+    :param annotations: The records that came back alongside this one, keyed by pandoraId.
+        The album's artist is read from those siblings; a record whose siblings are absent
+        still yields a usable album, carrying none.
     """
     name, version = parse_title_and_version(str(record.get("name") or "Unknown Album"))
-    return Album(
+    album = Album(
         item_id=album_id,
         provider=provider.instance_id,
         name=name,
@@ -243,6 +251,11 @@ def parse_album_record(provider: PandoraProvider, record: dict[str, Any], album_
             )
         },
     )
+    siblings = annotations or {}
+    artist_id = record.get("artistId")
+    if artist_id and isinstance(artist_record := siblings.get(artist_id), dict):
+        album.artists = UniqueList([parse_artist_record(provider, artist_record, str(artist_id))])
+    return album
 
 
 def parse_artist_record(

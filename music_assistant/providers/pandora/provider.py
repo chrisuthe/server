@@ -364,7 +364,7 @@ class PandoraProvider(MusicProvider):
             records = self._find_annotations(prov_album_id) or await self._annotate_one(
                 prov_album_id
             )
-            return parse_album_record(self, records[prov_album_id], prov_album_id)
+            return parse_album_record(self, records[prov_album_id], prov_album_id, records)
         if (found := self._find_track_with_fragment(prov_album_id)) and (
             album := parse_album(self, found[0], prov_album_id)
         ):
@@ -893,7 +893,7 @@ class PandoraProvider(MusicProvider):
             if result_id.startswith("TR:") and rights.get("hasInteractive"):
                 tracks.append(parse_track_record(self, record, result_id, annotations))
             elif result_id.startswith("AL:"):
-                albums.append(parse_album_record(self, record, result_id))
+                albums.append(parse_album_record(self, record, result_id, annotations))
         return tracks, albums
 
     def _get_or_create_session(self, station_id: str) -> PandoraStationSession:

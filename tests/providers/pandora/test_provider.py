@@ -17,7 +17,7 @@ from music_assistant_models.errors import (
     ProviderUnavailableError,
     ResourceTemporarilyUnavailable,
 )
-from music_assistant_models.media_items import SearchResults, Track
+from music_assistant_models.media_items import Album, SearchResults, Track
 
 from music_assistant.constants import CONF_PASSWORD, CONF_USERNAME
 from music_assistant.providers.pandora import provider as provider_module
@@ -487,6 +487,15 @@ async def test_a_cached_catalogue_track_carries_its_album_and_artist() -> None:
     assert calls == []
 
 
+async def test_a_looked_up_catalogue_album_carries_its_artist() -> None:
+    """An album with no artists can never match the same album from another provider."""
+    provider, _ = _annotating_provider(_CATALOGUE_TRACK)
+    album = await provider.get_album("AL:157378")
+    assert album.item_id == "AL:157378"
+    assert [artist.item_id for artist in album.artists] == ["AR:346031"]
+    assert album.artists[0].name == "Catalogue Artist"
+
+
 async def test_get_track_reuses_an_already_fetched_record() -> None:
     """A record already in hand is not fetched again, as for albums and artists above."""
     record = {"pandoraId": "TR:X9", "name": "Catalogue Song"}
@@ -780,7 +789,7 @@ _CATALOGUE_ANNOTATIONS: dict[str, Any] = {
         "duration": 199,
         "rightsInfo": {"hasInteractive": False},
     },
-    "AL:157378": {"pandoraId": "AL:157378", "name": "Some Album"},
+    "AL:157378": {"pandoraId": "AL:157378", "name": "Some Album", "artistId": "AR:346031"},
     "AR:346031": {"pandoraId": "AR:346031", "name": "Some Artist"},
 }
 
@@ -840,6 +849,15 @@ async def test_entitled_search_returns_catalogue_tracks_and_albums() -> None:
     assert track.album is not None
     assert track.album.name == "Some Album"
     assert track.artists[0].item_id == "AR:346031"
+
+
+async def test_a_searched_album_carries_its_artist() -> None:
+    """The AR: record is already in the search response, and an artist-less album never matches."""
+    provider, _ = _searching_provider()
+    results = await provider.search("coldplay", [MediaType.ALBUM])
+    album = cast("Album", results.albums[0])
+    assert [artist.item_id for artist in album.artists] == ["AR:346031"]
+    assert album.artists[0].name == "Some Artist"
 
 
 async def test_search_drops_a_track_the_account_cannot_play() -> None:
