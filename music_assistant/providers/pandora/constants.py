@@ -10,7 +10,10 @@ LOGIN_ENDPOINT = f"{API_BASE}/auth/login"
 STATIONS_ENDPOINT = f"{API_BASE}/station/getStations"
 PLAYLIST_FRAGMENT_ENDPOINT = f"{API_BASE}/playlist/getFragment"
 PLAYBACK_RESUMED_ENDPOINT = f"{API_BASE}/station/playbackResumed"
-SEARCH_ENDPOINT = f"{API_BASE}/search/fullSearch"
+# fullSearch is a station-*seed* search: its results are things a station can be built
+# around, not things that can be played. The catalogue search lives on v3.
+SEED_SEARCH_ENDPOINT = f"{API_BASE}/search/fullSearch"
+SOD_SEARCH_ENDPOINT = f"{API_HOST}/v3/sod/search"
 PLAYBACK_SOURCE_ENDPOINT = f"{API_BASE}/playback/source"
 CREATE_STATION_ENDPOINT = f"{API_BASE}/station/createStation"
 REMOVE_STATION_ENDPOINT = f"{API_BASE}/station/removeStation"

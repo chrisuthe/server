@@ -68,8 +68,9 @@ from .constants import (
     REMOVE_STATION_ENDPOINT,
     RETRY_REASON_AUTH,
     RETRY_REASON_STREAM_VIOLATION,
-    SEARCH_ENDPOINT,
+    SEED_SEARCH_ENDPOINT,
     SEEDABLE_PREFIXES,
+    SOD_SEARCH_ENDPOINT,
     STATIONS_ENDPOINT,
 )
 from .fragments import PandoraFragment, PandoraStationSession, should_fetch_fragment
@@ -88,6 +89,7 @@ from .parsers import (
     parse_artist_record,
     parse_station,
     parse_track,
+    parse_track_record,
 )
 
 if TYPE_CHECKING:
@@ -204,22 +206,28 @@ class PandoraProvider(MusicProvider):
         media_types: list[MediaType],
         limit: int = 25,
     ) -> SearchResults:
-        """Search the user's stations by name."""
-        # search is limited to the user's own stations: the API's catalogue search
-        # requires the legacy endpoints this provider does not speak
-        if MediaType.PLAYLIST not in media_types:
-            return SearchResults()
-        # substring rather than compare_strings: that helper answers "are these the same
-        # entity", and its fuzzy mode rejects a length difference over four characters, so a
-        # short query like "rock" could never reach a station called "Classic Rock Radio"
-        query = search_query.lower()
-        results: list[Playlist] = []
-        async for station in self._get_stations():
-            if query in station.name.lower():
-                results.append(station)
-                if len(results) >= limit:
-                    break
-        return SearchResults(playlists=results)
+        """
+        Search the user's stations and, for an entitled account, Pandora's catalogue.
+
+        Stations answer `MediaType.PLAYLIST`. Tracks and albums come from the catalogue and
+        are offered only to an account that may play them on demand. Artists are not
+        answered at all yet: a search result has to lead somewhere, and this provider has no
+        artist page. Any other media type comes back empty.
+        """
+        stations = (
+            await self._search_stations(search_query, limit)
+            if MediaType.PLAYLIST in media_types
+            else []
+        )
+        types = [
+            prefix
+            for media_type, prefix in ((MediaType.TRACK, "TR"), (MediaType.ALBUM, "AL"))
+            if media_type in media_types
+        ]
+        if not types or not self._on_demand_available:
+            return SearchResults(playlists=stations)
+        tracks, albums = await self._search_catalogue(search_query, types, limit)
+        return SearchResults(playlists=stations, tracks=tracks, albums=albums)
 
     async def get_library_playlists(self) -> AsyncGenerator[Playlist]:
         """Retrieve the user's stations as dynamic playlists."""
@@ -767,6 +775,51 @@ class PandoraProvider(MusicProvider):
         for station in response.get("stations", []):
             yield parse_station(self, station)
 
+    async def _search_stations(self, search_query: str, limit: int) -> list[Playlist]:
+        """Return the user's stations whose name contains the query, up to the limit."""
+        # substring rather than compare_strings: that helper answers "are these the same
+        # entity", and its fuzzy mode rejects a length difference over four characters, so a
+        # short query like "rock" could never reach a station called "Classic Rock Radio"
+        query = search_query.lower()
+        results: list[Playlist] = []
+        async for station in self._get_stations():
+            if query in station.name.lower():
+                results.append(station)
+                if len(results) >= limit:
+                    break
+        return results
+
+    async def _search_catalogue(
+        self, search_query: str, types: list[str], limit: int
+    ) -> tuple[list[Track], list[Album]]:
+        """
+        Search Pandora's catalogue for the given type prefixes.
+
+        One call answers every requested type, and the records it returns describe the
+        results' albums and artists too, so nothing here needs a second lookup. A track the
+        account may not play interactively is dropped rather than offered as a result that
+        fails on click.
+
+        :param types: Type prefixes to search for, as Pandora spells them - `["TR", "AL"]`.
+        """
+        response = await self._api_request(
+            "POST",
+            SOD_SEARCH_ENDPOINT,
+            data={"query": search_query, "types": types, "count": limit, "annotate": True},
+        )
+        annotations = response.get("annotations") or {}
+        tracks: list[Track] = []
+        albums: list[Album] = []
+        for result_id in response.get("results") or []:
+            if not isinstance(record := annotations.get(result_id), dict):
+                continue
+            rights = record.get("rightsInfo") or {}
+            if result_id.startswith("TR:") and rights.get("hasInteractive"):
+                tracks.append(parse_track_record(self, record, result_id, annotations))
+            elif result_id.startswith("AL:"):
+                albums.append(parse_album_record(self, record, result_id))
+        return tracks, albums
+
     def _get_or_create_session(self, station_id: str) -> PandoraStationSession:
         """Get or create a station session, with LRU eviction if needed."""
         # Simple LRU: limit to 10 active sessions
@@ -843,7 +896,7 @@ class PandoraProvider(MusicProvider):
         :raises MediaNotFoundError: If nothing Pandora returned can seed a station.
         """
         response = await self._api_request(
-            "POST", SEARCH_ENDPOINT, data={"query": query, "count": 5}
+            "POST", SEED_SEARCH_ENDPOINT, data={"query": query, "count": 5}
         )
         for item in response.get("items") or []:
             if not (pandora_id := item.get("pandoraId")):
