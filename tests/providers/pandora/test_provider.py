@@ -1173,6 +1173,33 @@ async def test_non_json_400_body_does_not_crash() -> None:
     response.close.assert_called_once()
 
 
+async def test_null_json_400_body_does_not_crash() -> None:
+    """A 400 whose body is JSON null must raise the generic error, not AttributeError."""
+    response = _ApiResponse(400, payload=None)
+    provider = _api_provider(response)
+    with pytest.raises(InvalidDataError):
+        await provider._api_request("GET", "https://example.com/x")
+    response.close.assert_called_once()
+
+
+async def test_list_json_400_body_does_not_crash() -> None:
+    """A 400 whose body is a JSON list must raise the generic error, not AttributeError."""
+    response = _ApiResponse(400, payload=[])
+    provider = _api_provider(response)
+    with pytest.raises(InvalidDataError):
+        await provider._api_request("GET", "https://example.com/x")
+    response.close.assert_called_once()
+
+
+async def test_string_json_400_body_does_not_crash() -> None:
+    """A 400 whose body is a JSON string must raise the generic error, not AttributeError."""
+    response = _ApiResponse(400, payload="error message")
+    provider = _api_provider(response)
+    with pytest.raises(InvalidDataError):
+        await provider._api_request("GET", "https://example.com/x")
+    response.close.assert_called_once()
+
+
 async def test_404_still_closes_the_session() -> None:
     """Other status branches keep closing the session; only the 400 refusal path changed."""
     response = _ApiResponse(404)

@@ -126,7 +126,7 @@ async def raise_if_no_entitlements(response: aiohttp.ClientResponse) -> None:
         error_body = await response.json()
     except aiohttp.ContentTypeError, json.JSONDecodeError:
         return
-    if error_body.get("errorString") == "NO_ENTITLEMENTS":
+    if isinstance(error_body, dict) and error_body.get("errorString") == "NO_ENTITLEMENTS":
         raise MediaNotFoundError("On-demand playback is not available on this Pandora account")
 
 
