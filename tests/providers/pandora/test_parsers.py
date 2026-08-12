@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import Mock
 
+import pytest
 from music_assistant_models.enums import ExternalID
 
 from music_assistant.providers.pandora.parsers import (
@@ -165,6 +166,23 @@ def test_track_record_builds_its_album_and_artist_from_the_siblings() -> None:
 def test_track_record_duration_is_seconds() -> None:
     """Pandora reports a catalogue track's length in seconds, as MA expects it."""
     assert parse_track_record(_provider(), _CATALOGUE["TR:100"], "TR:100").duration == 232
+
+
+@pytest.mark.parametrize(
+    ("record", "expected"),
+    [
+        ({"trackNumber": 7}, 7),
+        ({}, 0),
+        ({"trackNumber": None}, 0),
+    ],
+    ids=["numbered", "absent", "null"],
+)
+def test_track_record_carries_its_position_in_the_album(
+    record: dict[str, Any], expected: int
+) -> None:
+    """An album listing is ordered by this number, so a wrong one shows the album wrong."""
+    track = parse_track_record(_provider(), {**_CATALOGUE["TR:100"], **record}, "TR:100")
+    assert track.track_number == expected
 
 
 def test_track_record_carries_its_isrc() -> None:

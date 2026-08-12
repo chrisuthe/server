@@ -86,6 +86,10 @@ ACCOUNT_FLAG_HIGH_QUALITY = "highQualityStreamingAvailable"
 # without an ad", not "is Premium".
 ACCOUNT_FLAG_ON_DEMAND = "onDemand"
 
+# What the listener is told wherever an on-demand request is refused, whether this provider
+# answered for the account itself or Pandora refused the request with NO_ENTITLEMENTS.
+NO_ON_DEMAND_MESSAGE = "On-demand playback is not available on this Pandora account"
+
 CONF_DEVICE_UUID = "device_uuid"
 
 # Reference level a ReplayGain-style adjustment is measured against, so a gain can be

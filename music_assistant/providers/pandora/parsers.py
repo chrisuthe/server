@@ -27,6 +27,25 @@ if TYPE_CHECKING:
     from .provider import PandoraProvider
 
 
+def _parse_art(provider: PandoraProvider, art: list[dict[str, Any]]) -> MediaItemImage | None:
+    """
+    Parse the thumbnail to show for a Pandora art list, if any entry names a URL.
+
+    :param art: A Pandora `art`/`albumArt` list, each entry sized and holding a URL.
+    """
+    art_url = next(
+        (entry.get("url") for entry in art if entry.get("size") == 500), art[-1].get("url")
+    )
+    if not art_url:
+        return None
+    return MediaItemImage(
+        type=ImageType.THUMB,
+        path=str(art_url),
+        provider=provider.instance_id,
+        remotely_accessible=True,
+    )
+
+
 def parse_station(provider: PandoraProvider, station: dict[str, Any]) -> Playlist:
     """Parse a station object into a dynamic playlist."""
     playlist = Playlist(
@@ -43,19 +62,8 @@ def parse_station(provider: PandoraProvider, station: dict[str, Any]) -> Playlis
             )
         },
     )
-    if art := station.get("art"):
-        art_url = next(
-            (item.get("url") for item in art if item.get("size") == 500), art[-1].get("url")
-        )
-        if art_url:
-            playlist.metadata.add_image(
-                MediaItemImage(
-                    type=ImageType.THUMB,
-                    path=art_url,
-                    provider=provider.instance_id,
-                    remotely_accessible=True,
-                )
-            )
+    if (art := station.get("art")) and (image := _parse_art(provider, art)):
+        playlist.metadata.add_image(image)
     return playlist
 
 
@@ -91,20 +99,8 @@ def parse_track(
             )
         },
     )
-    if album_art := obj.get("albumArt"):
-        art_url = next(
-            (art.get("url") for art in album_art if art.get("size") == 500),
-            album_art[-1].get("url"),
-        )
-        if art_url:
-            track.metadata.add_image(
-                MediaItemImage(
-                    provider=provider.instance_id,
-                    type=ImageType.THUMB,
-                    path=art_url,
-                    remotely_accessible=True,
-                )
-            )
+    if (album_art := obj.get("albumArt")) and (image := _parse_art(provider, album_art)):
+        track.metadata.add_image(image)
     if artist_name := obj.get("artistName"):
         track.artists = UniqueList([parse_artist(provider, artist_name, record.get("artistId"))])
     track.album = parse_album(provider, obj, track_id, record)

@@ -18,6 +18,7 @@ from music_assistant_models.errors import (
 
 from .constants import (
     AUTH_ERRORS,
+    NO_ON_DEMAND_MESSAGE,
     NOT_FOUND_ERRORS,
     REPLAY_GAIN_REFERENCE_LUFS,
     UNAVAILABLE_ERRORS,
@@ -136,7 +137,7 @@ async def raise_if_playback_refused(response: aiohttp.ClientResponse) -> None:
         return
     error_string = error_body.get("errorString")
     if error_string == "NO_ENTITLEMENTS":
-        raise MediaNotFoundError("On-demand playback is not available on this Pandora account")
+        raise MediaNotFoundError(NO_ON_DEMAND_MESSAGE)
     if error_string == "NO_PLAYABLE_CONTENT":
         raise MediaNotFoundError("This Pandora source has nothing playable")
 

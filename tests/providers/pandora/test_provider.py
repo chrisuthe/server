@@ -629,6 +629,7 @@ def _creating_provider(
     provider.logger = Mock()
     provider._sessions = {}
     provider._high_quality_available = False
+    provider._on_demand_available = False
     create_calls: list[dict[str, Any]] = []
 
     async def _fake_api_request(
@@ -879,7 +880,22 @@ async def test_search_drops_a_track_the_account_cannot_play() -> None:
     """A result without hasInteractive would fail on click, so it never becomes a result."""
     provider, _ = _searching_provider()
     results = await provider.search("coldplay", [MediaType.TRACK])
-    assert "TR:101" not in [track.item_id for track in results.tracks]
+    assert [track.item_id for track in results.tracks] == ["TR:100"]
+
+
+async def test_search_returns_only_the_types_that_were_asked_for() -> None:
+    """
+    Pandora answers a track search with albums and artists too, and core does not filter them.
+
+    Returning an album to a track-only search puts a result in front of the user that the
+    caller never asked for, from a search whose count was spent on tracks.
+    """
+    provider, _ = _searching_provider()
+    tracks_only = await provider.search("coldplay", [MediaType.TRACK])
+    assert tracks_only.albums == []
+    albums_only = await provider.search("coldplay", [MediaType.ALBUM])
+    assert albums_only.tracks == []
+    assert [album.item_id for album in albums_only.albums] == ["AL:157378"]
 
 
 async def test_search_does_not_return_artists() -> None:
@@ -1045,7 +1061,7 @@ async def test_album_tracks_batch_only_the_records_the_details_response_lacks() 
 
 
 async def test_album_tracks_keep_pandoras_order() -> None:
-    """Pandora's order is the album's order; sorting by id or name would reverse this one."""
+    """Pandora's order is the album's order; sorting by id would reverse this one."""
     provider, _, _ = _detailing_provider({**_ALBUM_SIBLINGS, **_ALBUM_TRACKS})
     tracks = await provider.get_album_tracks(_ALBUM_ID)
     assert [track.name for track in tracks] == ["Album Song 1", "Album Song 2", "Album Song 3"]
@@ -1072,6 +1088,35 @@ async def test_album_tracks_drop_a_track_the_account_cannot_play() -> None:
     )
     tracks = await provider.get_album_tracks(_ALBUM_ID)
     assert [track.item_id for track in tracks] == ["TR:21356", "TR:21354"]
+
+
+async def test_album_tracks_drop_a_track_whose_rights_are_null() -> None:
+    """Pandora really does send `rightsInfo: null`; reading through it must not crash."""
+    nulled = {**_ALBUM_TRACKS["TR:21355"], "rightsInfo": None}
+    provider, _, _ = _detailing_provider({**_ALBUM_SIBLINGS, **_ALBUM_TRACKS, "TR:21355": nulled})
+    tracks = await provider.get_album_tracks(_ALBUM_ID)
+    assert [track.item_id for track in tracks] == ["TR:21356", "TR:21354"]
+
+
+_TRACKLESS_ALBUMS: dict[str, dict[str, Any]] = {
+    "null": {**_ALBUM_SIBLINGS[_ALBUM_ID], "tracks": None},
+    "absent": {key: value for key, value in _ALBUM_SIBLINGS[_ALBUM_ID].items() if key != "tracks"},
+}
+
+
+@pytest.mark.parametrize("album", list(_TRACKLESS_ALBUMS.values()), ids=list(_TRACKLESS_ALBUMS))
+async def test_an_album_with_no_tracks_is_empty_rather_than_an_error(
+    album: dict[str, Any],
+) -> None:
+    """
+    An album record naming no tracks lists nothing, and asks Pandora nothing further.
+
+    Pandora sends the key as null as readily as it omits it, and neither is a missing album.
+    """
+    provider, details_calls, annotate_calls = _detailing_provider({_ALBUM_ID: album})
+    assert await provider.get_album_tracks(_ALBUM_ID) == []
+    assert len(details_calls) == 1
+    assert annotate_calls == []
 
 
 async def test_album_tracks_drop_a_track_no_record_ever_arrived_for() -> None:

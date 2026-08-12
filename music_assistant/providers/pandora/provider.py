@@ -61,6 +61,7 @@ from .constants import (
     CONF_TAKEOVER_ACTION,
     CREATE_STATION_ENDPOINT,
     LOGIN_ENDPOINT,
+    NO_ON_DEMAND_MESSAGE,
     PLAYBACK_RESUMED_ENDPOINT,
     PLAYBACK_SOURCE_ENDPOINT,
     PLAYLIST_FRAGMENT_ENDPOINT,
@@ -111,7 +112,7 @@ class PandoraProvider(MusicProvider):
     _socks_proxy: bool = False
     _high_quality_available: bool = False
     _on_demand_available: bool = False
-    _device_uuid: str
+    _device_uuid: str = ""
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return Config entries to configure this provider."""
@@ -389,7 +390,7 @@ class PandoraProvider(MusicProvider):
         if not prov_album_id.startswith("AL:"):
             raise MediaNotFoundError(f"Album {prov_album_id} has no Pandora tracklist")
         if not self._on_demand_available:
-            raise MediaNotFoundError("On-demand playback is not available on this Pandora account")
+            raise MediaNotFoundError(NO_ON_DEMAND_MESSAGE)
         response = await self._api_request(
             "POST",
             CATALOG_DETAILS_ENDPOINT,
@@ -486,7 +487,7 @@ class PandoraProvider(MusicProvider):
             # play perfectly well.
             if holders:
                 raise MediaNotFoundError(f"Track {item_id} expired while playback was stopped")
-            raise MediaNotFoundError("On-demand playback is not available on this Pandora account")
+            raise MediaNotFoundError(NO_ON_DEMAND_MESSAGE)
         return await self._mint_stream_details(item_id)
 
     async def takeover_stream(self) -> None:
@@ -780,7 +781,7 @@ class PandoraProvider(MusicProvider):
         :raises MediaNotFoundError: If the account is not entitled to on-demand playback.
         """
         if not self._on_demand_available:
-            raise MediaNotFoundError("On-demand playback is not available on this Pandora account")
+            raise MediaNotFoundError(NO_ON_DEMAND_MESSAGE)
         return await self._annotate_objects(pandora_ids)
 
     async def _annotate_one(self, pandora_id: str) -> dict[str, Any]:
@@ -873,7 +874,7 @@ class PandoraProvider(MusicProvider):
         One call answers every requested type, and the records it returns describe the
         results' albums and artists too, so nothing here needs a second lookup. A track the
         account may not play interactively is dropped rather than offered as a result that
-        fails on click.
+        fails on click, and so is a result of a type nobody asked for.
 
         :param types: Type prefixes to search for, as Pandora spells them - `["TR", "AL"]`.
         """
@@ -889,9 +890,9 @@ class PandoraProvider(MusicProvider):
             if not isinstance(record := annotations.get(result_id), dict):
                 continue
             rights = record.get("rightsInfo") or {}
-            if result_id.startswith("TR:") and rights.get("hasInteractive"):
+            if "TR" in types and result_id.startswith("TR:") and rights.get("hasInteractive"):
                 tracks.append(parse_track_record(self, record, result_id, annotations))
-            elif result_id.startswith("AL:"):
+            elif "AL" in types and result_id.startswith("AL:"):
                 albums.append(parse_album_record(self, record, result_id, annotations))
         return tracks, albums
 
