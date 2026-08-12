@@ -8,15 +8,19 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from music_assistant_models.auth import Scope
+from music_assistant_models.auth import Scope, UserRole
 from music_assistant_models.enums import MediaType, ProviderFeature, StreamType
 from music_assistant_models.errors import (
     ActionUnavailable,
+    InvalidDataError,
     MediaNotFoundError,
+    PlayerUnavailableError,
     ResourceBusyError,
+    UnsupportedFeaturedException,
 )
 from music_assistant_models.provider import ProviderManifest
 
+from music_assistant.controllers.webserver.helpers.auth_middleware import ROLE_SCOPES
 from music_assistant.providers import sendspin_sync
 from music_assistant.providers.sendspin_sync import (
     AUDIO_SOURCE_ID,
@@ -169,6 +173,7 @@ async def test_api_commands_are_registered_and_released_on_unload() -> None:
         "sendspin_sync/session",
         "sendspin_sync/start_session",
         "sendspin_sync/solo_player",
+        "sendspin_sync/apply_measurements",
         "sendspin_sync/stop_session",
     ]
     scopes = [call.kwargs["required_scope"] for call in mass.register_api_command.call_args_list]
@@ -177,11 +182,35 @@ async def test_api_commands_are_registered_and_released_on_unload() -> None:
         Scope.PLAYERS_READ,
         Scope.PLAYERS_CONTROL,
         Scope.PLAYERS_CONTROL,
+        Scope.CONFIG_PLAYERS_WRITE,
         Scope.PLAYERS_CONTROL,
     ]
 
     await provider.unload()
     assert unregister_calls == registered
+
+
+async def test_applying_a_result_needs_more_than_a_guest_scope() -> None:
+    """
+    Persisting a static delay is guarded like any other player config write.
+
+    Every other session command is transient and fully restored, so a guest may drive
+    one. This command writes player config - the mutation config/players/save gates on
+    CONFIG_PLAYERS_WRITE - and an in-process call into the Sendspin provider is never
+    re-checked against the caller's scopes, so the registration is the only guard.
+    """
+    provider = await _setup_provider()
+    mass = _mock_mass(provider)
+    mass.register_api_command = MagicMock()
+    await provider.loaded_in_mass()
+
+    scope_by_command = {
+        call.args[0]: call.kwargs["required_scope"]
+        for call in mass.register_api_command.call_args_list
+    }
+
+    assert scope_by_command["sendspin_sync/apply_measurements"] == Scope.CONFIG_PLAYERS_WRITE
+    assert Scope.CONFIG_PLAYERS_WRITE not in ROLE_SCOPES[UserRole.GUEST]
 
 
 async def test_unload_stops_a_running_session() -> None:
@@ -355,15 +384,220 @@ async def test_a_stream_that_never_starts_releases_the_session() -> None:
     mass.cancel_timer.assert_called_with(provider._session_timeout_id)
 
 
-def _stub_session() -> MagicMock:
+async def test_applying_measurements_reaches_the_devices_through_the_sendspin_provider() -> None:
+    """
+    The normalised delays are handed to the published Sendspin applier, per player.
+
+    Going through the provider is what pushes the value to the client; writing the
+    config directly would leave the speaker itself uncorrected.
+    """
+    provider = await _setup_provider()
+    sendspin = _stub_sendspin(provider, {"a": 0, "b": 0, "c": 0})
+    await _run_session(provider, ["a", "b", "c"])
+
+    applied = await provider.apply_measurements({"a": 10.0, "b": 35.0, "c": 12.0})
+
+    assert applied == {"a": 0, "b": 25, "c": 2}
+    assert _applied_delays(sendspin) == {"a": 0, "b": 25, "c": 2}
+
+
+async def test_applying_measurements_folds_in_the_delays_already_in_place() -> None:
+    """Each member's current delay is read back and counted towards how late it is."""
+    provider = await _setup_provider()
+    sendspin = _stub_sendspin(provider, {"amp": 200, "speaker": 0})
+    await _run_session(provider, ["amp", "speaker"])
+
+    applied = await provider.apply_measurements({"amp": 0.0, "speaker": 40.0})
+
+    read_back = [call.args[0] for call in sendspin.get_player_static_delay.call_args_list]
+    assert sorted(read_back) == ["amp", "speaker"]
+    # the amp is 200 ms of advance plus 0 measured; the speaker 0 plus 40
+    assert applied == {"amp": 160, "speaker": 0}
+
+
+async def test_re_measuring_a_corrected_group_writes_the_same_delays_again() -> None:
+    """
+    Running the calibration twice converges rather than drifting.
+
+    A corrected group arrives together, so the second pass measures equal offsets;
+    folding in what each player now carries has to reproduce those same values.
+    """
+    provider = await _setup_provider()
+    sendspin = _stub_sendspin(provider, {"a": 0, "b": 0, "c": 0})
+    await _run_session(provider, ["a", "b", "c"])
+    first = await provider.apply_measurements({"a": 0.0, "b": 120.0, "c": 35.0})
+
+    second = await provider.apply_measurements(dict.fromkeys(("a", "b", "c"), 4.0))
+
+    assert first == {"a": 0, "b": 120, "c": 35}
+    assert second == first
+    assert _applied_delays(sendspin) == first
+
+
+async def test_measurements_are_refused_without_a_running_session() -> None:
+    """Offsets are only meaningful against a live stream, so there must be a session."""
+    provider = await _setup_provider()
+    sendspin = _stub_sendspin(provider, {"a": 0})
+
+    with pytest.raises(ActionUnavailable):
+        await provider.apply_measurements({"a": 0.0})
+
+    sendspin.set_player_static_delay.assert_not_awaited()
+
+
+async def test_a_refused_measurement_writes_nothing_at_all() -> None:
+    """
+    Every value is computed and accepted before the first one is written.
+
+    A rejection partway through the group would leave it half corrected, which is
+    worse than either applying the lot or applying none of it.
+    """
+    provider = await _setup_provider()
+    sendspin = _stub_sendspin(provider, {"a": 0, "b": 0})
+    await _run_session(provider, ["a", "b"])
+
+    with pytest.raises(InvalidDataError):
+        await provider.apply_measurements({"a": 0.0, "b": 99_000.0})
+
+    sendspin.set_player_static_delay.assert_not_awaited()
+
+
+async def test_a_measurement_for_a_player_outside_the_session_is_refused() -> None:
+    """A speaker that did not share the session's stream can not be normalised with it."""
+    provider = await _setup_provider()
+    sendspin = _stub_sendspin(provider, {"a": 0, "stranger": 0})
+    await _run_session(provider, ["a"])
+
+    with pytest.raises(InvalidDataError):
+        await provider.apply_measurements({"a": 0.0, "stranger": 5.0})
+
+    sendspin.set_player_static_delay.assert_not_awaited()
+
+
+async def test_applying_a_result_leaves_the_session_running() -> None:
+    """
+    The session survives so the correction can be verified where it was measured.
+
+    Ending it would ungroup every speaker, changing the sync path the numbers describe.
+    """
+    provider = await _setup_provider()
+    _stub_sendspin(provider, {"a": 0})
+    session = await _run_session(provider, ["a"])
+
+    await provider.apply_measurements({"a": 0.0})
+
+    session.stop.assert_not_awaited()
+    assert provider._session is session
+
+
+async def test_applying_a_result_rearms_the_inactivity_timeout() -> None:
+    """Applying is activity, so it keeps a session alive like a solo does."""
+    provider = await _setup_provider()
+    _stub_sendspin(provider, {"a": 0})
+    await _run_session(provider, ["a"])
+    mass = _mock_mass(provider)
+    mass.call_later.reset_mock()
+
+    await provider.apply_measurements({"a": 0.0})
+
+    assert mass.call_later.call_args.kwargs["task_id"] == provider._session_timeout_id
+
+
+async def test_a_member_that_cannot_take_a_static_delay_stops_the_apply_before_any_write() -> None:
+    """
+    An unusable member is caught while the current delays are read, so nothing is written.
+
+    Eligibility keeps such a speaker out of a session in the first place; this is the
+    backstop for a client that dropped the command between joining and measuring.
+    """
+    provider = await _setup_provider()
+    sendspin = _stub_sendspin(provider, {"a": 0, "b": 0})
+    sendspin.get_player_static_delay = MagicMock(
+        side_effect=[0, UnsupportedFeaturedException("no static delay")]
+    )
+    await _run_session(provider, ["a", "b"])
+
+    with pytest.raises(UnsupportedFeaturedException):
+        await provider.apply_measurements({"a": 0.0, "b": 10.0})
+
+    sendspin.set_player_static_delay.assert_not_awaited()
+
+
+async def test_a_player_lost_mid_apply_leaves_the_earlier_writes_in_place() -> None:
+    """
+    A write that fails partway through propagates rather than being swallowed.
+
+    Validation is all-or-nothing, but the writes are not: a speaker that disappears
+    between the read and its own write leaves the players before it corrected. The
+    caller has to see that rather than get a clean return over a half-corrected group.
+    """
+    provider = await _setup_provider()
+    sendspin = _stub_sendspin(provider, {"a": 0, "b": 0, "c": 0})
+    await _run_session(provider, ["a", "b", "c"])
+    applied: list[str] = []
+
+    async def _apply(player_id: str, _delay_ms: int) -> None:
+        if player_id == "c":
+            raise PlayerUnavailableError(player_id)
+        applied.append(player_id)
+
+    sendspin.set_player_static_delay = AsyncMock(side_effect=_apply)
+
+    with pytest.raises(PlayerUnavailableError):
+        await provider.apply_measurements({"a": 0.0, "b": 10.0, "c": 20.0})
+
+    assert applied == ["a", "b"]
+
+
+async def test_measurements_are_refused_when_sendspin_is_gone() -> None:
+    """Without the Sendspin provider there is nothing to apply the correction through."""
+    provider = await _setup_provider()
+    await _run_session(provider, ["a"])
+    _mock_mass(provider).get_provider = MagicMock(return_value=None)
+
+    with pytest.raises(ActionUnavailable):
+        await provider.apply_measurements({"a": 0.0})
+
+
+def _stub_session(player_ids: list[str] | None = None) -> MagicMock:
     """Return a stub calibration session that reports itself live."""
     session = MagicMock()
     session.queue_id = "anchor"
     session.stopped = False
+    session.player_ids = player_ids if player_ids is not None else ["player"]
     session.begin = AsyncMock()
     session.solo = AsyncMock()
     session.stop = AsyncMock()
     return session
+
+
+async def _run_session(provider: SendspinSyncProvider, player_ids: list[str]) -> MagicMock:
+    """Put a stub session over the given players in place on the provider."""
+    session = _stub_session(player_ids)
+    with patch.object(CalibrationSession, "create", AsyncMock(return_value=session)):
+        await provider.start_session(player_ids)
+    return session
+
+
+def _stub_sendspin(provider: SendspinSyncProvider, current_delays_ms: dict[str, int]) -> MagicMock:
+    """
+    Install a stub Sendspin provider that carries the given static delays.
+
+    Reads and writes hit the same mapping, so a second ``apply_measurements`` sees what
+    the first one applied - which is what makes the convergence test meaningful.
+    """
+    sendspin = MagicMock()
+    sendspin.get_player_static_delay = MagicMock(side_effect=current_delays_ms.__getitem__)
+    sendspin.set_player_static_delay = AsyncMock(
+        side_effect=lambda player_id, delay_ms: current_delays_ms.__setitem__(player_id, delay_ms)
+    )
+    _mock_mass(provider).get_provider = MagicMock(return_value=sendspin)
+    return sendspin
+
+
+def _applied_delays(sendspin: MagicMock) -> dict[str, int]:
+    """Return the last static delay applied per player through the Sendspin provider."""
+    return {call.args[0]: call.args[1] for call in sendspin.set_player_static_delay.await_args_list}
 
 
 async def _setup_provider() -> SendspinSyncProvider:

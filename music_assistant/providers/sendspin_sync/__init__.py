@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from itertools import cycle
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from music_assistant_models.auth import Scope
 from music_assistant_models.enums import (
@@ -47,6 +47,7 @@ from .session import (
     CalibrationSessionState,
     is_busy,
     is_eligible,
+    resolve_static_delays,
 )
 
 if TYPE_CHECKING:
@@ -57,6 +58,7 @@ if TYPE_CHECKING:
 
     from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
+    from music_assistant.providers.sendspin.provider import SendspinProvider
 
 
 SUPPORTED_FEATURES = {ProviderFeature.AUDIO_SOURCE}
@@ -159,6 +161,15 @@ class SendspinSyncProvider(PluginProvider):
             ("sendspin_sync/session", self.get_session, Scope.PLAYERS_READ),
             ("sendspin_sync/start_session", self.start_session, Scope.PLAYERS_CONTROL),
             ("sendspin_sync/solo_player", self.solo_player, Scope.PLAYERS_CONTROL),
+            # CONFIG_PLAYERS_WRITE, unlike the transient commands above: this one
+            # persists a player config value, which is exactly what config/players/save
+            # is gated on. PLAYERS_CONTROL is a guest scope, and an in-process call to
+            # the Sendspin provider is not re-checked against the caller's scopes.
+            (
+                "sendspin_sync/apply_measurements",
+                self.apply_measurements,
+                Scope.CONFIG_PLAYERS_WRITE,
+            ),
             ("sendspin_sync/stop_session", self.stop_session, Scope.PLAYERS_CONTROL),
         )
         for command, handler, required_scope in api_handlers:
@@ -364,6 +375,57 @@ class SendspinSyncProvider(PluginProvider):
             self._arm_session_timeout()
             return self._session.state
 
+    async def apply_measurements(self, offsets_ms: dict[str, float]) -> dict[str, int]:
+        """
+        Turn the session's measured arrival offsets into static delays and apply them.
+
+        The offsets are *relative*: the probe measures every speaker against one
+        arbitrary shared baseline, so only the differences between them mean anything.
+        Each player's existing static delay is folded in before normalising, so
+        re-running a calibration converges instead of drifting and a delay the user
+        set by hand is respected.
+
+        Every member of the session must be measured, and nothing is written until every
+        value has been computed and accepted, so no rejected measurement can leave the
+        group half corrected. A player that drops off mid-apply still can: the write that
+        fails raises and the players already written keep their new delay. The returned
+        map is therefore only meaningful on success.
+
+        Leaves the session running so the result can be verified in place: measure
+        again, and every speaker should now report the same arrival. The session's
+        inactivity timeout still applies, so a client has to apply within it.
+
+        :param offsets_ms: Measured arrival offset per player id, in milliseconds.
+        :raises ActionUnavailable: If no calibration session is running, or the Sendspin
+            provider is not available.
+        :raises InvalidDataError: If the measurements do not cover exactly the session's
+            members, a value is not finite, or one implies a delay Sendspin can not carry.
+        :raises PlayerUnavailableError: If a member of the session has meanwhile gone.
+        :raises UnsupportedFeaturedException: If a member does not accept a static delay.
+        :return: The absolute static delay applied per player, in milliseconds.
+        """
+        async with self._session_lock:
+            if self._session is None:
+                raise ActionUnavailable(
+                    "No calibration session is running",
+                    translation_key="no_session",
+                    translation_owner=self.translation_owner,
+                )
+            sendspin = self._sendspin_provider()
+            current_delays_ms = {
+                player_id: sendspin.get_player_static_delay(player_id)
+                for player_id in self._session.player_ids
+            }
+            delays_ms = resolve_static_delays(offsets_ms, current_delays_ms, self.translation_owner)
+            # Saving these mid-session does not disturb the measurement: the static delay
+            # config entry is immediate_apply and carries no requires_reload, so the
+            # config controller pushes it straight to the client instead of restarting
+            # the queue - which would end the stream the measurements are phased against.
+            for player_id, delay_ms in delays_ms.items():
+                await sendspin.set_player_static_delay(player_id, delay_ms)
+            self._arm_session_timeout()
+            return delays_ms
+
     async def stop_session(self) -> None:
         """
         Stop the running calibration session and restore every speaker it took over.
@@ -371,6 +433,21 @@ class SendspinSyncProvider(PluginProvider):
         Does nothing when no session is running.
         """
         await self._stop_session()
+
+    def _sendspin_provider(self) -> SendspinProvider:
+        """
+        Return the Sendspin provider a measured correction is applied through.
+
+        :raises ActionUnavailable: If the Sendspin provider is not available.
+        """
+        sendspin = cast("SendspinProvider | None", self.mass.get_provider(SENDSPIN_DOMAIN))
+        if sendspin is None:
+            raise ActionUnavailable(
+                "The Sendspin provider is not available",
+                translation_key="sendspin_unavailable",
+                translation_owner=self.translation_owner,
+            )
+        return sendspin
 
     def _arm_session_timeout(self) -> None:
         """(Re)start the inactivity timeout that tears a forgotten session down."""

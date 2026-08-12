@@ -1,4 +1,4 @@
-"""Tests for the published static delay applier on the Sendspin provider."""
+"""Tests for the published static delay accessors on the Sendspin provider."""
 
 from __future__ import annotations
 
@@ -202,3 +202,82 @@ async def test_player_without_static_delay_support_raises(mass: MusicAssistant) 
         await sendspin.set_player_static_delay(PLAYER_ID, 100)
 
     assert _pushed_delays(role) == []
+
+
+async def test_static_delay_support_is_reported_without_raising(mass: MusicAssistant) -> None:
+    """
+    The support predicate answers rather than raising, so a caller can filter on it.
+
+    It is what keeps a speaker that could never accept a correction out of a calibration
+    session, instead of the session failing at the point it tries to apply one.
+    """
+    sendspin, _role = _register_player(mass)
+
+    assert sendspin.supports_player_static_delay(PLAYER_ID) is True
+
+
+@pytest.mark.parametrize("player_id", [PLAYER_ID, "no_such_player", "foreign_player"])
+async def test_unsupported_players_report_no_static_delay_support(
+    mass: MusicAssistant, player_id: str
+) -> None:
+    """An unknown player, another provider's player, and an unsupporting role all say no."""
+    sendspin, _role = _register_player(mass, supported=False)
+    mass.players._players["foreign_player"] = Mock(spec=Player)
+
+    assert sendspin.supports_player_static_delay(player_id) is False
+
+
+async def test_the_delay_reads_back_as_it_was_applied(mass: MusicAssistant) -> None:
+    """The getter reports what the setter persisted, so a correction can build on it."""
+    sendspin, _role = _register_player(mass)
+    await sendspin.set_player_static_delay(PLAYER_ID, 275)
+
+    assert sendspin.get_player_static_delay(PLAYER_ID) == 275
+
+
+async def test_an_unset_delay_reads_back_as_the_player_default(mass: MusicAssistant) -> None:
+    """
+    With no value stored for the player, the getter reports its model-specific default.
+
+    This is the same expression the push to the device reads, so a caller folding the
+    current delay into a correction works from what the client was last told rather than
+    from a bare 0.
+    """
+    sendspin, _role = _register_player(mass)
+    player = mass.players.get_player(PLAYER_ID)
+    assert isinstance(player, SendspinPlayer)
+    player.static_delay_default_ms = 180
+
+    assert sendspin.get_player_static_delay(PLAYER_ID) == 180
+    assert player.config.get_value(CONF_SENDSPIN_STATIC_DELAY) is None
+
+
+async def test_reading_an_unknown_player_raises(mass: MusicAssistant) -> None:
+    """The getter refuses a player that is not there rather than reporting a delay."""
+    sendspin = _get_sendspin_provider(mass)
+
+    with pytest.raises(PlayerUnavailableError):
+        sendspin.get_player_static_delay("no_such_player")
+
+
+async def test_reading_a_non_sendspin_player_raises(mass: MusicAssistant) -> None:
+    """A player belonging to another provider carries no Sendspin static delay."""
+    sendspin = _get_sendspin_provider(mass)
+    foreign_player = Mock(spec=Player)
+    mass.players._players["foreign_player"] = foreign_player
+
+    with pytest.raises(UnsupportedFeaturedException):
+        sendspin.get_player_static_delay("foreign_player")
+
+
+async def test_reading_a_player_without_static_delay_support_raises(mass: MusicAssistant) -> None:
+    """
+    A player that cannot take a static delay raises instead of reporting 0.
+
+    A 0 there is indistinguishable from a real one, so a correction computed against it
+    would look applicable while the device could never accept it.
+    """
+    sendspin, _role = _register_player(mass, supported=False)
+
+    with pytest.raises(UnsupportedFeaturedException):
+        sendspin.get_player_static_delay(PLAYER_ID)

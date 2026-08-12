@@ -38,6 +38,7 @@ each of them in turn. It is driven through the API:
 | `sendspin_sync/session` | `players.read` | State of the running session, or `null` |
 | `sendspin_sync/start_session` | `players.control` | Take the given speakers over and start the track |
 | `sendspin_sync/solo_player` | `players.control` | Make one member of the session audible |
+| `sendspin_sync/apply_measurements` | `config.players.write` | Turn the measured offsets into static delays and apply them |
 | `sendspin_sync/stop_session` | `players.control` | End the session and restore every speaker |
 
 The speakers are grouped onto a **hidden Sendspin virtual player** that owns the
@@ -80,6 +81,66 @@ muted. Each speaker's restore steps are attempted independently, so one that has
 disconnected can not leave the others silent or grouped. Grouping powers a
 speaker on, so one that was off is switched back off rather than resumed.
 
+## Applying the result
+
+`apply_measurements` takes one number per session member: the offset at which the
+chirp train arrived from that speaker, as the probe measured it. Those numbers are
+**relative** — the probe measures every speaker against a baseline it picked for
+itself — so only the differences between them carry meaning.
+
+They are applied as Sendspin static delays. A static delay *advances* a player:
+the client subtracts it from the server timestamp, so a larger value makes the
+sound leave that speaker earlier, and the protocol carries no negative value.
+Equalising a group therefore means leaving the earliest speaker where it is and
+pulling every later one forward to meet it:
+
+```
+total_i = offsets_ms[i] + current_static_delay_ms[i]
+delay_i = round(total_i - min_j(total_j))
+```
+
+The earliest arrival is the one with the smallest `total`, so it gets 0 and does not
+move; the latest gets the largest advance and moves the most. The group converges on
+the earliest uncorrected arrival.
+
+Folding in the delay a player already carries is what makes this **idempotent**:
+re-running a calibration over an already corrected group returns the same delays
+rather than stacking a second correction on top of the first, and a delay the user
+set by hand for an amp is part of the baseline instead of being flattened to zero.
+
+Every member of the session must be measured. Correcting a subset would leave the
+rest normalised against a different baseline, which is worse than not correcting at
+all, so a partial result is refused. A measurement that is not a finite number, or
+one that implies a delay beyond the 5000 ms Sendspin carries, is likewise refused
+rather than clamped — that is not a speaker latency, and the largest plausible
+value would bury the bad measurement instead of reporting it. Nothing is written
+until every value has been computed and accepted, so a refusal never leaves the
+group half corrected. The writes themselves are not atomic: a speaker that drops off
+partway through leaves the ones before it corrected and raises, rather than reporting
+a success it did not achieve.
+
+Applying does **not** end the session. The static delay config entry is
+`immediate_apply` and carries no `requires_reload`, so saving it pushes the value
+straight to the client rather than restarting the queue — which would end the very
+stream the measurements are phased against. That makes *measure → apply → measure
+again* possible inside one session, and verification has to happen there: ending
+the session ungroups every speaker, changing the sync path the numbers describe.
+The inactivity timeout still applies, so a client has to apply within it.
+
+Unlike the other five commands, `apply_measurements` requires
+`config.players.write` rather than `players.control`. The rest are transient and
+fully restored when the session ends, but this one persists a player config value —
+the same mutation `config/players/save` is gated on. `players.control` is held by
+guests, and `config.players.write` by admin and service accounts only, so a plain
+user can drive a session but not apply its result. An in-process call into the
+Sendspin provider is not re-checked against the caller's scopes, so the command
+registration is the only place that guard exists.
+
+A speaker whose client does not carry `SET_STATIC_DELAY` can be measured but never
+corrected, so it is not eligible for a session at all — `eligible_players` leaves it
+out and `start_session` refuses it. Catching it there is the point: the alternative
+is a user walking the whole house and only being told at the last step.
+
 ## File Structure
 
 ```
@@ -87,6 +148,7 @@ sendspin_sync/
 ├── __init__.py       SendspinSyncProvider + setup() + the session API commands
 ├── chirp.py          Calibration signal generation
 ├── session.py        Calibration session orchestration (grouping, isolation, restore)
+│                     plus the offset-to-static-delay normalisation
 ├── manifest.json     Experimental plugin manifest
 ├── strings.json      Translatable manifest description + session error messages
 ├── icon.svg          Provider icon (light)

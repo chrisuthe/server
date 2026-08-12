@@ -27,7 +27,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any
+from math import isfinite
+from typing import TYPE_CHECKING, Any, cast
 
 from mashumaro import DataClassDictMixin
 from music_assistant_models.constants import PLAYER_CONTROL_NONE
@@ -46,16 +47,18 @@ from music_assistant.helpers.shared_playback import (
     SharedPlaybackSession,
     is_remote_session_host,
 )
+from music_assistant.providers.sendspin.constants import MAX_SENDSPIN_STATIC_DELAY
 
 if TYPE_CHECKING:
     import logging
-    from collections.abc import Coroutine
+    from collections.abc import Coroutine, Mapping
 
     from music_assistant_models.media_items import AudioSource
     from music_assistant_models.player import PlayerMedia
 
     from music_assistant.mass import MusicAssistant
     from music_assistant.models.player import Player
+    from music_assistant.providers.sendspin.provider import SendspinProvider
 
 # Name of the hidden anchor player. It is never shown in the UI, but it does end
 # up in logs and diagnostics, so it names what it is.
@@ -555,6 +558,12 @@ def is_eligible(mass: MusicAssistant, player: Player) -> bool:
     if is_remote_session_host(mass, player.player_id):
         # the hidden anchor of a session (this one or another plugin's) is not a speaker
         return False
+    # A measurement is only worth taking if the correction can be applied afterwards, and
+    # a client that does not carry a static delay can never accept one. Refusing it here
+    # means the user is told before walking the house rather than at the last step.
+    sendspin = cast("SendspinProvider | None", mass.get_provider(SENDSPIN_DOMAIN))
+    if sendspin is None or not sendspin.supports_player_static_delay(player.player_id):
+        return False
     # isolation drives mute where the client implements it and volume otherwise,
     # so a player with neither can never be taken out of the mix
     return (
@@ -570,6 +579,74 @@ def is_busy(player: Player) -> bool:
     :param player: The player to check.
     """
     return player.state.playback_state in BUSY_PLAYBACK_STATES
+
+
+def resolve_static_delays(
+    offsets_ms: Mapping[str, float],
+    current_delays_ms: Mapping[str, int],
+    translation_owner: str,
+) -> dict[str, int]:
+    """
+    Normalise a session's measured arrival offsets into absolute static delays.
+
+    A probe reports one offset per speaker, measured against a baseline it picked for
+    itself, so only the differences between them carry meaning. A Sendspin static
+    delay *advances* a player - the client subtracts it from the server timestamp, so
+    a larger value makes the sound leave that speaker earlier - and the protocol
+    carries no negative value. Equalising a group is therefore a matter of leaving the
+    earliest speaker where it is and pulling every later one forward to meet it, so the
+    whole group converges on the earliest arrival and that speaker is given zero.
+
+    The delay each player already carries is part of the sum, which makes this
+    converge rather than drift: re-measuring an already corrected group yields the
+    same delays again instead of stacking a second correction on the first, and a
+    delay the user set by hand for an amp is respected instead of being flattened.
+
+    Refuses rather than clamps. A measurement implying a delay past the end of the
+    supported range is not a speaker latency, and the largest plausible-looking value
+    would bury the bad measurement instead of reporting it.
+
+    :param offsets_ms: Measured arrival offset per player id, in milliseconds.
+    :param current_delays_ms: The static delay each player of the calibrated group
+        currently carries. Its keys define the group, and ``offsets_ms`` must cover
+        exactly the same players.
+    :param translation_owner: Translation owner for the errors raised here.
+    :raises InvalidDataError: If no measurements were given, if ``offsets_ms`` does not
+        cover exactly the group, if a measurement is not a finite number, or if one
+        implies a delay beyond the range Sendspin carries.
+    :return: The absolute static delay to apply per player, the earliest arrival at 0.
+    """
+    if not offsets_ms:
+        raise InvalidDataError(
+            "No measurements were given to apply",
+            translation_key="no_measurements",
+            translation_owner=translation_owner,
+        )
+    _reject_uncovered_group(offsets_ms, current_delays_ms, translation_owner)
+    # ahead of the minimum below, which a NaN would poison in a way that depends on
+    # iteration order: min() returns NaN only when it comes first
+    _reject_unusable_offsets(offsets_ms, translation_owner)
+    totals_ms = {
+        player_id: offset_ms + current_delays_ms[player_id]
+        for player_id, offset_ms in offsets_ms.items()
+    }
+    earliest_ms = min(totals_ms.values())
+    # subtracting the minimum puts the earliest speaker at exactly 0, which is
+    # MIN_SENDSPIN_STATIC_DELAY, and no value can fall below it - so only the top of
+    # the range can be exceeded
+    delays_ms = {
+        player_id: round(total_ms - earliest_ms) for player_id, total_ms in totals_ms.items()
+    }
+    for player_id, delay_ms in delays_ms.items():
+        if delay_ms > MAX_SENDSPIN_STATIC_DELAY:
+            raise InvalidDataError(
+                f"Measurements put player {player_id} {delay_ms} ms behind the earliest speaker, "
+                f"more than the {MAX_SENDSPIN_STATIC_DELAY} ms Sendspin can correct",
+                translation_key="delay_out_of_range",
+                translation_args=[player_id, delay_ms, MAX_SENDSPIN_STATIC_DELAY],
+                translation_owner=translation_owner,
+            )
+    return delays_ms
 
 
 def _validate_player(mass: MusicAssistant, player_id: str, translation_owner: str) -> Player:
@@ -623,6 +700,48 @@ def _reject_busy_players(players: list[Player], translation_owner: str) -> None:
         translation_args=[names],
         translation_owner=translation_owner,
     )
+
+
+def _reject_uncovered_group(
+    offsets_ms: Mapping[str, float],
+    current_delays_ms: Mapping[str, int],
+    translation_owner: str,
+) -> None:
+    """
+    Raise unless the measurements line up exactly with the calibrated group.
+
+    Normalisation is only meaningful across the whole group: correcting a subset
+    leaves the rest sitting against a different baseline, so a partly measured group
+    would come out less aligned than it went in.
+    """
+    if unknown_ids := offsets_ms.keys() - current_delays_ms.keys():
+        player_id = sorted(unknown_ids)[0]
+        raise InvalidDataError(
+            f"Player {player_id} is not part of this calibration session",
+            translation_key="player_not_in_session",
+            translation_args=[player_id],
+            translation_owner=translation_owner,
+        )
+    if unmeasured_ids := current_delays_ms.keys() - offsets_ms.keys():
+        player_id = sorted(unmeasured_ids)[0]
+        raise InvalidDataError(
+            f"Player {player_id} was not measured, so the group can not be equalised",
+            translation_key="player_not_measured",
+            translation_args=[player_id],
+            translation_owner=translation_owner,
+        )
+
+
+def _reject_unusable_offsets(offsets_ms: Mapping[str, float], translation_owner: str) -> None:
+    """Raise when any measured offset is not a finite number."""
+    for player_id, offset_ms in offsets_ms.items():
+        if not isfinite(offset_ms):
+            raise InvalidDataError(
+                f"Measured offset {offset_ms} for player {player_id} is not a finite number",
+                translation_key="offset_not_finite",
+                translation_args=[player_id],
+                translation_owner=translation_owner,
+            )
 
 
 def _snapshot(player: Player) -> PlayerSnapshot:

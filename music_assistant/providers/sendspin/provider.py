@@ -496,6 +496,56 @@ class SendspinProvider(PlayerProvider):
             return
         self._bridge_static_delay_defaults[client_id] = default_ms
 
+    def supports_player_static_delay(self, player_id: str) -> bool:
+        """
+        Return whether a static delay can be read from and applied to the given player.
+
+        The permissive counterpart to the accessors below, published so that a caller can
+        decide whether a player is worth offering at all rather than discovering it
+        through an exception. Answers False - never raises - for a player that is
+        unknown, belongs to another provider, or whose player role does not carry the
+        command.
+
+        Not a complete pre-check for those accessors: this says nothing about whether the
+        player is *available*, which they additionally require. A True here does not
+        promise a later read or write will not raise.
+
+        Depends on what the live client advertises, so a real Sendspin speaker may answer
+        False and may change its answer across reconnects.
+
+        :param player_id: Player id to check.
+        """
+        player = self.mass.players.get_player(player_id)
+        return isinstance(player, SendspinPlayer) and player.supports_static_delay
+
+    def get_player_static_delay(self, player_id: str) -> int:
+        """
+        Return the static delay a Sendspin player currently carries, in milliseconds.
+
+        The counterpart to :meth:`set_player_static_delay`, published so that a caller
+        computing a correction can fold in the delay a player already has - including
+        one the user set by hand for an amp - without reading this provider's player
+        config itself. Reads the value exactly as the push to the device reads it, so
+        what comes back is what the client was last told to apply.
+
+        Accepts and rejects exactly the players the setter does. In particular, a player
+        that does not accept a static delay raises rather than reporting 0: a 0 there is
+        indistinguishable from a real one, and a correction computed against it could
+        never be applied.
+
+        :param player_id: Player id of the Sendspin player to inspect.
+        :raises PlayerUnavailableError: No available player with this id exists.
+        :raises UnsupportedFeaturedException: The player is not a Sendspin player, or its
+            player role does not accept a static delay.
+        :return: The static delay in effect for this player, which is its model-specific
+            default until the user or a calibration sets one.
+        """
+        player = self._static_delay_player(player_id)
+        return cast(
+            "int",
+            player.config.get_value(CONF_SENDSPIN_STATIC_DELAY, player.static_delay_default_ms),
+        )
+
     async def set_player_static_delay(self, player_id: str, delay_ms: int) -> None:
         """
         Set a Sendspin player's static delay and push it to the device.
@@ -522,15 +572,7 @@ class SendspinProvider(PlayerProvider):
             player role does not accept a static delay.
         :raises InvalidDataError: delay_ms falls outside the supported range.
         """
-        player = self.mass.players.get_player(player_id, raise_unavailable=True)
-        if not isinstance(player, SendspinPlayer):
-            msg = f"Player {player_id} is not a Sendspin player"
-            raise UnsupportedFeaturedException(msg)
-        # A player whose role won't take a static delay has no config entry for it, so
-        # the save below would report success while changing nothing at all.
-        if not player.supports_static_delay:
-            msg = f"Player {player_id} does not accept a Sendspin static delay"
-            raise UnsupportedFeaturedException(msg)
+        player = self._static_delay_player(player_id)
         if not MIN_SENDSPIN_STATIC_DELAY <= delay_ms <= MAX_SENDSPIN_STATIC_DELAY:
             msg = (
                 f"Static delay {delay_ms} ms for player {player_id} is outside the supported "
@@ -1003,6 +1045,27 @@ class SendspinProvider(PlayerProvider):
             ),
             return_exceptions=True,
         )
+
+    def _static_delay_player(self, player_id: str) -> SendspinPlayer:
+        """
+        Return the Sendspin player behind a static delay read or write.
+
+        :param player_id: Player id to resolve.
+        :raises PlayerUnavailableError: No available player with this id exists.
+        :raises UnsupportedFeaturedException: The player is not a Sendspin player, or its
+            player role does not accept a static delay.
+        """
+        player = self.mass.players.get_player(player_id, raise_unavailable=True)
+        if not isinstance(player, SendspinPlayer):
+            msg = f"Player {player_id} is not a Sendspin player"
+            raise UnsupportedFeaturedException(msg)
+        # A player whose role won't take a static delay has no config entry for it, so a
+        # save would report success while changing nothing and a read would only ever
+        # see the default.
+        if not player.supports_static_delay:
+            msg = f"Player {player_id} does not accept a Sendspin static delay"
+            raise UnsupportedFeaturedException(msg)
+        return player
 
     def _set_aiosendspin_log_level(self) -> None:
         """Keep aiosendspin's (very chatty) logging quiet unless verbose logging is enabled."""
