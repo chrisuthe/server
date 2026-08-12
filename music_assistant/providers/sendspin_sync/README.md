@@ -34,11 +34,11 @@ each of them in turn. It is driven through the API:
 
 | Command | Scope | Purpose |
 | --- | --- | --- |
-| `sendspin_sync/eligible_players` | `players.read` | The Sendspin speakers a session can run against |
+| `sendspin_sync/eligible_players` | `players.read` | The Sendspin speakers a session can run against, and whether MA can write each one's delay |
 | `sendspin_sync/session` | `players.read` | State of the running session, or `null` |
 | `sendspin_sync/start_session` | `players.control` | Take the given speakers over and start the track |
 | `sendspin_sync/solo_player` | `players.control` | Make one member of the session audible |
-| `sendspin_sync/apply_measurements` | `config.players.write` | Turn the measured offsets into static delays and apply them |
+| `sendspin_sync/apply_measurements` | `config.players.write` | Turn the measured offsets into static delays and apply the ones MA can write |
 | `sendspin_sync/stop_session` | `players.control` | End the session and restore every speaker |
 
 The speakers are grouped onto a **hidden Sendspin virtual player** that owns the
@@ -88,7 +88,9 @@ chirp train arrived from that speaker, as the probe measured it. Those numbers a
 **relative** — the probe measures every speaker against a baseline it picked for
 itself — so only the differences between them carry meaning.
 
-They are applied as Sendspin static delays. A static delay *advances* a player:
+They are resolved into Sendspin static delays, and the ones MA is allowed to write
+are applied — see [Speakers that cannot accept a delay](#speakers-that-cannot-accept-a-delay)
+for the rest. A static delay *advances* a player:
 the client subtracts it from the server timestamp, so a larger value makes the
 sound leave that speaker earlier, and the protocol carries no negative value.
 Equalising a group therefore means leaving the earliest speaker where it is and
@@ -136,10 +138,62 @@ user can drive a session but not apply its result. An in-process call into the
 Sendspin provider is not re-checked against the caller's scopes, so the command
 registration is the only place that guard exists.
 
-A speaker whose client does not carry `SET_STATIC_DELAY` can be measured but never
-corrected, so it is not eligible for a session at all — `eligible_players` leaves it
-out and `start_session` refuses it. Catching it there is the point: the alternative
-is a user walking the whole house and only being told at the last step.
+That holds even for a session over speakers MA cannot write to, which reaches the
+scope check and then writes nothing — so a guest can drive such a session but not
+read back its answer. The scope is on the command, not on what a particular run
+turns out to touch, which fails closed.
+
+## Speakers that cannot accept a delay
+
+A Sendspin client only takes a static delay if it advertises `SET_STATIC_DELAY`.
+ESPHome's Sendspin component implements one but gates it behind
+`static_delay_adjustable`, which defaults to `false`, so a house of capable
+hardware can turn out to have very few speakers MA is allowed to correct.
+
+Those speakers are measured anyway. `eligible_players` returns them with
+`adjustable: false`, and `apply_measurements` splits its result accordingly:
+
+```
+{"applied": {player_id: delay_ms}, "manual": {player_id: delay_ms}}
+```
+
+`applied` is what was written through the Sendspin provider. `manual` is the
+delay resolved for each speaker MA could not write to, for the user to apply on
+the device itself — by setting `static_delay_adjustable: true` and re-running, by
+putting the value into `initial_static_delay` in the YAML, or on the delay control
+of an outboard amp.
+
+**The two halves are not the same kind of number.** An `applied` value is
+absolute: it replaces the delay that speaker carried. A `manual` value is how much
+further forward the speaker has to come, so it is *added* to any delay the device
+already applies — that one is already inside the arrival the probe measured, and
+MA cannot read it. For the usual device with no delay configured the two coincide,
+but a device that already carries `initial_static_delay: 20ms` and comes back with
+`manual: 43` needs `63ms`, not `43ms`.
+
+The normalisation does not split. Offsets are *relative*, so every measured
+speaker is in the `min()` that picks the reference, including the ones that
+cannot be written — a non-adjustable speaker may well be the earliest arrival and
+define the 0, which is fine and needs no special case. The range refusal applies
+to all of them too: a measurement implying more than 5000 ms is a bad measurement
+whoever is going to apply it. Dropping a speaker from the maths instead would not
+merely deny it a correction, it would remove it from the picture the others are
+normalised against, and the user could not even learn how far out it is.
+
+A speaker MA cannot write to also contributes 0 to the `current_static_delay_ms`
+term. MA holds no static delay for it — there is no config entry to hold one —
+and whatever its firmware applies is already inside the arrival that was just
+measured, so 0 keeps the sum honest and stable across re-runs.
+
+`adjustable` is on `eligible_players` rather than discovered at apply time on
+purpose: the user is told which speakers they will have to correct by hand while
+picking them, not after walking the house.
+
+A member that has *left* is refused outright rather than reported under `manual`.
+Sendspin answers the same "no static delay" for a speaker that has disconnected as
+for one that refuses one, so `apply_measurements` resolves each member before it
+splits anything — otherwise a speaker that dropped mid-session would come back as
+one for the user to go and adjust on a device that is not there.
 
 ## File Structure
 

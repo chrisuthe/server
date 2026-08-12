@@ -28,7 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 from math import isfinite
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from mashumaro import DataClassDictMixin
 from music_assistant_models.constants import PLAYER_CONTROL_NONE
@@ -58,7 +58,6 @@ if TYPE_CHECKING:
 
     from music_assistant.mass import MusicAssistant
     from music_assistant.models.player import Player
-    from music_assistant.providers.sendspin.provider import SendspinProvider
 
 # Name of the hidden anchor player. It is never shown in the UI, but it does end
 # up in logs and diagnostics, so it names what it is.
@@ -90,6 +89,29 @@ class CalibrationPlayer(DataClassDictMixin):
     # before a session takes it over. Mirrors the rule start_session enforces, so a
     # client never offers a speaker that the server will then refuse.
     busy: bool
+    # whether the measured correction can be written to the speaker. A client shows
+    # this at pick time, so a user learns which speakers they will have to correct by
+    # hand before walking the house rather than when the result comes back.
+    adjustable: bool
+
+
+@dataclass
+class CalibrationResult(DataClassDictMixin):
+    """
+    The static delays a session resolved, split by whether MA could write them.
+
+    Mind that the two halves are not the same kind of number. An ``applied`` value is
+    the absolute delay the speaker now carries, and replaces whatever it had. A
+    ``manual`` value is how much further forward that speaker has to come, so it is
+    *added* to any delay its firmware already applies - that one is already inside the
+    arrival the probe measured, and MA can not read it.
+    """
+
+    applied: dict[str, int]
+    # the delay resolved for each speaker MA can not write to, for the user to set on
+    # the device itself - by opting its client into an adjustable delay and re-running,
+    # or by adding the value to its firmware configuration
+    manual: dict[str, int]
 
 
 @dataclass
@@ -558,12 +580,12 @@ def is_eligible(mass: MusicAssistant, player: Player) -> bool:
     if is_remote_session_host(mass, player.player_id):
         # the hidden anchor of a session (this one or another plugin's) is not a speaker
         return False
-    # A measurement is only worth taking if the correction can be applied afterwards, and
-    # a client that does not carry a static delay can never accept one. Refusing it here
-    # means the user is told before walking the house rather than at the last step.
-    sendspin = cast("SendspinProvider | None", mass.get_provider(SENDSPIN_DOMAIN))
-    if sendspin is None or not sendspin.supports_player_static_delay(player.player_id):
-        return False
+    # Deliberately no check on whether the speaker accepts a static delay. Offsets are
+    # relative, so dropping a speaker here would not merely deny it a correction - it
+    # would take it out of the picture the other speakers are normalised against, and
+    # the user could not even learn how far out it is. CalibrationPlayer.adjustable
+    # carries that up to the client instead, so the warning still lands at pick time.
+
     # isolation drives mute where the client implements it and volume otherwise,
     # so a player with neither can never be taken out of the mix
     return (
@@ -607,9 +629,10 @@ def resolve_static_delays(
     would bury the bad measurement instead of reporting it.
 
     :param offsets_ms: Measured arrival offset per player id, in milliseconds.
-    :param current_delays_ms: The static delay each player of the calibrated group
-        currently carries. Its keys define the group, and ``offsets_ms`` must cover
-        exactly the same players.
+    :param current_delays_ms: The static delay MA currently applies to each player of
+        the calibrated group - 0 for a player MA does not apply one to, whose own delay
+        is already inside its measured offset. Its keys define the group, and
+        ``offsets_ms`` must cover exactly the same players.
     :param translation_owner: Translation owner for the errors raised here.
     :raises InvalidDataError: If no measurements were given, if ``offsets_ms`` does not
         cover exactly the group, if a measurement is not a finite number, or if one

@@ -9,7 +9,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from music_assistant_models.auth import Scope, UserRole
-from music_assistant_models.enums import MediaType, ProviderFeature, StreamType
+from music_assistant_models.enums import (
+    MediaType,
+    PlaybackState,
+    PlayerType,
+    ProviderFeature,
+    StreamType,
+)
 from music_assistant_models.errors import (
     ActionUnavailable,
     InvalidDataError,
@@ -21,6 +27,7 @@ from music_assistant_models.errors import (
 from music_assistant_models.provider import ProviderManifest
 
 from music_assistant.controllers.webserver.helpers.auth_middleware import ROLE_SCOPES
+from music_assistant.helpers.shared_playback import SENDSPIN_DOMAIN
 from music_assistant.providers import sendspin_sync
 from music_assistant.providers.sendspin_sync import (
     AUDIO_SOURCE_ID,
@@ -213,6 +220,31 @@ async def test_applying_a_result_needs_more_than_a_guest_scope() -> None:
     assert Scope.CONFIG_PLAYERS_WRITE not in ROLE_SCOPES[UserRole.GUEST]
 
 
+async def test_eligible_players_reports_which_speakers_can_be_written_to() -> None:
+    """
+    A speaker whose client refuses a static delay is offered, flagged rather than hidden.
+
+    The flag lands while the user is picking speakers, so nobody walks the house before
+    finding out which of them they will have to correct by hand.
+    """
+    provider = await _setup_provider()
+    _stub_sendspin(provider, {"writable": 0, "fixed": 0}, non_adjustable={"fixed"})
+    _stub_eligible_players(provider, ["writable", "fixed"])
+
+    offered = await provider.get_eligible_players()
+
+    assert [(p.player_id, p.adjustable) for p in offered] == [("writable", True), ("fixed", False)]
+
+
+async def test_nothing_is_offered_without_the_sendspin_provider() -> None:
+    """With Sendspin gone there are no Sendspin speakers to calibrate."""
+    provider = await _setup_provider()
+    _stub_eligible_players(provider, ["a"])
+    _mock_mass(provider).get_provider = MagicMock(return_value=None)
+
+    assert await provider.get_eligible_players() == []
+
+
 async def test_unload_stops_a_running_session() -> None:
     """Unloading the plugin does not leave a user's speakers muted and regrouped."""
     provider = await _setup_provider()
@@ -395,9 +427,10 @@ async def test_applying_measurements_reaches_the_devices_through_the_sendspin_pr
     sendspin = _stub_sendspin(provider, {"a": 0, "b": 0, "c": 0})
     await _run_session(provider, ["a", "b", "c"])
 
-    applied = await provider.apply_measurements({"a": 10.0, "b": 35.0, "c": 12.0})
+    result = await provider.apply_measurements({"a": 10.0, "b": 35.0, "c": 12.0})
 
-    assert applied == {"a": 0, "b": 25, "c": 2}
+    assert result.applied == {"a": 0, "b": 25, "c": 2}
+    assert result.manual == {}
     assert _applied_delays(sendspin) == {"a": 0, "b": 25, "c": 2}
 
 
@@ -407,12 +440,12 @@ async def test_applying_measurements_folds_in_the_delays_already_in_place() -> N
     sendspin = _stub_sendspin(provider, {"amp": 200, "speaker": 0})
     await _run_session(provider, ["amp", "speaker"])
 
-    applied = await provider.apply_measurements({"amp": 0.0, "speaker": 40.0})
+    result = await provider.apply_measurements({"amp": 0.0, "speaker": 40.0})
 
     read_back = [call.args[0] for call in sendspin.get_player_static_delay.call_args_list]
     assert sorted(read_back) == ["amp", "speaker"]
     # the amp is 200 ms of advance plus 0 measured; the speaker 0 plus 40
-    assert applied == {"amp": 160, "speaker": 0}
+    assert result.applied == {"amp": 160, "speaker": 0}
 
 
 async def test_re_measuring_a_corrected_group_writes_the_same_delays_again() -> None:
@@ -429,9 +462,9 @@ async def test_re_measuring_a_corrected_group_writes_the_same_delays_again() -> 
 
     second = await provider.apply_measurements(dict.fromkeys(("a", "b", "c"), 4.0))
 
-    assert first == {"a": 0, "b": 120, "c": 35}
-    assert second == first
-    assert _applied_delays(sendspin) == first
+    assert first.applied == {"a": 0, "b": 120, "c": 35}
+    assert second.applied == first.applied
+    assert _applied_delays(sendspin) == first.applied
 
 
 async def test_measurements_are_refused_without_a_running_session() -> None:
@@ -503,22 +536,139 @@ async def test_applying_a_result_rearms_the_inactivity_timeout() -> None:
     assert mass.call_later.call_args.kwargs["task_id"] == provider._session_timeout_id
 
 
-async def test_a_member_that_cannot_take_a_static_delay_stops_the_apply_before_any_write() -> None:
+async def test_a_member_that_cannot_take_a_static_delay_comes_back_for_the_user() -> None:
     """
-    An unusable member is caught while the current delays are read, so nothing is written.
+    Such a member is measured and normalised like any other, but never written to.
 
-    Eligibility keeps such a speaker out of a session in the first place; this is the
-    backstop for a client that dropped the command between joining and measuring.
+    Its delay is handed back under ``manual`` instead, which is the whole point: the
+    user can set it on the device even though MA can not.
+    """
+    provider = await _setup_provider()
+    sendspin = _stub_sendspin(provider, {"a": 0, "b": 0}, non_adjustable={"b"})
+    await _run_session(provider, ["a", "b"])
+
+    result = await provider.apply_measurements({"a": 0.0, "b": 10.0})
+
+    assert result.applied == {"a": 0}
+    assert result.manual == {"b": 10}
+    assert _applied_delays(sendspin) == {"a": 0}
+
+
+async def test_a_member_that_cannot_take_a_static_delay_is_never_read_either() -> None:
+    """
+    Its current delay is taken as 0 rather than read, because the read would raise.
+
+    MA holds no static delay for such a speaker, and whatever its firmware applies is
+    already inside the arrival that was just measured.
+    """
+    provider = await _setup_provider()
+    sendspin = _stub_sendspin(provider, {"a": 0, "b": 0}, non_adjustable={"b"})
+    await _run_session(provider, ["a", "b"])
+
+    await provider.apply_measurements({"a": 0.0, "b": 10.0})
+
+    read_back = [call.args[0] for call in sendspin.get_player_static_delay.call_args_list]
+    assert read_back == ["a"]
+
+
+async def test_a_member_that_vanished_is_an_error_rather_than_one_to_correct_by_hand() -> None:
+    """
+    A speaker that has gone raises instead of landing under ``manual``.
+
+    Sendspin answers the same "no static delay" for a speaker that has left as for one
+    that refuses one, so the two have to be told apart before the result is built -
+    otherwise the user is sent to go adjust a speaker that is not there.
     """
     provider = await _setup_provider()
     sendspin = _stub_sendspin(provider, {"a": 0, "b": 0})
-    sendspin.get_player_static_delay = MagicMock(
-        side_effect=[0, UnsupportedFeaturedException("no static delay")]
+    await _run_session(provider, ["a", "b"])
+    _mock_mass(provider).players.get_player = MagicMock(
+        side_effect=lambda player_id, *_: None if player_id == "b" else MagicMock()
     )
+
+    with pytest.raises(PlayerUnavailableError):
+        await provider.apply_measurements({"a": 0.0, "b": 10.0})
+
+    sendspin.set_player_static_delay.assert_not_awaited()
+
+
+async def test_a_member_that_went_unavailable_is_an_error_too() -> None:
+    """A speaker still registered but off the network is no more correctable than a gone one."""
+    provider = await _setup_provider()
+    sendspin = _stub_sendspin(provider, {"a": 0, "b": 0})
+    await _run_session(provider, ["a", "b"])
+    gone = MagicMock()
+    gone.state.available = False
+    _mock_mass(provider).players.get_player = MagicMock(
+        side_effect=lambda player_id, *_: gone if player_id == "b" else MagicMock()
+    )
+
+    with pytest.raises(PlayerUnavailableError):
+        await provider.apply_measurements({"a": 0.0, "b": 10.0})
+
+    sendspin.set_player_static_delay.assert_not_awaited()
+
+
+async def test_a_delay_already_in_place_moves_the_reference_a_manual_value_is_measured_from() -> (
+    None
+):
+    """
+    The fold-in and the split compose: a peer's existing delay shifts the whole group.
+
+    Ignoring the amp's 200 ms of advance would leave it at 0 and hand the user 40 for
+    the speaker MA can not write to. Counting it makes the amp the later arrival of the
+    two, so the unwritable speaker becomes the reference and needs nothing done to it.
+    """
+    provider = await _setup_provider()
+    sendspin = _stub_sendspin(provider, {"amp": 200, "fixed": 0}, non_adjustable={"fixed"})
+    await _run_session(provider, ["amp", "fixed"])
+
+    result = await provider.apply_measurements({"amp": 0.0, "fixed": 40.0})
+
+    # the amp totals 0 + 200, the fixed speaker 40 + 0 and so defines the reference
+    assert result.applied == {"amp": 160}
+    assert result.manual == {"fixed": 0}
+    assert _applied_delays(sendspin) == {"amp": 160}
+
+
+async def test_a_group_of_speakers_that_take_no_delay_writes_nothing_and_does_not_error() -> None:
+    """A session of entirely unwritable speakers still yields a usable result."""
+    provider = await _setup_provider()
+    sendspin = _stub_sendspin(provider, {"a": 0, "b": 0}, non_adjustable={"a", "b"})
     await _run_session(provider, ["a", "b"])
 
-    with pytest.raises(UnsupportedFeaturedException):
-        await provider.apply_measurements({"a": 0.0, "b": 10.0})
+    result = await provider.apply_measurements({"a": 5.0, "b": 45.0})
+
+    assert result.applied == {}
+    assert result.manual == {"a": 0, "b": 40}
+    sendspin.set_player_static_delay.assert_not_awaited()
+
+
+async def test_a_speaker_that_takes_no_delay_can_still_set_the_reference() -> None:
+    """
+    The earliest arrival gets 0 whether or not MA can write to it.
+
+    It belongs in the min() that picks the reference like any other speaker; excluding
+    it would normalise the group against a baseline that is not the earliest arrival.
+    """
+    provider = await _setup_provider()
+    _stub_sendspin(provider, {"early": 0, "late": 0}, non_adjustable={"early"})
+    await _run_session(provider, ["early", "late"])
+
+    result = await provider.apply_measurements({"early": 5.0, "late": 65.0})
+
+    assert result.manual == {"early": 0}
+    assert result.applied == {"late": 60}
+
+
+async def test_a_measurement_out_of_range_is_refused_for_an_unwritable_speaker_too() -> None:
+    """A bad measurement is a bad measurement whoever was going to apply it."""
+    provider = await _setup_provider()
+    sendspin = _stub_sendspin(provider, {"a": 0, "b": 0}, non_adjustable={"b"})
+    await _run_session(provider, ["a", "b"])
+
+    with pytest.raises(InvalidDataError):
+        await provider.apply_measurements({"a": 0.0, "b": 99_000.0})
 
     sendspin.set_player_static_delay.assert_not_awaited()
 
@@ -579,15 +729,50 @@ async def _run_session(provider: SendspinSyncProvider, player_ids: list[str]) ->
     return session
 
 
-def _stub_sendspin(provider: SendspinSyncProvider, current_delays_ms: dict[str, int]) -> MagicMock:
+def _stub_eligible_players(provider: SendspinSyncProvider, player_ids: list[str]) -> None:
+    """Register stub players that all_players returns and is_eligible accepts."""
+    players = []
+    for player_id in player_ids:
+        player = MagicMock()
+        player.player_id = player_id
+        player.state.name = player_id
+        player.state.available = True
+        player.state.type = PlayerType.PLAYER
+        player.state.playback_state = PlaybackState.IDLE
+        player.state.mute_control = "mute_control"
+        player.state.volume_control = "volume_control"
+        player.provider.domain = SENDSPIN_DOMAIN
+        players.append(player)
+    _mock_mass(provider).players.all_players = MagicMock(return_value=players)
+
+
+def _stub_sendspin(
+    provider: SendspinSyncProvider,
+    current_delays_ms: dict[str, int],
+    non_adjustable: set[str] | None = None,
+) -> MagicMock:
     """
     Install a stub Sendspin provider that carries the given static delays.
 
     Reads and writes hit the same mapping, so a second ``apply_measurements`` sees what
     the first one applied - which is what makes the convergence test meaningful.
+
+    :param provider: The plugin provider to install the stub behind.
+    :param current_delays_ms: The static delay each player starts out carrying.
+    :param non_adjustable: Players whose client refuses a static delay. Reading one
+        raises, exactly as the real provider does.
     """
+    refused = non_adjustable or set()
+
+    def _get(player_id: str) -> int:
+        if player_id in refused:
+            raise UnsupportedFeaturedException(player_id)
+        return current_delays_ms[player_id]
+
     sendspin = MagicMock()
-    sendspin.get_player_static_delay = MagicMock(side_effect=current_delays_ms.__getitem__)
+    sendspin.is_virtual_player = MagicMock(return_value=False)
+    sendspin.supports_player_static_delay = MagicMock(side_effect=lambda p: p not in refused)
+    sendspin.get_player_static_delay = MagicMock(side_effect=_get)
     sendspin.set_player_static_delay = AsyncMock(
         side_effect=lambda player_id, delay_ms: current_delays_ms.__setitem__(player_id, delay_ms)
     )
