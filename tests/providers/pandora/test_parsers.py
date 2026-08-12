@@ -7,7 +7,9 @@ from unittest.mock import Mock
 
 from music_assistant.providers.pandora.parsers import (
     parse_album,
+    parse_album_record,
     parse_artist,
+    parse_artist_record,
     parse_station,
     parse_track,
 )
@@ -95,6 +97,70 @@ def test_track_tolerates_present_but_null_fields() -> None:
     assert track.album is not None
     assert track.album.name == "Unknown Album"
     assert list(track.artists) == []
+
+
+def test_annotated_track_takes_its_album_and_artist_ids_from_the_record() -> None:
+    """A record names the album and artist in Pandora's catalogue; those are the real ids."""
+    annotations = {"TR:S0": {"albumId": "AL:900", "artistId": "AR:800"}}
+    track = parse_track(_provider(), _track(), annotations)
+    assert track.album is not None
+    assert track.album.item_id == "AL:900"
+    assert track.artists[0].item_id == "AR:800"
+    # the record names the ids, but the fragment still names the album and the artist
+    assert track.album.name == "Some Album"
+    assert track.artists[0].name == "Some Artist"
+
+
+def test_track_without_an_annotation_keeps_the_fallback_ids() -> None:
+    """
+    An unannotated track keeps a track-scoped album and a name-keyed artist.
+
+    An omitted map, an empty one and a map annotating some other track must all land here:
+    only the ids for this track can change what it resolves to.
+    """
+    for annotated in (None, {}, {"TR:OTHER": {"albumId": "AL:900"}}):
+        track = parse_track(_provider(), _track(), annotated)
+        assert track.album is not None
+        assert track.album.item_id == "TR:S0"
+        assert track.artists[0].item_id == "Some Artist"
+
+
+def test_track_tolerates_a_present_but_null_annotation() -> None:
+    """A key present with a null value must degrade to the fallbacks, not crash."""
+    track = parse_track(_provider(), _track(), {"TR:S0": None})
+    assert track.album is not None
+    assert track.album.item_id == "TR:S0"
+
+
+def test_album_record_keeps_the_id_it_was_requested_by() -> None:
+    """A record without a pandoraId must not break the lookup or rename the album."""
+    album = parse_album_record(_provider(), {"name": "Some Album"}, "AL:900")
+    assert album.item_id == "AL:900"
+    assert album.name == "Some Album"
+    assert next(iter(album.provider_mappings)).item_id == "AL:900"
+
+
+def test_album_record_carries_no_image() -> None:
+    """A record's icon.artUrl is a relative path whose CDN base is unmeasured."""
+    record = {"name": "Some Album", "icon": {"artUrl": "images/abc/500W_500H.jpg"}}
+    assert not parse_album_record(_provider(), record, "AL:900").metadata.images
+
+
+def test_album_record_without_a_name_falls_back() -> None:
+    """A nameless record must still produce a usable album rather than crash."""
+    assert parse_album_record(_provider(), {}, "AL:900").name == "Unknown Album"
+
+
+def test_artist_record_keeps_the_id_and_takes_the_name() -> None:
+    """An AR: id must resolve to the artist's name, not to the id as a name."""
+    artist = parse_artist_record(_provider(), {"name": "Some Artist"}, "AR:800")
+    assert artist.item_id == "AR:800"
+    assert artist.name == "Some Artist"
+
+
+def test_artist_record_without_a_name_falls_back_to_the_id() -> None:
+    """A nameless record leaves nothing else to show, so the id has to do."""
+    assert parse_artist_record(_provider(), {}, "AR:800").name == "AR:800"
 
 
 def test_album_is_addressed_by_the_tracks_own_id() -> None:

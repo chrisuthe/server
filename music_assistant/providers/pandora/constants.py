@@ -1,7 +1,11 @@
 """Constants for the Pandora music provider."""
 
 # API Endpoints
-API_BASE = "https://www.pandora.com/api/v1"
+API_HOST = "https://www.pandora.com/api"
+API_BASE = f"{API_HOST}/v1"
+# The music catalogue lives on v4. Note v1/aesop/annotateObjects is the *podcast* annotator
+# and does not answer for TR:/AL:/AR: ids.
+CATALOG_ANNOTATE_ENDPOINT = f"{API_HOST}/v4/catalog/annotateObjects"
 LOGIN_ENDPOINT = f"{API_BASE}/auth/login"
 STATIONS_ENDPOINT = f"{API_BASE}/station/getStations"
 PLAYLIST_FRAGMENT_ENDPOINT = f"{API_BASE}/playlist/getFragment"

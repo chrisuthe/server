@@ -25,6 +25,7 @@ from music_assistant_models.errors import (
     MediaNotFoundError,
     MusicAssistantError,
     ProviderUnavailableError,
+    ResourceTemporarilyUnavailable,
 )
 from music_assistant_models.media_items import (
     Album,
@@ -52,6 +53,7 @@ from .constants import (
     ACCOUNT_FLAG_HIGH_QUALITY,
     ACCOUNT_FLAG_ON_DEMAND,
     ADD_SEED_ENDPOINT,
+    CATALOG_ANNOTATE_ENDPOINT,
     CONF_ALLOW_STATION_DELETE,
     CONF_DEVICE_UUID,
     CONF_QUALITY,
@@ -77,7 +79,14 @@ from .helpers import (
     raise_if_no_entitlements,
     read_account_flags,
 )
-from .parsers import parse_album, parse_artist, parse_station, parse_track
+from .parsers import (
+    parse_album,
+    parse_album_record,
+    parse_artist,
+    parse_artist_record,
+    parse_station,
+    parse_track,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Sequence
@@ -241,7 +250,7 @@ class PandoraProvider(MusicProvider):
         # Already-served tracks are withheld: the queue controller only de-duplicates refill
         # candidates against its unplayed tail, so a served track that scrolls out of that
         # tail would otherwise be re-added here and then fail once the fragment has moved on.
-        return [parse_track(self, track) for track in fragment.pending]
+        return [parse_track(self, track, fragment.annotations) for track in fragment.pending]
 
     async def create_playlist(self, name: str, media_types: set[MediaType]) -> Playlist:
         """
@@ -321,25 +330,36 @@ class PandoraProvider(MusicProvider):
 
     async def get_track(self, prov_track_id: str) -> Track:
         """Get full track details by id."""
-        if (track := self._find_track(prov_track_id)) is None:
+        if (found := self._find_track_with_fragment(prov_track_id)) is None:
             raise MediaNotFoundError(f"Track {prov_track_id} not found")
-        return parse_track(self, track)
+        track, fragment = found
+        return parse_track(self, track, fragment.annotations)
 
     async def get_album(self, prov_album_id: str) -> Album:
         """
-        Get the album a station track belongs to.
+        Get an album by id.
 
-        Fragments carry no album identifier of their own, so an album is addressed by the id of
-        one of its tracks - see `parse_album`, which mints the album that way.
+        A catalogue album is looked up directly. A station track's album has no catalogue
+        identity, so it is addressed by the id of one of its tracks - see `parse_album`.
         """
-        if (track := self._find_track(prov_album_id)) and (
-            album := parse_album(self, track, prov_album_id)
+        if prov_album_id.startswith("AL:"):
+            record = self._find_annotation(prov_album_id) or await self._annotate(prov_album_id)
+            return parse_album_record(self, record, prov_album_id)
+        if (found := self._find_track_with_fragment(prov_album_id)) and (
+            album := parse_album(self, found[0], prov_album_id)
         ):
             return album
         raise MediaNotFoundError(f"Album {prov_album_id} not found")
 
     async def get_artist(self, prov_artist_id: str) -> Artist:
-        """Get artist details; Pandora identifies station artists by name only."""
+        """
+        Get an artist by id.
+
+        A catalogue artist is looked up directly; a station artist is identified by name.
+        """
+        if prov_artist_id.startswith("AR:"):
+            record = self._find_annotation(prov_artist_id) or await self._annotate(prov_artist_id)
+            return parse_artist_record(self, record, prov_artist_id)
         return parse_artist(self, prov_artist_id)
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
@@ -602,7 +622,76 @@ class PandoraProvider(MusicProvider):
             raise MediaNotFoundError(
                 f"Pandora returned no playable tracks for {session.station_id}"
             )
-        return session.add_fragment(tracks, time.time())
+        return session.add_fragment(tracks, time.time(), await self._hydrate(tracks))
+
+    async def _hydrate(self, tracks: list[dict[str, Any]]) -> dict[str, Any]:
+        """
+        Return Pandora's catalogue records for the given tracks, keyed by pandoraId.
+
+        Empty for an account without on-demand entitlement: these records exist to make
+        albums and artists addressable, and a listener who cannot play a catalogue track
+        must not be offered one.
+
+        :param tracks: Retained fragment tracks, each carrying a `pandoraId`.
+        """
+        if not self._on_demand_available:
+            return {}
+        try:
+            response = await self._api_request(
+                "POST",
+                CATALOG_ANNOTATE_ENDPOINT,
+                data={
+                    "pandoraIds": [track["pandoraId"] for track in tracks],
+                    "annotateAlbumTracks": False,
+                },
+                # enrichment must never fight the concurrent-stream limit: taking the stream
+                # over would stop playback on the user's other device as a side effect of
+                # fetching metadata.
+                exhausted_retry_reasons=frozenset({RETRY_REASON_STREAM_VIOLATION}),
+            )
+        except (
+            InvalidDataError,
+            MediaNotFoundError,
+            ProviderUnavailableError,
+            ResourceTemporarilyUnavailable,
+        ) as err:
+            if self.http_session.closed:
+                # several _api_request error paths close the transport before raising, and
+                # for a socks user that is this provider's own session. Degrading past that
+                # would report a healthy fragment fetch and leave the next call failing with
+                # a bare "Session is closed" RuntimeError from somewhere unrelated, so only
+                # degrade while the connection is still usable.
+                raise
+            # enrichment only: without it a track keeps its name, art and audio, so a
+            # station must keep playing rather than fail on a metadata call. The cost is
+            # that this fragment's songs fall back to track-scoped album and name-keyed
+            # artist identities, so they can pick up a second album or artist row alongside
+            # the catalogue ones - accepted, because serving no album at all is worse. Auth
+            # errors are deliberately NOT caught here - _api_request already re-authenticates
+            # once on a 401, so anything still raising past that must surface rather than
+            # degrade into a silently unhydrated station.
+            self.logger.warning("Could not annotate Pandora fragment tracks: %s", err)
+            return {}
+        return {key: value for key, value in response.items() if isinstance(value, dict)}
+
+    async def _annotate(self, pandora_id: str) -> dict[str, Any]:
+        """
+        Return Pandora's catalogue record for one id.
+
+        :raises MediaNotFoundError: If Pandora holds no record for the id.
+        """
+        response = await self._api_request(
+            "POST",
+            CATALOG_ANNOTATE_ENDPOINT,
+            data={"pandoraIds": [pandora_id], "annotateAlbumTracks": False},
+            # as in _hydrate: a metadata lookup must not take the stream over and stop
+            # playback on another device.
+            exhausted_retry_reasons=frozenset({RETRY_REASON_STREAM_VIOLATION}),
+        )
+        record = response.get(pandora_id)
+        if not isinstance(record, dict):
+            raise MediaNotFoundError(f"Pandora has no record for {pandora_id}")
+        return record
 
     async def _get_stations(self) -> AsyncGenerator[Playlist]:
         """Retrieve the user's stations from the provider."""
@@ -623,24 +712,45 @@ class PandoraProvider(MusicProvider):
         session.last_accessed = time.time()
         return session
 
-    def _find_track(self, prov_track_id: str) -> dict[str, Any] | None:
+    def _find_track_with_fragment(
+        self, prov_track_id: str
+    ) -> tuple[dict[str, Any], PandoraFragment] | None:
         """
-        Return raw track data from the freshest retained fragment holding it, or None.
+        Return raw track data and the freshest retained fragment holding it, or None.
 
         The id no longer names a station, so every retained session is searched. At most ten
         sessions hold at most four fragments of about four tracks, so this stays small.
-        Stations overlap, so the freshest fragment decides: it is the most recent answer
-        Pandora gave for the track, and picking by dict order instead would let the same
-        song resolve differently from one lookup to the next.
+        Stations overlap, so the freshest fragment decides: its annotations are the most
+        recent answer Pandora gave for the track, and picking by dict order instead would
+        let the same song resolve to a different album from one lookup to the next.
         """
         holders = [
-            (fragment, track)
+            (track, fragment)
             for session in self._sessions.values()
             for fragment in session.fragments
             if (track := fragment.find(prov_track_id)) is not None
         ]
-        freshest = max(holders, key=lambda holder: holder[0].fetched_at, default=None)
-        return freshest[1] if freshest is not None else None
+        return max(holders, key=lambda holder: holder[1].fetched_at, default=None)
+
+    def _find_annotation(self, pandora_id: str) -> dict[str, Any] | None:
+        """
+        Return the catalogue record the freshest retained fragment holds for the given id.
+
+        Hydration annotates a whole fragment in one call, albums and artists included, so the
+        record an album or artist lookup wants is usually in hand already. Music Assistant
+        resolves those per item, so refetching them here would put the provider back to one
+        network call per album and per artist in a listing. Fragments overlap the same way
+        tracks do, so the freshest one holding the id decides, consistent with
+        `_find_track_with_fragment` above.
+        """
+        holders = [
+            fragment
+            for session in self._sessions.values()
+            for fragment in session.fragments
+            if pandora_id in fragment.annotations
+        ]
+        freshest = max(holders, key=lambda fragment: fragment.fetched_at, default=None)
+        return freshest.annotations[pandora_id] if freshest is not None else None
 
     def _audio_format(self) -> AudioFormat:
         """Return the audio format the fragments are requested in."""

@@ -59,10 +59,22 @@ def parse_station(provider: PandoraProvider, station: dict[str, Any]) -> Playlis
     return playlist
 
 
-def parse_track(provider: PandoraProvider, obj: dict[str, Any]) -> Track:
-    """Parse a raw fragment track into a Track."""
+def parse_track(
+    provider: PandoraProvider,
+    obj: dict[str, Any],
+    annotations: dict[str, Any] | None = None,
+) -> Track:
+    """
+    Parse a raw fragment track into a Track.
+
+    :param obj: One raw track from a Pandora fragment.
+    :param annotations: Catalogue records keyed by pandoraId, from whichever endpoint
+        produced them. Omitted or empty when nothing has been annotated, which is the case
+        for an account without on-demand entitlement.
+    """
     name, version = parse_title_and_version(obj.get("songTitle") or "Unknown Song")
     track_id = obj["pandoraId"]
+    record = (annotations or {}).get(track_id) or {}
     track = Track(
         item_id=track_id,
         provider=provider.instance_id,
@@ -94,24 +106,40 @@ def parse_track(provider: PandoraProvider, obj: dict[str, Any]) -> Track:
                 )
             )
     if artist_name := obj.get("artistName"):
-        track.artists = UniqueList([parse_artist(provider, artist_name)])
-    track.album = parse_album(provider, obj, track_id)
+        track.artists = UniqueList([parse_artist(provider, artist_name, record.get("artistId"))])
+    track.album = parse_album(provider, obj, track_id, record)
     return track
 
 
-def parse_album(provider: PandoraProvider, obj: dict[str, Any], track_id: str) -> Album | None:
-    """Parse the album a fragment track belongs to, if the API named one."""
+def parse_album(
+    provider: PandoraProvider,
+    obj: dict[str, Any],
+    track_id: str,
+    record: dict[str, Any] | None = None,
+) -> Album | None:
+    """
+    Parse the album a fragment track belongs to, if the API named one.
+
+    An annotated track names its album in Pandora's catalogue, which is the id that album
+    carries everywhere else. A fragment on its own names no album at all, so the track's own
+    id stands in - the two cannot be confused, since they carry different prefixes.
+
+    :param obj: One raw track from a Pandora fragment.
+    :param track_id: The track's own Pandora id, used as the album id when there is no other.
+    :param record: The track's catalogue record, if one has been fetched.
+    """
     if not (url := obj.get("albumDetailURL")):
         return None
+    album_id = str((record or {}).get("albumId") or track_id)
     name, version = parse_title_and_version(obj.get("albumTitle") or "Unknown Album")
     return Album(
-        item_id=track_id,
+        item_id=album_id,
         provider=provider.instance_id,
         name=name,
         version=version,
         provider_mappings={
             ProviderMapping(
-                item_id=track_id,
+                item_id=album_id,
                 provider_domain=provider.domain,
                 provider_instance=provider.instance_id,
                 url=url,
@@ -120,17 +148,61 @@ def parse_album(provider: PandoraProvider, obj: dict[str, Any], track_id: str) -
     )
 
 
-def parse_artist(provider: PandoraProvider, artist_name: str) -> Artist:
-    """Parse an artist; Pandora fragments identify artists by name only."""
+def parse_artist(provider: PandoraProvider, name: str, artist_id: str | None = None) -> Artist:
+    """
+    Parse an artist.
+
+    :param name: The artist's name, which is also its id when the catalogue gave none.
+    :param artist_id: The artist's catalogue id, if one has been fetched. Without it a
+        Pandora fragment identifies its artist by name only.
+    """
+    item_id = artist_id or name
     return Artist(
-        item_id=artist_name,
-        name=artist_name,
+        item_id=item_id,
+        name=name,
         provider=provider.instance_id,
         provider_mappings={
             ProviderMapping(
-                item_id=artist_name,
+                item_id=item_id,
                 provider_domain=provider.domain,
                 provider_instance=provider.instance_id,
             )
         },
     )
+
+
+def parse_album_record(provider: PandoraProvider, record: dict[str, Any], album_id: str) -> Album:
+    """
+    Parse an album from a Pandora catalogue record.
+
+    No image is set: a record's `icon.artUrl` is a relative path whose CDN base is unmeasured.
+
+    :param record: The catalogue record Pandora returned for the album.
+    :param album_id: The id the album was requested by, which it keeps.
+    """
+    name, version = parse_title_and_version(str(record.get("name") or "Unknown Album"))
+    return Album(
+        item_id=album_id,
+        provider=provider.instance_id,
+        name=name,
+        version=version,
+        provider_mappings={
+            ProviderMapping(
+                item_id=album_id,
+                provider_domain=provider.domain,
+                provider_instance=provider.instance_id,
+            )
+        },
+    )
+
+
+def parse_artist_record(
+    provider: PandoraProvider, record: dict[str, Any], artist_id: str
+) -> Artist:
+    """
+    Parse an artist from a Pandora catalogue record.
+
+    :param record: The catalogue record Pandora returned for the artist.
+    :param artist_id: The id the artist was requested by, which it keeps.
+    """
+    return parse_artist(provider, str(record.get("name") or artist_id), artist_id)
