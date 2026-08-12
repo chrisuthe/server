@@ -24,6 +24,7 @@ from music_assistant_models.errors import (
     ResourceBusyError,
     UnsupportedFeaturedException,
 )
+from music_assistant_models.player import OutputProtocol
 from music_assistant_models.provider import ProviderManifest
 
 from music_assistant.controllers.webserver.helpers.auth_middleware import ROLE_SCOPES
@@ -229,17 +230,78 @@ async def test_eligible_players_reports_which_speakers_can_be_written_to() -> No
     """
     provider = await _setup_provider()
     _stub_sendspin(provider, {"writable": 0, "fixed": 0}, non_adjustable={"fixed"})
-    _stub_eligible_players(provider, ["writable", "fixed"])
 
     offered = await provider.get_eligible_players()
 
     assert [(p.player_id, p.adjustable) for p in offered] == [("writable", True), ("fixed", False)]
 
 
+async def test_a_physical_speaker_is_offered_as_the_player_the_user_knows() -> None:
+    """
+    A wrapped Sendspin speaker is offered by its visible player, not its hidden client.
+
+    That visible player is the one the user recognises and the only one grouping, volume
+    and mute can be driven on; whether its delay can be written is asked of the client
+    behind it, which is the object that carries one.
+    """
+    provider = await _setup_provider()
+    sendspin = _stub_sendspin(
+        provider,
+        {"lr_client": 0, "browser": 0},
+        non_adjustable={"lr_client"},
+        session_members={"living_room": "lr_client", "browser": "browser"},
+    )
+
+    offered = await provider.get_eligible_players()
+
+    assert [(p.player_id, p.name, p.adjustable) for p in offered] == [
+        ("living_room", "living_room", False),
+        ("browser", "browser", True),
+    ]
+    assert sendspin.supports_player_static_delay.call_args_list[0].args[0] == "lr_client"
+
+
+async def test_a_speaker_that_does_not_play_over_sendspin_is_not_offered() -> None:
+    """A player MA reaches over other protocols only can not carry a Sendspin delay."""
+    provider = await _setup_provider()
+    _stub_sendspin(provider, {"browser": 0})
+    mass = _mock_mass(provider)
+    airplay_only = MagicMock()
+    airplay_only.player_id = "airplay_only"
+    airplay_only.provider.domain = "universal_player"
+    airplay_only.state.available = True
+    airplay_only.state.type = PlayerType.PLAYER
+    airplay_only.get_output_protocol_by_domain = MagicMock(return_value=None)
+    mass.players.all_players = MagicMock(
+        return_value=[airplay_only, mass.players.get_player("browser")]
+    )
+
+    offered = await provider.get_eligible_players()
+
+    assert [p.player_id for p in offered] == ["browser"]
+
+
+async def test_a_session_anchor_is_never_offered_as_a_speaker() -> None:
+    """
+    The hidden virtual player that leads a calibration group is not a speaker to pick.
+
+    Eligibility no longer turns on the provider a player belongs to, and a virtual player
+    is typed like a web player, so this is the check that keeps anchors - this plugin's
+    or another's - out of the list.
+    """
+    provider = await _setup_provider()
+    sendspin = _stub_sendspin(provider, {"browser": 0, "virtual_anchor": 0})
+    sendspin.is_virtual_player = MagicMock(side_effect=lambda player_id: player_id != "browser")
+
+    offered = await provider.get_eligible_players()
+
+    assert [p.player_id for p in offered] == ["browser"]
+
+
 async def test_nothing_is_offered_without_the_sendspin_provider() -> None:
     """With Sendspin gone there are no Sendspin speakers to calibrate."""
     provider = await _setup_provider()
-    _stub_eligible_players(provider, ["a"])
+    _stub_players(provider, {"a": "a"})
     _mock_mass(provider).get_provider = MagicMock(return_value=None)
 
     assert await provider.get_eligible_players() == []
@@ -699,6 +761,68 @@ async def test_a_player_lost_mid_apply_leaves_the_earlier_writes_in_place() -> N
     assert applied == ["a", "b"]
 
 
+async def test_a_physical_speakers_correction_is_written_to_its_sendspin_client() -> None:
+    """
+    A wrapped speaker is measured as the player the user picked and corrected underneath.
+
+    The result stays keyed by the member the client asked about, while the delay itself
+    goes to the Sendspin player behind it - the only object that carries one.
+    """
+    provider = await _setup_provider()
+    sendspin = _stub_sendspin(
+        provider,
+        {"lr_client": 0, "kitchen_client": 0},
+        session_members={"living_room": "lr_client", "kitchen": "kitchen_client"},
+    )
+    await _run_session(provider, ["living_room", "kitchen"])
+
+    result = await provider.apply_measurements({"living_room": 0.0, "kitchen": 40.0})
+
+    assert result.applied == {"living_room": 0, "kitchen": 40}
+    assert result.manual == {}
+    assert _applied_delays(sendspin) == {"lr_client": 0, "kitchen_client": 40}
+
+
+async def test_a_physical_speaker_that_takes_no_delay_comes_back_by_its_visible_id() -> None:
+    """What the user has to go and adjust is named by the speaker, not by its client."""
+    provider = await _setup_provider()
+    sendspin = _stub_sendspin(
+        provider,
+        {"lr_client": 0, "kitchen_client": 0},
+        non_adjustable={"kitchen_client"},
+        session_members={"living_room": "lr_client", "kitchen": "kitchen_client"},
+    )
+    await _run_session(provider, ["living_room", "kitchen"])
+
+    result = await provider.apply_measurements({"living_room": 0.0, "kitchen": 40.0})
+
+    assert result.manual == {"kitchen": 40}
+    assert _applied_delays(sendspin) == {"lr_client": 0}
+
+
+async def test_a_member_that_lost_its_sendspin_client_is_refused() -> None:
+    """
+    A speaker whose Sendspin side went away mid-session can not be resolved, so it raises.
+
+    Reporting it as one to adjust by hand would be a lie, and folding its delay in as 0
+    would move the reference every other speaker in the group is corrected against.
+    """
+    provider = await _setup_provider()
+    sendspin = _stub_sendspin(
+        provider,
+        {"lr_client": 0, "kitchen_client": 0},
+        session_members={"living_room": "lr_client", "kitchen": "kitchen_client"},
+    )
+    await _run_session(provider, ["living_room", "kitchen"])
+    kitchen = _mock_mass(provider).players.get_player("kitchen")
+    kitchen.get_output_protocol_by_domain = MagicMock(return_value=None)
+
+    with pytest.raises(PlayerUnavailableError):
+        await provider.apply_measurements({"living_room": 0.0, "kitchen": 40.0})
+
+    sendspin.set_player_static_delay.assert_not_awaited()
+
+
 async def test_measurements_are_refused_when_sendspin_is_gone() -> None:
     """Without the Sendspin provider there is nothing to apply the correction through."""
     provider = await _setup_provider()
@@ -729,27 +853,11 @@ async def _run_session(provider: SendspinSyncProvider, player_ids: list[str]) ->
     return session
 
 
-def _stub_eligible_players(provider: SendspinSyncProvider, player_ids: list[str]) -> None:
-    """Register stub players that all_players returns and is_eligible accepts."""
-    players = []
-    for player_id in player_ids:
-        player = MagicMock()
-        player.player_id = player_id
-        player.state.name = player_id
-        player.state.available = True
-        player.state.type = PlayerType.PLAYER
-        player.state.playback_state = PlaybackState.IDLE
-        player.state.mute_control = "mute_control"
-        player.state.volume_control = "volume_control"
-        player.provider.domain = SENDSPIN_DOMAIN
-        players.append(player)
-    _mock_mass(provider).players.all_players = MagicMock(return_value=players)
-
-
 def _stub_sendspin(
     provider: SendspinSyncProvider,
     current_delays_ms: dict[str, int],
     non_adjustable: set[str] | None = None,
+    session_members: dict[str, str] | None = None,
 ) -> MagicMock:
     """
     Install a stub Sendspin provider that carries the given static delays.
@@ -757,12 +865,22 @@ def _stub_sendspin(
     Reads and writes hit the same mapping, so a second ``apply_measurements`` sees what
     the first one applied - which is what makes the convergence test meaningful.
 
+    Also registers the session's players, since an apply resolves each member to the
+    Sendspin player its delay is written to.
+
     :param provider: The plugin provider to install the stub behind.
-    :param current_delays_ms: The static delay each player starts out carrying.
-    :param non_adjustable: Players whose client refuses a static delay. Reading one
-        raises, exactly as the real provider does.
+    :param current_delays_ms: The static delay each *Sendspin* player starts out carrying.
+    :param non_adjustable: Sendspin players whose client refuses a static delay. Reading
+        one raises, exactly as the real provider does.
+    :param session_members: Session member id -> the Sendspin player behind it, for
+        wrapped physical speakers. Defaults to a web player per delay entry, which is
+        its own Sendspin endpoint.
     """
     refused = non_adjustable or set()
+    _stub_players(
+        provider,
+        session_members or {player_id: player_id for player_id in current_delays_ms},
+    )
 
     def _get(player_id: str) -> int:
         if player_id in refused:
@@ -778,6 +896,50 @@ def _stub_sendspin(
     )
     _mock_mass(provider).get_provider = MagicMock(return_value=sendspin)
     return sendspin
+
+
+def _stub_players(provider: SendspinSyncProvider, session_members: dict[str, str]) -> None:
+    """
+    Register visible players that all_players offers and a session can resolve.
+
+    Each is eligible and resolves to the Sendspin player its static delay is written to.
+
+    :param provider: The plugin provider whose stub MusicAssistant should hold them.
+    :param session_members: Session member id -> the Sendspin player behind it. A member
+        mapped to itself is a web player; any other mapping is a physical speaker, whose
+        visible player wraps a hidden Sendspin client of that id.
+    """
+    registry: dict[str, MagicMock] = {}
+    for player_id, sendspin_id in session_members.items():
+        player = MagicMock()
+        player.player_id = player_id
+        player.state.name = player_id
+        player.state.available = True
+        player.state.type = PlayerType.PLAYER
+        player.state.playback_state = PlaybackState.IDLE
+        player.state.mute_control = "mute_control"
+        player.state.volume_control = "volume_control"
+        if sendspin_id == player_id:
+            player.provider.domain = SENDSPIN_DOMAIN
+        else:
+            player.provider.domain = "universal_player"
+            client = MagicMock()
+            client.player_id = sendspin_id
+            protocol = OutputProtocol(
+                output_protocol_id=sendspin_id,
+                name="Sendspin",
+                protocol_domain=SENDSPIN_DOMAIN,
+            )
+            player.get_output_protocol_by_domain = MagicMock(
+                side_effect=lambda domain, found=protocol: (
+                    found if domain == SENDSPIN_DOMAIN else None
+                )
+            )
+            player.get_protocol_player = MagicMock(return_value=client)
+        registry[player_id] = player
+    mass = _mock_mass(provider)
+    mass.players.get_player = MagicMock(side_effect=registry.get)
+    mass.players.all_players = MagicMock(return_value=list(registry.values()))
 
 
 def _applied_delays(sendspin: MagicMock) -> dict[str, int]:

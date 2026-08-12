@@ -34,7 +34,7 @@ each of them in turn. It is driven through the API:
 
 | Command | Scope | Purpose |
 | --- | --- | --- |
-| `sendspin_sync/eligible_players` | `players.read` | The Sendspin speakers a session can run against, and whether MA can write each one's delay |
+| `sendspin_sync/eligible_players` | `players.read` | The speakers a session can run against, and whether MA can write each one's delay |
 | `sendspin_sync/session` | `players.read` | State of the running session, or `null` |
 | `sendspin_sync/start_session` | `players.control` | Take the given speakers over and start the track |
 | `sendspin_sync/solo_player` | `players.control` | Make one member of the session audible |
@@ -80,6 +80,37 @@ the inactivity timeout that stops a phone that walked away from leaving a house
 muted. Each speaker's restore steps are attempted independently, so one that has
 disconnected can not leave the others silent or grouped. Grouping powers a
 speaker on, so one that was off is switched back off rather than resumed.
+
+### Which player a session holds
+
+Only web and app players are Sendspin players in their own right. Every physical
+speaker — an ESPHome device, a Windows client, a MultiRoom-Audio box — is
+registered **twice**: a hidden `PlayerType.PROTOCOL` Sendspin player that speaks the
+protocol, and the visible player MA presents the device as, which is either a
+Universal Player wrapping it or a native player its identifiers matched.
+
+A session offers and holds the **visible** player, because that is the level
+everything it does works at:
+
+- **Grouping.** The anchor's `can_group_with` carries visible ids — protocol ids are
+  translated to their parents — and both `SharedPlaybackSession.can_listen_in` and the
+  player controller gate membership on it. A protocol id would be refused; a visible
+  id is translated back to the Sendspin player, so the group is still one native
+  Sendspin group carrying one uninterrupted stream.
+- **Volume, mute and name.** A visible player's `volume_control` and `mute_control`
+  resolve through its linked protocol player, so isolation drives the Sendspin client
+  either way, and the name a user picked from is the one they know the speaker by.
+- **The static delay** is the exception: it lives on the Sendspin player alone, so an
+  apply resolves each member to it (`resolve_sendspin_player`) before reading or
+  writing, while the result stays keyed by the member the client asked about. A member
+  whose Sendspin side has gone is refused rather than reported as one to adjust by
+  hand — folding its delay in as 0 would move the reference every other speaker in the
+  group is corrected against.
+
+Eligibility therefore asks whether a player *renders over Sendspin*, not which
+provider it belongs to. A hidden protocol player is never offered, and neither is a
+session anchor: a Sendspin virtual player is typed `PlayerType.PLAYER` just like a web
+player, so `is_remote_session_host` is what excludes it.
 
 ## Applying the result
 

@@ -6,6 +6,11 @@ Sendspin virtual player and starts the calibration track on that anchor's queue
 exactly once. The phone-side probe then measures one speaker at a time, driven
 by :meth:`CalibrationSession.solo`.
 
+A member is the speaker as the user sees it, not the hidden Sendspin protocol
+player behind it: grouping, volume and mute are all driven at that level and the
+controller translates them to the protocol player itself. Only a static delay is
+written to the Sendspin side, resolved with :func:`resolve_sendspin_player`.
+
 Two properties of the orchestration are load-bearing for the measurement:
 
 - **The stream is started once and never restarted.** The chirp train is a
@@ -63,9 +68,12 @@ if TYPE_CHECKING:
 # up in logs and diagnostics, so it names what it is.
 ANCHOR_DISPLAY_NAME = "Sendspin Calibration"
 
-# Player types that render audio and can therefore be calibrated. Sendspin also
-# registers protocol, display, visualizer and light players, none of which is a
-# speaker; an allowlist keeps a future player type out until it is considered.
+# Player types that render audio and can therefore be calibrated. A session drives
+# the player a user sees, so this deliberately excludes PlayerType.PROTOCOL: the
+# hidden half of a speaker MA presents through its parent, reached by resolving that
+# parent with resolve_sendspin_player. Sendspin also registers display, visualizer and
+# light players, none of which is a speaker; an allowlist keeps a future player type
+# out until it is considered.
 CALIBRATABLE_PLAYER_TYPES = (PlayerType.PLAYER, PlayerType.STEREO_PAIR)
 
 # States in which a player is considered busy with the user's own content.
@@ -81,7 +89,12 @@ class SilenceMethod(StrEnum):
 
 @dataclass
 class CalibrationPlayer(DataClassDictMixin):
-    """A Sendspin speaker a calibration session can be run against."""
+    """
+    A speaker a calibration session can be run against.
+
+    Identified and named as the user sees it, which for a physical speaker is the
+    visible player wrapping its Sendspin client rather than that client.
+    """
 
     player_id: str
     name: str
@@ -187,12 +200,13 @@ class CalibrationSession:
         :param translation_owner: Namespace whose strings.json localizes this session's errors.
         :param owner_instance_id: Instance id of the provider that owns the session;
             the anchor player is removed when it unloads.
-        :param player_ids: The Sendspin players to calibrate, in the order given.
+        :param player_ids: The speakers to calibrate, in the order given, as the user
+            sees them - not the Sendspin protocol players behind them.
         :param force: Take over players that are busy playing the user's own content.
         :raises InvalidDataError: If no players were given, or the same player twice.
         :raises PlayerUnavailableError: If a given player is unknown or unavailable.
-        :raises UnsupportedFeaturedException: If a given player is not a Sendspin
-            speaker, or can not be silenced.
+        :raises UnsupportedFeaturedException: If a given player does not render over
+            Sendspin, or can not be silenced.
         :raises ActionUnavailable: If a player is busy playing and ``force`` was not set.
         :return: The commandeered, not yet streaming session.
         """
@@ -566,6 +580,31 @@ class CalibrationSession:
         await self._restore_volume_and_mute(player, self._snapshots[player_id])
 
 
+def resolve_sendspin_player(player: Player) -> Player | None:
+    """
+    Return the Sendspin player the given player renders audio through.
+
+    A physical Sendspin speaker is registered twice: a hidden protocol player that
+    speaks the protocol, and the visible player MA presents the device as. Grouping,
+    volume and mute are driven on the visible one - the protocol player is not even in
+    the anchor's ``can_group_with``, which carries visible ids - while a static delay is
+    written to the Sendspin one. A session therefore holds the visible player and
+    resolves it here when it needs the speaker's Sendspin side. A Sendspin web or app
+    player is its own protocol endpoint and resolves to itself.
+
+    :param player: The player to resolve.
+    :return: The Sendspin player, or None when this player has no Sendspin output to
+        render through - it plays over other protocols only, or its Sendspin client is
+        gone or not ready to take a stream.
+    """
+    if player.provider.domain == SENDSPIN_DOMAIN:
+        return player
+    protocol = player.get_output_protocol_by_domain(SENDSPIN_DOMAIN)
+    if protocol is None or not protocol.available:
+        return None
+    return player.get_protocol_player(protocol.output_protocol_id)
+
+
 def is_eligible(mass: MusicAssistant, player: Player) -> bool:
     """
     Return whether the given player can take part in a calibration session.
@@ -573,7 +612,10 @@ def is_eligible(mass: MusicAssistant, player: Player) -> bool:
     :param mass: MusicAssistant instance.
     :param player: The player to check.
     """
-    if not player.state.available or player.provider.domain != SENDSPIN_DOMAIN:
+    if not player.state.available:
+        return False
+    if resolve_sendspin_player(player) is None:
+        # only a speaker that renders over Sendspin can be given a Sendspin static delay
         return False
     if player.state.type not in CALIBRATABLE_PLAYER_TYPES:
         return False
