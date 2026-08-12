@@ -2114,7 +2114,7 @@
   "provider.sendspin_sync.errors.no_session": "No calibration session is running.",
   "provider.sendspin_sync.errors.offset_not_finite": "The measurement for {0} is not a usable number. Measure it again.",
   "provider.sendspin_sync.errors.player_busy": "{0} is currently playing. Stop playback first, or start the calibration anyway.",
-  "provider.sendspin_sync.errors.player_not_eligible": "{0} can not be calibrated: it is not a Sendspin speaker, its volume can not be controlled, or it does not accept a measured delay.",
+  "provider.sendspin_sync.errors.player_not_eligible": "{0} can not be calibrated: it is not a Sendspin speaker, or its volume can not be controlled.",
   "provider.sendspin_sync.errors.player_not_in_session": "{0} is not part of this calibration session.",
   "provider.sendspin_sync.errors.player_not_measured": "{0} was not measured. Measure every speaker in the session before applying the result.",
   "provider.sendspin_sync.errors.player_silent": "{0} is muted or turned all the way down. Turn it up before calibrating.",

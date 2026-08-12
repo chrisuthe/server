@@ -29,6 +29,7 @@ from music_assistant_models.enums import (
 from music_assistant_models.errors import (
     ActionUnavailable,
     MediaNotFoundError,
+    PlayerUnavailableError,
     ResourceBusyError,
 )
 from music_assistant_models.media_items import AudioSource, ProviderMapping
@@ -43,6 +44,7 @@ from music_assistant.models.plugin import PluginProvider
 from .chirp import BIT_DEPTH, CHANNELS, SAMPLE_RATE, build_chirp_period
 from .session import (
     CalibrationPlayer,
+    CalibrationResult,
     CalibrationSession,
     CalibrationSessionState,
     is_busy,
@@ -280,12 +282,21 @@ class SendspinSyncProvider(PluginProvider):
 
         Only Sendspin speakers qualify, and only those that can be taken out of the
         mix - a player with neither a mute nor a volume control can never be isolated.
+
+        A speaker whose client does not accept a static delay is still offered, with
+        ``adjustable`` false: it can be measured like any other, and its result comes
+        back from ``apply_measurements`` for the user to apply on the device itself.
         """
+        sendspin = cast("SendspinProvider | None", self.mass.get_provider(SENDSPIN_DOMAIN))
+        if sendspin is None:
+            # nothing to measure without it, and nothing to ask about a speaker either
+            return []
         return [
             CalibrationPlayer(
                 player_id=player.player_id,
                 name=player.state.name,
                 busy=is_busy(player),
+                adjustable=sendspin.supports_player_static_delay(player.player_id),
             )
             # all_players (not iter_players) so a non-admin user is only offered the
             # speakers they are allowed to see
@@ -375,7 +386,7 @@ class SendspinSyncProvider(PluginProvider):
             self._arm_session_timeout()
             return self._session.state
 
-    async def apply_measurements(self, offsets_ms: dict[str, float]) -> dict[str, int]:
+    async def apply_measurements(self, offsets_ms: dict[str, float]) -> CalibrationResult:
         """
         Turn the session's measured arrival offsets into static delays and apply them.
 
@@ -385,11 +396,20 @@ class SendspinSyncProvider(PluginProvider):
         re-running a calibration converges instead of drifting and a delay the user
         set by hand is respected.
 
+        Every speaker in the session is normalised the same way, including one whose
+        client does not accept a static delay - it belongs in the baseline the others
+        are measured against just as much, and may well be the earliest arrival that
+        defines it. Only the last step splits: the delays MA can write are written and
+        come back under ``applied``, and the rest come back under ``manual`` for the
+        user to set on the device itself. An ``applied`` value replaces the delay its
+        speaker carried; a ``manual`` value is added to whatever its firmware already
+        applies. See :class:`CalibrationResult`.
+
         Every member of the session must be measured, and nothing is written until every
         value has been computed and accepted, so no rejected measurement can leave the
         group half corrected. A player that drops off mid-apply still can: the write that
         fails raises and the players already written keep their new delay. The returned
-        map is therefore only meaningful on success.
+        result is therefore only meaningful on success.
 
         Leaves the session running so the result can be verified in place: measure
         again, and every speaker should now report the same arrival. The session's
@@ -401,8 +421,10 @@ class SendspinSyncProvider(PluginProvider):
         :raises InvalidDataError: If the measurements do not cover exactly the session's
             members, a value is not finite, or one implies a delay Sendspin can not carry.
         :raises PlayerUnavailableError: If a member of the session has meanwhile gone.
-        :raises UnsupportedFeaturedException: If a member does not accept a static delay.
-        :return: The absolute static delay applied per player, in milliseconds.
+        :raises UnsupportedFeaturedException: If a member stopped accepting a static
+            delay between being checked and being used, which a reconnect can do.
+        :return: The resolved static delay per player, split into the ones MA applied and
+            the ones the user has to apply themselves.
         """
         async with self._session_lock:
             if self._session is None:
@@ -412,19 +434,31 @@ class SendspinSyncProvider(PluginProvider):
                     translation_owner=self.translation_owner,
                 )
             sendspin = self._sendspin_provider()
+            adjustable = self._adjustable_members(sendspin, self._session.player_ids)
+            # The Sendspin provider refuses to read a delay off a speaker it can not
+            # write one to: it holds no value for such a speaker, so a read would report
+            # its configured default, and a bridge client can set that to a non-zero
+            # value the device is not actually carrying. Substituting 0 is what that
+            # refusal leaves, and it is the honest number - whatever delay the firmware
+            # applies is already inside the arrival this run measured.
             current_delays_ms = {
-                player_id: sendspin.get_player_static_delay(player_id)
-                for player_id in self._session.player_ids
+                player_id: sendspin.get_player_static_delay(player_id) if is_adjustable else 0
+                for player_id, is_adjustable in adjustable.items()
             }
             delays_ms = resolve_static_delays(offsets_ms, current_delays_ms, self.translation_owner)
+            result = CalibrationResult(applied={}, manual={})
             # Saving these mid-session does not disturb the measurement: the static delay
             # config entry is immediate_apply and carries no requires_reload, so the
             # config controller pushes it straight to the client instead of restarting
             # the queue - which would end the stream the measurements are phased against.
             for player_id, delay_ms in delays_ms.items():
+                if not adjustable[player_id]:
+                    result.manual[player_id] = delay_ms
+                    continue
                 await sendspin.set_player_static_delay(player_id, delay_ms)
+                result.applied[player_id] = delay_ms
             self._arm_session_timeout()
-            return delays_ms
+            return result
 
     async def stop_session(self) -> None:
         """
@@ -448,6 +482,41 @@ class SendspinSyncProvider(PluginProvider):
                 translation_owner=self.translation_owner,
             )
         return sendspin
+
+    def _adjustable_members(
+        self, sendspin: SendspinProvider, player_ids: list[str]
+    ) -> dict[str, bool]:
+        """
+        Return which of the given session members MA can write a static delay to.
+
+        Resolved in one pass up front, because a client is free to change its answer
+        across a reconnect and this one answer governs both halves of the calculation:
+        asking again later could fold a speaker's current delay in as 0 and then write
+        the result to it as an absolute, which are two different numbers.
+
+        :param sendspin: The Sendspin provider to ask.
+        :param player_ids: The session members to resolve.
+        :raises PlayerUnavailableError: If a member has meanwhile gone. Sendspin answers
+            the same False for a speaker that has left as for one that refuses a delay,
+            and reporting the first as "set this one by hand" would be a lie.
+        """
+        adjustable: dict[str, bool] = {}
+        for player_id in player_ids:
+            player = self.mass.players.get_player(player_id)
+            if player is None or not player.state.available:
+                raise PlayerUnavailableError(
+                    f"Player {player_id} is not available",
+                    translation_key="player_unavailable",
+                    translation_args=[player_id],
+                    translation_owner=self.translation_owner,
+                )
+            adjustable[player_id] = sendspin.supports_player_static_delay(player_id)
+        if fixed := [player_id for player_id, ok in adjustable.items() if not ok]:
+            # a speaker reported back for the user to adjust by hand leaves no other
+            # trace, so a client whose support flapped can be told apart from one that
+            # never advertised the command in the first place
+            self.logger.debug("Calibration can not write a static delay to: %s", ", ".join(fixed))
+        return adjustable
 
     def _arm_session_timeout(self) -> None:
         """(Re)start the inactivity timeout that tears a forgotten session down."""

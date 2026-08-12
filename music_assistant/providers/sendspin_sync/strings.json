@@ -6,7 +6,7 @@
     "no_players": "Select at least one speaker to calibrate.",
     "duplicate_players": "Each speaker may only appear once in a calibration session.",
     "player_unavailable": "{0} is not available.",
-    "player_not_eligible": "{0} can not be calibrated: it is not a Sendspin speaker, its volume can not be controlled, or it does not accept a measured delay.",
+    "player_not_eligible": "{0} can not be calibrated: it is not a Sendspin speaker, or its volume can not be controlled.",
     "player_silent": "{0} is muted or turned all the way down. Turn it up before calibrating.",
     "player_busy": "{0} is currently playing. Stop playback first, or start the calibration anyway.",
     "session_already_running": "A calibration session is already running.",

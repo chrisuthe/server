@@ -521,36 +521,28 @@ async def test_the_session_anchor_is_not_itself_eligible() -> None:
     assert is_eligible(mass, player) is False
 
 
-async def test_a_speaker_that_cannot_take_a_static_delay_is_not_eligible() -> None:
+async def test_a_speaker_that_cannot_take_a_static_delay_is_still_eligible() -> None:
     """
-    A speaker whose client carries no static delay is left out of the offer entirely.
+    A speaker whose client carries no static delay is measured like any other.
 
-    It could be measured perfectly well, but the correction could never be applied to
-    it, so offering it would let a user walk the whole house before being told.
+    Offsets are relative, so leaving it out would take it out of the picture the rest
+    are normalised against rather than merely deny it a correction.
     """
     player = _make_player("a")
     mass = _make_mass(player)
     mass.get_provider.return_value.supports_player_static_delay = MagicMock(return_value=False)
 
-    assert is_eligible(mass, player) is False
+    assert is_eligible(mass, player) is True
 
 
-async def test_nothing_is_eligible_without_the_sendspin_provider() -> None:
-    """With Sendspin gone there is nothing to read a delay from, let alone apply one to."""
-    player = _make_player("a")
-    mass = _make_mass(player)
-    mass.get_provider = MagicMock(return_value=None)
-
-    assert is_eligible(mass, player) is False
-
-
-async def test_start_refuses_a_speaker_that_cannot_take_a_static_delay() -> None:
-    """The refusal lands when the session is requested, not when its result is applied."""
+async def test_start_accepts_a_speaker_that_cannot_take_a_static_delay() -> None:
+    """A session runs over such a speaker; the result comes back for the user to apply."""
     mass = _make_mass(_make_player("a"))
     mass.get_provider.return_value.supports_player_static_delay = MagicMock(return_value=False)
 
-    with pytest.raises(UnsupportedFeaturedException):
-        await _start(mass, ["a"])
+    session = await _start(mass, ["a"])
+
+    assert session.player_ids == ["a"]
 
 
 async def _start(
