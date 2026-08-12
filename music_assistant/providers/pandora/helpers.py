@@ -119,9 +119,9 @@ def create_auth_headers(csrf_token: str, auth_token: str | None = None) -> dict[
     return headers
 
 
-async def raise_if_no_entitlements(response: aiohttp.ClientResponse) -> None:
+async def raise_if_playback_refused(response: aiohttp.ClientResponse) -> None:
     """
-    Raise MediaNotFoundError if a 400 response reports the account lacks on-demand rights.
+    Raise MediaNotFoundError if a 400 response reports a known on-demand playback refusal.
 
     Returns silently for any other body, including one that fails to parse as JSON, so the
     caller can fall back to its own handling of the response.
@@ -132,8 +132,13 @@ async def raise_if_no_entitlements(response: aiohttp.ClientResponse) -> None:
         error_body = await response.json()
     except aiohttp.ContentTypeError, json.JSONDecodeError:
         return
-    if isinstance(error_body, dict) and error_body.get("errorString") == "NO_ENTITLEMENTS":
+    if not isinstance(error_body, dict):
+        return
+    error_string = error_body.get("errorString")
+    if error_string == "NO_ENTITLEMENTS":
         raise MediaNotFoundError("On-demand playback is not available on this Pandora account")
+    if error_string == "NO_PLAYABLE_CONTENT":
+        raise MediaNotFoundError("This Pandora source has nothing playable")
 
 
 def loudness_from_file_gain(file_gain: Any) -> float | None:

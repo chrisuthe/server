@@ -79,7 +79,7 @@ from .helpers import (
     get_csrf_token,
     handle_pandora_error,
     loudness_from_file_gain,
-    raise_if_no_entitlements,
+    raise_if_playback_refused,
     read_account_flags,
 )
 from .parsers import (
@@ -583,7 +583,7 @@ class PandoraProvider(MusicProvider):
                 if response.status == 400:
                     # A free/non-Premium account gets a 400 for on-demand track requests;
                     # a per-track refusal must not tear down the session.
-                    await raise_if_no_entitlements(response)
+                    await raise_if_playback_refused(response)
                     await self.close()
                     raise InvalidDataError(f"Pandora API error: HTTP {response.status}")
                 if response.status >= 400:

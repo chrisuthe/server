@@ -1594,6 +1594,22 @@ async def test_no_entitlements_400_names_the_refusal_and_leaves_session_open() -
     response.close.assert_not_called()
 
 
+async def test_no_playable_content_400_names_the_refusal_and_leaves_session_open() -> None:
+    """An empty source's refusal must be legible, not a generic close-and-raise."""
+    response = _ApiResponse(
+        400,
+        {
+            "message": "Source does not have any playable tracks",
+            "errorCode": 0,
+            "errorString": "NO_PLAYABLE_CONTENT",
+        },
+    )
+    provider = _api_provider(response)
+    with pytest.raises(MediaNotFoundError, match="nothing playable"):
+        await provider._api_request("GET", "https://example.com/x")
+    response.close.assert_not_called()
+
+
 async def test_other_400_body_still_raises_the_generic_api_error() -> None:
     """A 400 that isn't the entitlement refusal keeps the pre-existing behaviour."""
     response = _ApiResponse(400, {"errorString": "SOME_OTHER_ERROR"})
