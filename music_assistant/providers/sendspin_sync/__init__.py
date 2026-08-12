@@ -49,6 +49,7 @@ from .session import (
     CalibrationSessionState,
     is_busy,
     is_eligible,
+    resolve_sendspin_player,
     resolve_static_delays,
 )
 
@@ -280,8 +281,11 @@ class SendspinSyncProvider(PluginProvider):
         """
         Return the players a calibration session can be run against.
 
-        Only Sendspin speakers qualify, and only those that can be taken out of the
-        mix - a player with neither a mute nor a volume control can never be isolated.
+        Only speakers that play over Sendspin qualify, and only those that can be taken
+        out of the mix - a player with neither a mute nor a volume control can never be
+        isolated. Every player is offered under the name the user knows it by: a physical
+        speaker is presented by the visible player MA wraps its Sendspin client in, not
+        by that hidden client.
 
         A speaker whose client does not accept a static delay is still offered, with
         ``adjustable`` false: it can be measured like any other, and its result comes
@@ -291,20 +295,25 @@ class SendspinSyncProvider(PluginProvider):
         if sendspin is None:
             # nothing to measure without it, and nothing to ask about a speaker either
             return []
-        return [
-            CalibrationPlayer(
-                player_id=player.player_id,
-                name=player.state.name,
-                busy=is_busy(player),
-                adjustable=sendspin.supports_player_static_delay(player.player_id),
+        offered: list[CalibrationPlayer] = []
+        # all_players (not iter_players) so a non-admin user is only offered the
+        # speakers they are allowed to see. Unfiltered by provider: the visible player
+        # of a physical Sendspin speaker belongs to whichever provider wraps its client.
+        for player in self.mass.players.all_players(return_unavailable=False):
+            sendspin_player = resolve_sendspin_player(player)
+            if sendspin_player is None or not is_eligible(self.mass, player):
+                continue
+            offered.append(
+                CalibrationPlayer(
+                    player_id=player.player_id,
+                    name=player.state.name,
+                    busy=is_busy(player),
+                    # asked of the speaker's Sendspin side, which is the only object
+                    # that carries a static delay
+                    adjustable=sendspin.supports_player_static_delay(sendspin_player.player_id),
+                )
             )
-            # all_players (not iter_players) so a non-admin user is only offered the
-            # speakers they are allowed to see
-            for player in self.mass.players.all_players(
-                return_unavailable=False, provider_filter=SENDSPIN_DOMAIN
-            )
-            if is_eligible(self.mass, player)
-        ]
+        return offered
 
     async def get_session(self) -> CalibrationSessionState | None:
         """Return the state of the running calibration session, or None if there is none."""
@@ -323,13 +332,14 @@ class SendspinSyncProvider(PluginProvider):
         torn down automatically after a period of inactivity, so a phone that goes
         away can not leave the speakers muted.
 
-        :param player_ids: The Sendspin players to calibrate, in the order given.
+        :param player_ids: The speakers to calibrate, in the order given, as
+            ``eligible_players`` offers them.
         :param force: Take over players that are busy playing the user's own content.
         :raises ResourceBusyError: If a calibration session is already running.
         :raises InvalidDataError: If no players were given, or the same player twice.
         :raises PlayerUnavailableError: If a given player is unknown or unavailable.
-        :raises UnsupportedFeaturedException: If a given player is not a Sendspin
-            speaker, or can not be silenced.
+        :raises UnsupportedFeaturedException: If a given player does not render over
+            Sendspin, or can not be silenced.
         :raises ActionUnavailable: If a player is already muted or turned all the way
             down, or is playing and ``force`` was not set.
         :return: The state of the started session.
@@ -434,7 +444,7 @@ class SendspinSyncProvider(PluginProvider):
                     translation_owner=self.translation_owner,
                 )
             sendspin = self._sendspin_provider()
-            adjustable = self._adjustable_members(sendspin, self._session.player_ids)
+            delay_targets = self._delay_targets(sendspin, self._session.player_ids)
             # The Sendspin provider refuses to read a delay off a speaker it can not
             # write one to: it holds no value for such a speaker, so a read would report
             # its configured default, and a bridge client can set that to a non-zero
@@ -442,8 +452,8 @@ class SendspinSyncProvider(PluginProvider):
             # refusal leaves, and it is the honest number - whatever delay the firmware
             # applies is already inside the arrival this run measured.
             current_delays_ms = {
-                player_id: sendspin.get_player_static_delay(player_id) if is_adjustable else 0
-                for player_id, is_adjustable in adjustable.items()
+                player_id: sendspin.get_player_static_delay(target) if target else 0
+                for player_id, target in delay_targets.items()
             }
             delays_ms = resolve_static_delays(offsets_ms, current_delays_ms, self.translation_owner)
             result = CalibrationResult(applied={}, manual={})
@@ -452,10 +462,11 @@ class SendspinSyncProvider(PluginProvider):
             # config controller pushes it straight to the client instead of restarting
             # the queue - which would end the stream the measurements are phased against.
             for player_id, delay_ms in delays_ms.items():
-                if not adjustable[player_id]:
+                target = delay_targets[player_id]
+                if target is None:
                     result.manual[player_id] = delay_ms
                     continue
-                await sendspin.set_player_static_delay(player_id, delay_ms)
+                await sendspin.set_player_static_delay(target, delay_ms)
                 result.applied[player_id] = delay_ms
             self._arm_session_timeout()
             return result
@@ -483,11 +494,16 @@ class SendspinSyncProvider(PluginProvider):
             )
         return sendspin
 
-    def _adjustable_members(
+    def _delay_targets(
         self, sendspin: SendspinProvider, player_ids: list[str]
-    ) -> dict[str, bool]:
+    ) -> dict[str, str | None]:
         """
-        Return which of the given session members MA can write a static delay to.
+        Return the Sendspin player each session member's static delay is written to.
+
+        A member is the speaker as the user sees it, so the Sendspin player behind it is
+        resolved here - for a physical speaker that is the hidden protocol player MA
+        wraps, and for a web player the member itself. The value is None for a member MA
+        can not write a delay to, which is what splits the result of an apply.
 
         Resolved in one pass up front, because a client is free to change its answer
         across a reconnect and this one answer governs both halves of the calculation:
@@ -496,27 +512,37 @@ class SendspinSyncProvider(PluginProvider):
 
         :param sendspin: The Sendspin provider to ask.
         :param player_ids: The session members to resolve.
-        :raises PlayerUnavailableError: If a member has meanwhile gone. Sendspin answers
-            the same False for a speaker that has left as for one that refuses a delay,
-            and reporting the first as "set this one by hand" would be a lie.
+        :raises PlayerUnavailableError: If a member has meanwhile gone, or lost the
+            Sendspin side a delay would be written to. Sendspin answers the same False
+            for a speaker that has left as for one that refuses a delay, and reporting
+            the first as "set this one by hand" would be a lie.
         """
-        adjustable: dict[str, bool] = {}
+        targets: dict[str, str | None] = {}
         for player_id in player_ids:
             player = self.mass.players.get_player(player_id)
-            if player is None or not player.state.available:
+            sendspin_player = (
+                resolve_sendspin_player(player)
+                if player is not None and player.state.available
+                else None
+            )
+            if sendspin_player is None:
                 raise PlayerUnavailableError(
                     f"Player {player_id} is not available",
                     translation_key="player_unavailable",
                     translation_args=[player_id],
                     translation_owner=self.translation_owner,
                 )
-            adjustable[player_id] = sendspin.supports_player_static_delay(player_id)
-        if fixed := [player_id for player_id, ok in adjustable.items() if not ok]:
+            targets[player_id] = (
+                sendspin_player.player_id
+                if sendspin.supports_player_static_delay(sendspin_player.player_id)
+                else None
+            )
+        if fixed := [player_id for player_id, target in targets.items() if target is None]:
             # a speaker reported back for the user to adjust by hand leaves no other
             # trace, so a client whose support flapped can be told apart from one that
             # never advertised the command in the first place
             self.logger.debug("Calibration can not write a static delay to: %s", ", ".join(fixed))
-        return adjustable
+        return targets
 
     def _arm_session_timeout(self) -> None:
         """(Re)start the inactivity timeout that tears a forgotten session down."""

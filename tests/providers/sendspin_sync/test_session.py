@@ -17,11 +17,13 @@ from music_assistant_models.errors import (
     PlayerUnavailableError,
     UnsupportedFeaturedException,
 )
+from music_assistant_models.player import OutputProtocol
 
 from music_assistant.providers.sendspin_sync.session import (
     CalibrationSession,
     CalibrationSessionState,
     is_eligible,
+    resolve_sendspin_player,
 )
 
 if TYPE_CHECKING:
@@ -513,6 +515,99 @@ async def test_eligibility(overrides: dict[str, Any], expected: bool) -> None:
     assert is_eligible(_make_mass(player), player) is expected
 
 
+async def test_a_physical_speaker_is_eligible_and_resolves_to_its_sendspin_client() -> None:
+    """
+    A speaker that plays over Sendspin qualifies, whichever provider presents it.
+
+    Only web and app players are Sendspin players in their own right; every physical
+    speaker is a hidden Sendspin protocol player behind a visible one, which is the
+    object a user picks and the session drives.
+    """
+    speaker = _make_speaker("living_room", client_id="ss_client")
+
+    assert is_eligible(_make_mass(speaker), speaker) is True
+    resolved = resolve_sendspin_player(speaker)
+    assert resolved is not None
+    assert resolved.player_id == "ss_client"
+
+
+async def test_a_web_player_resolves_to_itself() -> None:
+    """A Sendspin web player is its own protocol endpoint, so it carries its own delay."""
+    player = _make_player("browser")
+
+    resolved = resolve_sendspin_player(player)
+    assert resolved is not None
+    assert resolved.player_id == "browser"
+
+
+async def test_a_speaker_that_does_not_play_over_sendspin_is_not_eligible() -> None:
+    """A speaker reachable over other protocols only can not be given a Sendspin delay."""
+    player = _make_player("airplay_only", domain="universal_player")
+
+    assert resolve_sendspin_player(player) is None
+    assert is_eligible(_make_mass(player), player) is False
+
+
+async def test_a_speaker_whose_sendspin_client_cannot_take_a_stream_is_not_eligible() -> None:
+    """
+    A Sendspin output that is not ready to be played to is not one to calibrate against.
+
+    Its client has gone or still needs setting up, so it can neither be measured nor
+    take the correction that would come out of it.
+    """
+    speaker = _make_speaker("garage", client_ready=False)
+
+    assert resolve_sendspin_player(speaker) is None
+    assert is_eligible(_make_mass(speaker), speaker) is False
+
+
+async def test_a_physical_speaker_with_neither_control_is_still_refused() -> None:
+    """The isolation requirement holds for a wrapped speaker as much as for a web player."""
+    speaker = _make_speaker(
+        "kitchen", mute_control=PLAYER_CONTROL_NONE, volume_control=PLAYER_CONTROL_NONE
+    )
+
+    assert is_eligible(_make_mass(speaker), speaker) is False
+
+
+async def test_soloing_a_physical_speaker_silences_only_the_others() -> None:
+    """
+    A session over wrapped speakers isolates them by the visible player it holds.
+
+    Mute and volume resolve through the visible player to the Sendspin client, so the
+    commands are issued against the id the user picked, and the stream is left alone.
+    """
+    mass = _make_mass(
+        _make_speaker("living_room"), _make_speaker("kitchen"), _make_speaker("study")
+    )
+    session = await _start(mass, ["living_room", "kitchen", "study"])
+    shared = _shared_session(session)
+    assert [call.args[0] for call in shared.add_guest_listener.await_args_list] == [
+        "living_room",
+        "kitchen",
+        "study",
+    ]
+    mass.player_queues.play_media.reset_mock()
+
+    await session.solo("kitchen")
+
+    assert _silenced(mass) == {"living_room", "study"}
+    assert "kitchen" not in _mute_command_targets(mass)
+    mass.player_queues.play_media.assert_not_awaited()
+    mass.player_queues.stop.assert_not_awaited()
+
+
+async def test_a_session_mixes_wrapped_speakers_and_web_players() -> None:
+    """Both kinds of Sendspin speaker are members of one session on equal terms."""
+    mass = _make_mass(_make_speaker("living_room"), _make_player("browser"))
+
+    session = await _start(mass, ["living_room", "browser"])
+    await session.solo("browser")
+
+    assert session.player_ids == ["living_room", "browser"]
+    assert _silenced(mass) == {"living_room"}
+
+
 async def test_the_session_anchor_is_not_itself_eligible() -> None:
     """The hidden player that leads a calibration group is not a speaker to calibrate."""
     player = _make_player(ANCHOR_ID)
@@ -605,6 +700,43 @@ def _make_shared_session() -> MagicMock:
     return shared
 
 
+def _make_speaker(
+    player_id: str,
+    *,
+    client_id: str | None = None,
+    client_ready: bool = True,
+    **overrides: object,
+) -> MagicMock:
+    """
+    Return a stub of a physical speaker: a visible player wrapping a Sendspin client.
+
+    That is how every Sendspin speaker that is not a web or app player is registered -
+    a hidden protocol player plus the player MA presents the device as - so a session
+    holds the visible one and resolves the client behind it for the static delay.
+
+    :param player_id: Id and display name of the visible player.
+    :param client_id: Id of the hidden Sendspin protocol player behind it.
+    :param client_ready: Whether that client can currently take a stream.
+    :param overrides: PlayerState attributes to set on the visible player.
+    """
+    player = _make_player(player_id, domain="universal_player", **overrides)
+    client_id = client_id or f"{player_id}_client"
+    protocol = OutputProtocol(
+        output_protocol_id=client_id,
+        name="Sendspin",
+        protocol_domain="sendspin",
+        available=client_ready,
+    )
+    client = _make_player(client_id, type=PlayerType.PROTOCOL)
+    player.get_output_protocol_by_domain = MagicMock(
+        side_effect=lambda domain: protocol if domain == "sendspin" else None
+    )
+    player.get_protocol_player = MagicMock(
+        side_effect=lambda protocol_id: client if protocol_id == client_id else None
+    )
+    return player
+
+
 def _make_player(player_id: str, *, domain: str = "sendspin", **overrides: object) -> MagicMock:
     """
     Return a stub player carrying just the state a calibration session reads.
@@ -617,6 +749,10 @@ def _make_player(player_id: str, *, domain: str = "sendspin", **overrides: objec
     player.player_id = player_id
     player.provider.domain = domain
     player.extra_data = {}
+    # a player of another provider renders over Sendspin only if something says so;
+    # _make_speaker is what wires that up
+    player.get_output_protocol_by_domain = MagicMock(return_value=None)
+    player.get_protocol_player = MagicMock(return_value=None)
     state: dict[str, object] = {
         "name": player_id,
         "available": True,
