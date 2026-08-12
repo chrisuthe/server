@@ -98,6 +98,8 @@ from .constants import (
     CONF_PAIRING_TOKEN,
     CONF_SENDSPIN_STATIC_DELAY,
     DEFAULT_SENDSPIN_STATIC_DELAY,
+    MAX_SENDSPIN_STATIC_DELAY,
+    MIN_SENDSPIN_STATIC_DELAY,
     PAIR_METHOD_DYNAMIC_PIN,
     PAIR_METHOD_PIN,
     PAIR_METHOD_STATIC_PIN,
@@ -1081,6 +1083,15 @@ class SendspinPlayer(SendspinBasePlayer):
                 return rates
         return [(44100, 16)]
 
+    @property
+    def supports_static_delay(self) -> bool:
+        """Return whether the live player role accepts a static delay."""
+        player_role = self._player_role
+        return (
+            player_role is not None
+            and PlayerCommand.SET_STATIC_DELAY in player_role.state_supported_commands
+        )
+
     def preserve_control_features_from(self, other: SendspinPlayer) -> None:
         """Keep the first registration's volume/mute features as a workaround for Cast."""
         for feature in (PlayerFeature.VOLUME_SET, PlayerFeature.VOLUME_MUTE):
@@ -2059,17 +2070,14 @@ class SendspinPlayer(SendspinBasePlayer):
                     )
                 )
 
-        if (
-            player_role is not None
-            and PlayerCommand.SET_STATIC_DELAY in player_role.state_supported_commands
-        ):
+        if self.supports_static_delay:
             entries.append(
                 ConfigEntry(
                     key=CONF_SENDSPIN_STATIC_DELAY,
                     type=ConfigEntryType.INTEGER,
                     required=False,
                     default_value=self.static_delay_default_ms,
-                    range=(0, 5000),
+                    range=(MIN_SENDSPIN_STATIC_DELAY, MAX_SENDSPIN_STATIC_DELAY),
                     immediate_apply=True,
                     # Not a advanced option since this will only show up for players where it is likely
                     # necessary to adjust the delay.
