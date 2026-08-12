@@ -27,6 +27,7 @@ from music_assistant.providers.pandora.constants import (
     CONF_DEVICE_UUID,
     CREATE_STATION_ENDPOINT,
     PLAYBACK_SOURCE_ENDPOINT,
+    QUALITY_HIGH,
     REMOVE_STATION_ENDPOINT,
     RETRY_REASON_STREAM_VIOLATION,
     SEED_SEARCH_ENDPOINT,
@@ -84,6 +85,7 @@ def _provider(
     provider.http_session = Mock(closed=False)
     provider._sessions = {}
     provider._high_quality_available = False
+    provider._on_demand_available = False
     pending = list(payloads or [_tracks()])
     station_list = stations or []
 
@@ -413,6 +415,46 @@ async def test_hydrated_track_matches_playlist_tracks_identity() -> None:
     assert listed.album is not None
     assert looked_up.album.item_id == listed.album.item_id == "AL:900"
     assert looked_up.artists[0].item_id == listed.artists[0].item_id == "AR:800"
+
+
+async def test_get_track_from_a_fragment_makes_no_catalogue_call() -> None:
+    """The fragment already describes the track, and Music Assistant resolves items one by one."""
+    provider, calls = _annotating_provider(_HYDRATED)
+    await provider.get_playlist_tracks(STATION_ID)
+    calls.clear()
+    track = await provider.get_track("TR:S0")
+    assert track.name == "Song 0"
+    assert calls == []
+
+
+async def test_get_track_resolves_a_catalogue_id_no_fragment_holds() -> None:
+    """A track found by search is addressed by id alone, so this is its only route to resolve."""
+    provider, _ = _annotating_provider(
+        {"TR:1809020": {"pandoraId": "TR:1809020", "name": "Catalogue Song", "duration": 214}}
+    )
+    track = await provider.get_track("TR:1809020")
+    assert track.item_id == "TR:1809020"
+    assert track.name == "Catalogue Song"
+    assert track.duration == 214
+
+
+async def test_get_track_reuses_an_already_fetched_record() -> None:
+    """A record already in hand is not fetched again, as for albums and artists above."""
+    record = {"pandoraId": "TR:X9", "name": "Catalogue Song"}
+    provider, calls = _annotating_provider({**_HYDRATED, "TR:X9": record})
+    await provider.get_playlist_tracks(STATION_ID)
+    calls.clear()
+    track = await provider.get_track("TR:X9")
+    assert track.name == "Catalogue Song"
+    assert calls == []
+
+
+async def test_unentitled_account_is_refused_a_catalogue_track() -> None:
+    """A track this account cannot play must be refused by name, not looked up first."""
+    provider, calls = _annotating_provider(_HYDRATED, on_demand=False)
+    with pytest.raises(MediaNotFoundError, match="not available on this Pandora account"):
+        await provider.get_track("TR:1809020")
+    assert calls == []
 
 
 def _two_station_provider() -> tuple[PandoraProvider, dict[str, Any]]:
@@ -1209,8 +1251,6 @@ async def test_a_catalogue_track_is_minted_per_play() -> None:
     assert details.stream_type is StreamType.HTTP
     assert details.path == MINTED_URL
     assert details.duration == 214
-    # the mint names its own encoding; it is never asked for the account's preferred one
-    assert details.audio_format.content_type is ContentType.AAC
     assert [url for url, _ in calls] == [PLAYBACK_SOURCE_ENDPOINT]
     assert calls[0][1] == {
         "sourceId": "TR:1809020",
@@ -1218,6 +1258,37 @@ async def test_a_catalogue_track_is_minted_per_play() -> None:
         "includeSource": True,
         "deviceUuid": DEVICE_UUID,
     }
+
+
+async def test_the_mint_names_its_own_encoding_not_the_account_preference() -> None:
+    """
+    An account whose fragments arrive as MP3 still gets the encoding the mint actually made.
+
+    Describing an AAC stream as MP3 hands the player the wrong container for the bytes, so
+    the account's quality preference must not reach a minted stream at all.
+    """
+    provider, _ = _minting_provider()
+    provider._high_quality_available = True
+    provider.config = Mock(instance_id="pandora--test", get_value=Mock(return_value=QUALITY_HIGH))
+    assert provider._audio_format().content_type is ContentType.MP3
+    details = await provider.get_stream_details("TR:1809020", MediaType.TRACK)
+    assert details.audio_format.content_type is ContentType.AAC
+
+
+async def test_an_mp3_mint_is_described_as_mp3() -> None:
+    """Pandora mints MP3 too, and a standard-quality account must not force AAC onto it."""
+    provider, _ = _minting_provider({**_MINTED_ITEM, "encoding": "mp3-hifi"})
+    assert provider._audio_format().content_type is ContentType.AAC
+    details = await provider.get_stream_details("TR:1809020", MediaType.TRACK)
+    assert details.audio_format.content_type is ContentType.MP3
+
+
+async def test_a_mint_that_names_no_encoding_falls_back_to_aac() -> None:
+    """Every measured mint named one, but an unnamed encoding must still play rather than fail."""
+    item = {key: value for key, value in _MINTED_ITEM.items() if key != "encoding"}
+    provider, _ = _minting_provider(item)
+    details = await provider.get_stream_details("TR:1809020", MediaType.TRACK)
+    assert details.audio_format.content_type is ContentType.AAC
 
 
 async def test_a_minted_stream_carries_pandoras_loudness_and_seekability() -> None:
@@ -1265,7 +1336,7 @@ async def test_a_mint_without_an_audio_url_is_refused() -> None:
 async def test_an_unentitled_account_is_refused_before_the_mint() -> None:
     """The refusal is certain, so it costs no round trip and no NO_ENTITLEMENTS answer."""
     provider, calls = _minting_provider(on_demand=False)
-    with pytest.raises(MediaNotFoundError, match="no longer available from Pandora"):
+    with pytest.raises(MediaNotFoundError, match="not available on this Pandora account"):
         await provider.get_stream_details("TR:1809020", MediaType.TRACK)
     assert calls == []
 

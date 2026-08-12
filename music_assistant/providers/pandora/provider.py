@@ -339,11 +339,18 @@ class PandoraProvider(MusicProvider):
         )
 
     async def get_track(self, prov_track_id: str) -> Track:
-        """Get full track details by id."""
-        if (found := self._find_track_with_fragment(prov_track_id)) is None:
-            raise MediaNotFoundError(f"Track {prov_track_id} not found")
-        track, fragment = found
-        return parse_track(self, track, fragment.annotations)
+        """
+        Get full track details by id.
+
+        A track a retained fragment still holds is described from that fragment, at no cost.
+        Anything else is a catalogue track and is looked up directly - which is how a track
+        found by search resolves at all.
+        """
+        if (found := self._find_track_with_fragment(prov_track_id)) is not None:
+            track, fragment = found
+            return parse_track(self, track, fragment.annotations)
+        record = self._find_annotation(prov_track_id) or await self._annotate(prov_track_id)
+        return parse_track_record(self, record, prov_track_id)
 
     async def get_album(self, prov_album_id: str) -> Album:
         """
@@ -425,7 +432,7 @@ class PandoraProvider(MusicProvider):
             # play perfectly well.
             if holders:
                 raise MediaNotFoundError(f"Track {item_id} expired while playback was stopped")
-            raise MediaNotFoundError(f"Track {item_id} is no longer available from Pandora")
+            raise MediaNotFoundError("On-demand playback is not available on this Pandora account")
         return await self._mint_stream_details(item_id)
 
     async def takeover_stream(self) -> None:
