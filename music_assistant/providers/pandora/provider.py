@@ -635,11 +635,10 @@ class PandoraProvider(MusicProvider):
                     await self.close()
                     raise ProviderUnavailableError("Pandora server error")
                 if response.status == 400:
-                    # A free/non-Premium account gets a 400 for on-demand track requests;
-                    # a per-track refusal must not tear down the session.
+                    # Pandora answers a refused playback request with a 400: the account may
+                    # not play on demand, or the source has nothing playable in it. Neither is
+                    # a broken session, so a refusal must not tear one down.
                     await raise_if_playback_refused(response)
-                    await self.close()
-                    raise InvalidDataError(f"Pandora API error: HTTP {response.status}")
                 if response.status >= 400:
                     await self.close()
                     raise InvalidDataError(f"Pandora API error: HTTP {response.status}")
@@ -720,18 +719,7 @@ class PandoraProvider(MusicProvider):
         if not self._on_demand_available:
             return {}
         try:
-            response = await self._api_request(
-                "POST",
-                CATALOG_ANNOTATE_ENDPOINT,
-                data={
-                    "pandoraIds": [track["pandoraId"] for track in tracks],
-                    "annotateAlbumTracks": False,
-                },
-                # enrichment must never fight the concurrent-stream limit: taking the stream
-                # over would stop playback on the user's other device as a side effect of
-                # fetching metadata.
-                exhausted_retry_reasons=frozenset({RETRY_REASON_STREAM_VIOLATION}),
-            )
+            return await self._annotate_objects([track["pandoraId"] for track in tracks])
         except (
             InvalidDataError,
             MediaNotFoundError,
@@ -755,6 +743,25 @@ class PandoraProvider(MusicProvider):
             # degrade into a silently unhydrated station.
             self.logger.warning("Could not annotate Pandora fragment tracks: %s", err)
             return {}
+
+    async def _annotate_objects(self, pandora_ids: list[str]) -> dict[str, Any]:
+        """
+        Return Pandora's catalogue records for the given ids, keyed by pandoraId.
+
+        Ungated: `_annotate_ids` is the entitlement-checked way in, and `_hydrate` answers
+        for an unentitled account before it gets here.
+
+        :param pandora_ids: The ids to annotate, in one request.
+        """
+        response = await self._api_request(
+            "POST",
+            CATALOG_ANNOTATE_ENDPOINT,
+            data={"pandoraIds": pandora_ids, "annotateAlbumTracks": False},
+            # a metadata lookup must never fight the concurrent-stream limit: taking the
+            # stream over would stop playback on the user's other device as a side effect
+            # of fetching metadata.
+            exhausted_retry_reasons=frozenset({RETRY_REASON_STREAM_VIOLATION}),
+        )
         return {key: value for key, value in response.items() if isinstance(value, dict)}
 
     async def _annotate_ids(self, pandora_ids: list[str]) -> dict[str, Any]:
@@ -774,15 +781,7 @@ class PandoraProvider(MusicProvider):
         """
         if not self._on_demand_available:
             raise MediaNotFoundError("On-demand playback is not available on this Pandora account")
-        response = await self._api_request(
-            "POST",
-            CATALOG_ANNOTATE_ENDPOINT,
-            data={"pandoraIds": pandora_ids, "annotateAlbumTracks": False},
-            # as in _hydrate: a metadata lookup must not take the stream over and stop
-            # playback on another device.
-            exhausted_retry_reasons=frozenset({RETRY_REASON_STREAM_VIOLATION}),
-        )
-        return {key: value for key, value in response.items() if isinstance(value, dict)}
+        return await self._annotate_objects(pandora_ids)
 
     async def _annotate_one(self, pandora_id: str) -> dict[str, Any]:
         """

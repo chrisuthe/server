@@ -229,6 +229,21 @@ async def test_unentitled_account_does_not_hydrate() -> None:
     assert fragment.annotations == {}
 
 
+async def test_unentitled_hydration_raises_and_logs_nothing() -> None:
+    """
+    Hydration answers for an unentitled account itself, rather than through the gated path.
+
+    Routing it through the entitlement check would raise once per fragment fetch, and the
+    degradation clause would then swallow that raise and log a warning for every station
+    an unentitled listener plays.
+    """
+    provider, calls = _annotating_provider(_HYDRATED, on_demand=False)
+    tracks = await provider.get_playlist_tracks(STATION_ID)
+    assert [track.item_id for track in tracks] == [f"TR:S{index}" for index in range(4)]
+    assert calls == []
+    assert cast("Mock", provider.logger).warning.mock_calls == []
+
+
 async def test_hydration_drops_a_non_record_value() -> None:
     """The map is keyed by id, but its values are not guaranteed to be records."""
     provider, _ = _annotating_provider({"TR:S0": None, "TR:S1": {"albumId": "AL:900"}})
