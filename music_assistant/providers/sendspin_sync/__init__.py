@@ -330,7 +330,12 @@ class SendspinSyncProvider(PluginProvider):
         The calibration track starts once and runs for the whole session; use
         ``solo_player`` to walk the speakers without restarting it. The session is
         torn down automatically after a period of inactivity, so a phone that goes
-        away can not leave the speakers muted.
+        away can not leave the speakers muted or measuring from a delay of zero.
+
+        Every speaker MA can write a static delay to is measured from zero, so a delay
+        already in place can not push its arrival outside the window the probe counts in.
+        Stopping the session puts each of those back, unless ``apply_measurements`` has
+        meanwhile written a correction over it.
 
         :param player_ids: The speakers to calibrate, in the order given, as
             ``eligible_players`` offers them.
@@ -341,7 +346,8 @@ class SendspinSyncProvider(PluginProvider):
         :raises UnsupportedFeaturedException: If a given player does not render over
             Sendspin, or can not be silenced.
         :raises ActionUnavailable: If a player is already muted or turned all the way
-            down, or is playing and ``force`` was not set.
+            down, is playing and ``force`` was not set, or the Sendspin provider is
+            not loaded.
         :return: The state of the started session.
         """
         async with self._session_lock:
@@ -402,9 +408,15 @@ class SendspinSyncProvider(PluginProvider):
 
         The offsets are *relative*: the probe measures every speaker against one
         arbitrary shared baseline, so only the differences between them mean anything.
-        Each player's existing static delay is folded in before normalising, so
-        re-running a calibration converges instead of drifting and a delay the user
-        set by hand is respected.
+        Each player's current static delay is folded in before normalising, which keeps
+        re-running a calibration convergent instead of drifting.
+
+        Starting a session takes off every static delay MA can write, so a measured
+        speaker comes in at 0 and its correction falls out of the measurement alone.
+        That correction therefore replaces whatever delay MA held for that speaker,
+        including one the user set by hand - the session put it back only if the speaker
+        was left unmeasured. What a speaker's own firmware applies is neither readable
+        nor removable and is already inside the arrival that was measured.
 
         Every speaker in the session is normalised the same way, including one whose
         client does not accept a static delay - it belongs in the baseline the others
@@ -467,6 +479,13 @@ class SendspinSyncProvider(PluginProvider):
                     result.manual[player_id] = delay_ms
                     continue
                 await sendspin.set_player_static_delay(target, delay_ms)
+                # Immediately after the write, and not in a pass of its own: the
+                # correction supersedes the zero the session put in place, so the
+                # session must stop owing this member its pre-session delay or the
+                # teardown would put that back over the value just written. Only a
+                # member a write actually landed on gets here, so one that was left
+                # out or failed still goes back to what it had.
+                self._session.keep_applied_static_delay(player_id)
                 result.applied[player_id] = delay_ms
             self._arm_session_timeout()
             return result

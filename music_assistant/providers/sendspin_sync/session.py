@@ -33,7 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 from math import isfinite
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from mashumaro import DataClassDictMixin
 from music_assistant_models.constants import PLAYER_CONTROL_NONE
@@ -63,6 +63,7 @@ if TYPE_CHECKING:
 
     from music_assistant.mass import MusicAssistant
     from music_assistant.models.player import Player
+    from music_assistant.providers.sendspin.provider import SendspinProvider
 
 # Name of the hidden anchor player. It is never shown in the UI, but it does end
 # up in logs and diagnostics, so it names what it is.
@@ -139,6 +140,16 @@ class CalibrationSessionState(DataClassDictMixin):
 
 
 @dataclass(frozen=True, slots=True)
+class StaticDelaySnapshot:
+    """The static delay a session took off a member, and the player to write it back to."""
+
+    # the Sendspin player the delay belongs to, held rather than resolved again at
+    # teardown: a member whose visible player has gone by then can no longer be resolved
+    sendspin_player_id: str
+    delay_ms: int
+
+
+@dataclass(frozen=True, slots=True)
 class PlayerSnapshot:
     """Everything a calibration session must put back on a player it commandeered."""
 
@@ -177,6 +188,10 @@ class CalibrationSession:
         self._shared_session = shared_session
         self._snapshots = snapshots
         self._silenced: dict[str, SilenceMethod] = {}
+        # what this session zeroed and still owes back, by member id. Both records at
+        # once, like _silenced: an entry means the delay was taken off and not yet put
+        # back, and it is dropped by the restore or by an apply that superseded it.
+        self._zeroed_delays: dict[str, StaticDelaySnapshot] = {}
         self._soloed_player_id: str | None = None
         self._stopped = False
 
@@ -193,7 +208,9 @@ class CalibrationSession:
         """
         Commandeer the given players and group them onto a fresh calibration anchor.
 
-        The session is silent until :meth:`begin` starts its stream.
+        The session is silent until :meth:`begin` starts its stream. Every member MA can
+        write a static delay to is measured from zero, so what it takes off is put back
+        by :meth:`stop`.
 
         :param mass: MusicAssistant instance.
         :param logger: Logger of the owning provider.
@@ -207,7 +224,8 @@ class CalibrationSession:
         :raises PlayerUnavailableError: If a given player is unknown or unavailable.
         :raises UnsupportedFeaturedException: If a given player does not render over
             Sendspin, or can not be silenced.
-        :raises ActionUnavailable: If a player is busy playing and ``force`` was not set.
+        :raises ActionUnavailable: If a player is busy playing and ``force`` was not set,
+            or the Sendspin provider is not loaded.
         :return: The commandeered, not yet streaming session.
         """
         if not player_ids:
@@ -226,19 +244,21 @@ class CalibrationSession:
         _reject_silent_players(players, translation_owner)
         if not force:
             _reject_busy_players(players, translation_owner)
+        sendspin = _require_sendspin(mass, translation_owner)
         snapshots = {player.player_id: _snapshot(player) for player in players}
         shared_session = await SharedPlaybackSession.create_remote(
             mass,
             owner_instance_id=owner_instance_id,
             display_name=ANCHOR_DISPLAY_NAME,
         )
-        # the session only owns what it managed to group, so a failure halfway
+        # the session only owns what it managed to group and zero, so a failure halfway
         # restores those players and leaves the untouched ones alone
         session = cls(mass, logger, translation_owner, shared_session, {})
         try:
             for player in players:
                 await shared_session.add_guest_listener(player.player_id)
                 session._snapshots[player.player_id] = snapshots[player.player_id]
+                await session._zero_static_delay(sendspin, player)
         except Exception:
             await session.stop()
             raise
@@ -346,6 +366,21 @@ class CalibrationSession:
                 await self._silence(other_id)
         self._soloed_player_id = player_id
 
+    def keep_applied_static_delay(self, player_id: str) -> None:
+        """
+        Take a member out of the static delay restore, once a correction was written to it.
+
+        A correction is an absolute delay written over the zero this session put in
+        place, so putting the member's pre-session delay back at teardown would overwrite
+        it with the very value it was computed to replace. Call this for each member a
+        correction actually landed on; the rest are left to go back to what they had.
+
+        Idempotent, and a no-op for a member this session never zeroed.
+
+        :param player_id: The session member whose new delay must survive teardown.
+        """
+        self._zeroed_delays.pop(player_id, None)
+
     async def stop(self) -> None:
         """
         End the session and restore every player it commandeered.
@@ -387,9 +422,10 @@ class CalibrationSession:
             self.logger.warning("Could not stop the calibration stream: %s", err)
 
     async def _restore_players(self) -> None:
-        """Put volume, mute, group membership, power and playback back as they were found."""
+        """Put delay, volume, mute, group membership, power and playback back as found."""
         for snapshot in self._snapshots.values():
             await self._restore_player(snapshot)
+        self._report_stranded_static_delays()
 
     async def _restore_player(self, snapshot: PlayerSnapshot) -> None:
         """
@@ -407,6 +443,12 @@ class CalibrationSession:
             )
             self._release_stale_mute_lock(player)
             return
+        # ahead of the steps below: releasing a player from the group and putting its
+        # power back can take its Sendspin client offline, and the delay can not be
+        # written to a client that is no longer there
+        await self._restore_step(
+            player, "restore the static delay", self._restore_static_delay(snapshot.player_id)
+        )
         await self._restore_step(
             player, "release from the calibration group", self._ungroup(player)
         )
@@ -438,6 +480,80 @@ class CalibrationSession:
             # and one failure may not strand the rest of the restore.
             # CancelledError is a BaseException and still propagates.
             self.logger.warning("Could not %s for player %s: %s", what, player.state.name, err)
+
+    async def _zero_static_delay(self, sendspin: SendspinProvider, player: Player) -> None:
+        """
+        Take MA's static delay off a member, so it is measured from zero.
+
+        A static delay advances a client, so a large one - a 250 ms factory default, say -
+        moves the speaker's arrival outside the window a probe can place a chirp period
+        in, and the reading folds to a plausible number that passes every check. What is
+        left once the delay is gone is the speaker's own latency, which is small enough
+        to stay inside that window. Folding the delay back in afterwards can not recover
+        a folded reading, so this has to happen before anything is measured.
+
+        Runs before the stream starts, which also keeps the timing shift the client makes
+        on taking the new value out of the settling window a :meth:`solo` allows for.
+
+        Does nothing for a member MA can not write a delay to: there is nothing to take
+        off, and whatever its firmware applies is inside the arrival that gets measured.
+        Nor for one that is already at zero, which also keeps the session from pinning a
+        value into the config of a speaker that was still tracking its model default.
+
+        :param sendspin: The Sendspin provider the delay is written through.
+        :param player: The member to zero, as the user sees it.
+        """
+        sendspin_player = resolve_sendspin_player(player)
+        if sendspin_player is None or not sendspin.supports_player_static_delay(
+            sendspin_player.player_id
+        ):
+            return
+        delay_ms = sendspin.get_player_static_delay(sendspin_player.player_id)
+        if delay_ms == 0:
+            return
+        await sendspin.set_player_static_delay(sendspin_player.player_id, 0)
+        # recorded only once the write landed, so a failed one leaves nothing to undo
+        self._zeroed_delays[player.player_id] = StaticDelaySnapshot(
+            sendspin_player.player_id, delay_ms
+        )
+
+    async def _restore_static_delay(self, player_id: str) -> None:
+        """
+        Give a member back the static delay this session took off it.
+
+        A no-op for a member that was never zeroed, or whose delay a correction has
+        already superseded - see :meth:`keep_applied_static_delay`.
+        """
+        zeroed = self._zeroed_delays.pop(player_id, None)
+        if zeroed is None:
+            return
+        try:
+            # resolved again rather than held from the start of the session: a session
+            # runs for as long as it takes to walk a house, and the Sendspin provider
+            # that carries the delay may have reloaded in the meantime
+            sendspin = _require_sendspin(self.mass, self.translation_owner)
+            await sendspin.set_player_static_delay(zeroed.sendspin_player_id, zeroed.delay_ms)
+        except Exception:
+            # keep the record so the sweep at the end of the restore can name the value
+            self._zeroed_delays[player_id] = zeroed
+            raise
+
+    def _report_stranded_static_delays(self) -> None:
+        """
+        Warn about every static delay this session zeroed and could not put back.
+
+        Zeroing is persisted in the player's config, so a speaker that has meanwhile gone
+        stays at zero until something sets it again - and a user has no reason to suspect
+        it. Naming the value it should carry is all a finished session can still do.
+        """
+        for player_id, zeroed in self._zeroed_delays.items():
+            self.logger.warning(
+                "Player %s is left with a static delay of 0 after calibration; "
+                "set it back to %s ms by hand",
+                player_id,
+                zeroed.delay_ms,
+            )
+        self._zeroed_delays.clear()
 
     async def _ungroup(self, player: Player) -> None:
         """Release a player from the calibration group."""
@@ -661,10 +777,11 @@ def resolve_static_delays(
     earliest speaker where it is and pulling every later one forward to meet it, so the
     whole group converges on the earliest arrival and that speaker is given zero.
 
-    The delay each player already carries is part of the sum, which makes this
-    converge rather than drift: re-measuring an already corrected group yields the
-    same delays again instead of stacking a second correction on the first, and a
-    delay the user set by hand for an amp is respected instead of being flattened.
+    The delay each player already carries is part of the sum, which makes this converge
+    rather than drift: handed a group's current delays, re-measuring it yields those same
+    delays again instead of stacking a second correction on the first. A calibration
+    session takes off every delay it can write before it measures, so those players come
+    in at 0 and their correction falls out of the measurement alone.
 
     Refuses rather than clamps. A measurement implying a delay past the end of the
     supported range is not a speaker latency, and the largest plausible-looking value
@@ -712,6 +829,24 @@ def resolve_static_delays(
                 translation_owner=translation_owner,
             )
     return delays_ms
+
+
+def _require_sendspin(mass: MusicAssistant, translation_owner: str) -> SendspinProvider:
+    """
+    Return the Sendspin provider a session reads and writes static delays through.
+
+    :param mass: MusicAssistant instance.
+    :param translation_owner: Translation owner for the error raised here.
+    :raises ActionUnavailable: If the Sendspin provider is not loaded.
+    """
+    sendspin = cast("SendspinProvider | None", mass.get_provider(SENDSPIN_DOMAIN))
+    if sendspin is None:
+        raise ActionUnavailable(
+            "The Sendspin provider is not available",
+            translation_key="sendspin_unavailable",
+            translation_owner=translation_owner,
+        )
+    return sendspin
 
 
 def _validate_player(mass: MusicAssistant, player_id: str, translation_owner: str) -> Player:

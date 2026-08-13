@@ -833,6 +833,98 @@ async def test_measurements_are_refused_when_sendspin_is_gone() -> None:
         await provider.apply_measurements({"a": 0.0})
 
 
+async def test_a_full_cycle_leaves_the_measured_speakers_on_their_correction() -> None:
+    """
+    Start, measure, apply and stop: the speakers end on the delays the run computed.
+
+    The applied correction supersedes the zero the session put in place, so the restore
+    may not put the pre-session delay back over it - that value is exactly what the
+    correction was computed to replace.
+    """
+    provider = await _setup_provider()
+    delays_ms = {"a": 250, "b": 0}
+    _stub_sendspin(provider, delays_ms)
+    await _run_real_session(provider, ["a", "b"])
+    assert delays_ms == {"a": 0, "b": 0}
+
+    result = await provider.apply_measurements({"a": 10.0, "b": 55.0})
+    await provider.stop_session()
+
+    assert result.applied == {"a": 0, "b": 45}
+    assert delays_ms == {"a": 0, "b": 45}
+
+
+async def test_a_session_that_ends_without_an_apply_gives_every_delay_back() -> None:
+    """A run the user abandons leaves the speakers exactly as it found them."""
+    provider = await _setup_provider()
+    delays_ms = {"a": 250, "b": 30}
+    _stub_sendspin(provider, delays_ms)
+    await _run_real_session(provider, ["a", "b"])
+
+    await provider.stop_session()
+
+    assert delays_ms == {"a": 250, "b": 30}
+
+
+async def test_a_refused_apply_leaves_every_delay_to_be_restored() -> None:
+    """Nothing is written, so nothing supersedes the restore and every speaker goes back."""
+    provider = await _setup_provider()
+    delays_ms = {"a": 250, "b": 30}
+    _stub_sendspin(provider, delays_ms)
+    await _run_real_session(provider, ["a", "b"])
+
+    with pytest.raises(InvalidDataError):
+        await provider.apply_measurements({"a": 0.0, "b": 99_000.0})
+    await provider.stop_session()
+
+    assert delays_ms == {"a": 250, "b": 30}
+
+
+async def test_a_speaker_the_correction_could_not_reach_goes_back_to_what_it_had() -> None:
+    """
+    A member reported for the user to adjust by hand keeps the delay it started with.
+
+    Its result is an increment on whatever its firmware applies, not an absolute MA
+    wrote, so there is nothing on the speaker for the restore to overwrite.
+    """
+    provider = await _setup_provider()
+    delays_ms = {"a": 250, "fixed": 0}
+    _stub_sendspin(provider, delays_ms, non_adjustable={"fixed"})
+    await _run_real_session(provider, ["a", "fixed"])
+
+    result = await provider.apply_measurements({"a": 10.0, "fixed": 55.0})
+    await provider.stop_session()
+
+    assert result.manual == {"fixed": 45}
+    # 'fixed' was never written to, on the way in or out; 'a' keeps its correction
+    assert delays_ms == {"a": 0, "fixed": 0}
+
+
+async def test_a_timed_out_session_gives_the_delays_back() -> None:
+    """A phone that walks away may not leave the speakers measuring from zero."""
+    provider = await _setup_provider()
+    delays_ms = {"a": 250}
+    _stub_sendspin(provider, delays_ms)
+    await _run_real_session(provider, ["a"])
+
+    await provider._handle_session_timeout()
+
+    assert delays_ms == {"a": 250}
+    assert await provider.get_session() is None
+
+
+async def test_unloading_the_plugin_gives_the_delays_back() -> None:
+    """Nor may a reload of the plugin itself."""
+    provider = await _setup_provider()
+    delays_ms = {"a": 250}
+    _stub_sendspin(provider, delays_ms)
+    await _run_real_session(provider, ["a"])
+
+    await provider.unload()
+
+    assert delays_ms == {"a": 250}
+
+
 def _stub_session(player_ids: list[str] | None = None) -> MagicMock:
     """Return a stub calibration session that reports itself live."""
     session = MagicMock()
@@ -851,6 +943,43 @@ async def _run_session(provider: SendspinSyncProvider, player_ids: list[str]) ->
     with patch.object(CalibrationSession, "create", AsyncMock(return_value=session)):
         await provider.start_session(player_ids)
     return session
+
+
+async def _run_real_session(provider: SendspinSyncProvider, player_ids: list[str]) -> None:
+    """
+    Start an actual calibration session over the given players, on a stubbed anchor.
+
+    Unlike :func:`_run_session` this drives the real session, so the static delays it
+    zeroes on the way in and puts back at teardown are exercised too.
+
+    :param provider: The plugin provider to start the session on.
+    :param player_ids: The players to calibrate. Register them first with
+        :func:`_stub_sendspin`.
+    """
+    mass = _mock_mass(provider)
+    for command in ("cmd_volume_mute", "cmd_volume_set", "cmd_set_members", "cmd_power"):
+        setattr(mass.players, command, AsyncMock())
+    mass.players.cmd_play = AsyncMock()
+    mass.players.cmd_resume = AsyncMock()
+    mass.player_queues.play_media = AsyncMock()
+    mass.player_queues.stop = AsyncMock()
+    mass.player_queues.get = MagicMock(return_value=None)
+    with patch(
+        "music_assistant.providers.sendspin_sync.session.SharedPlaybackSession"
+    ) as shared_cls:
+        shared_cls.create_remote = AsyncMock(return_value=_stub_anchor())
+        await provider.start_session(player_ids)
+
+
+def _stub_anchor() -> MagicMock:
+    """Return a stub of the shared playback session a calibration group is anchored on."""
+    anchor = MagicMock()
+    anchor.player_id = "calibration_anchor"
+    anchor.queue_id = "calibration_anchor"
+    anchor.add_guest_listener = AsyncMock()
+    anchor.remove_guest_listener = AsyncMock()
+    anchor.close = AsyncMock()
+    return anchor
 
 
 def _stub_sendspin(
@@ -919,6 +1048,18 @@ def _stub_players(provider: SendspinSyncProvider, session_members: dict[str, str
         player.state.playback_state = PlaybackState.IDLE
         player.state.mute_control = "mute_control"
         player.state.volume_control = "volume_control"
+        # the rest of the state a real session snapshots and restores, so a test can
+        # drive one end to end rather than against a stub session
+        player.state.powered = True
+        player.state.power_control = "power_control"
+        player.state.volume_muted = False
+        player.state.volume_level = 42
+        player.state.synced_to = None
+        player.state.active_group = None
+        player.state.active_source = None
+        player.state.current_media = None
+        player.state.supported_features = set()
+        player.extra_data = {}
         if sendspin_id == player_id:
             player.provider.domain = SENDSPIN_DOMAIN
         else:
