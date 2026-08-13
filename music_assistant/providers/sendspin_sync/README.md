@@ -86,22 +86,30 @@ speaker on, so one that was off is switched back off rather than resumed.
 
 ### Measuring from zero
 
-`start_session` also sets every member's static delay to **0** before anything is
-measured, and puts it back when the session ends.
+`start_session` also sets the static delay of every member MA can write to **0**
+before anything is measured, and puts it back when the session ends.
 
 A static delay advances a client, so a speaker carrying a large one — a 250 ms
-factory default, say — arrives far enough ahead that its true offset falls outside
-the ±250 ms a 500 ms chirp period can place it in, and the reading **folds** to a
-plausible number that passes every check the probe makes. The arithmetic below
-folds each speaker's current delay back in, but no arithmetic afterwards recovers
-a folded reading. What is left once the delay is gone is the speaker's own
-intrinsic latency — whatever sits downstream of its audio port — which is tens of
-milliseconds rather than hundreds, and comfortably inside the window.
+factory default, say — arrives far enough ahead that it spends most of the ±500 ms
+the 1 s period resolves on its own configuration rather than on anything physical,
+and a large enough one falls outside that window entirely and comes back
+**folded** as a plausible number that passes every check the probe makes. The
+arithmetic below folds each speaker's current delay back in, but no arithmetic
+afterwards recovers a folded reading. What is left once the delay is gone is the
+speaker's own intrinsic latency — whatever sits downstream of its audio port —
+which should be tens of milliseconds rather than hundreds, and sits comfortably
+near the middle of the window.
+
+This and the period length are complementary, not alternatives: zeroing keeps a
+delay MA configured out of the measurement, and the window covers what cannot be
+zeroed — a speaker MA cannot write to, carrying a large delay of its own.
 
 The zeroing happens before the stream starts, so the timing shift a client makes
 on taking the new value lands outside any measurement. A member MA cannot write a
 delay to is left alone: there is nothing to take off, and whatever its firmware
-applies is already inside the arrival that gets measured.
+applies is already inside the arrival that gets measured. So is one that is
+already at zero, which keeps a session from pinning a value into the config of a
+speaker that was still tracking the default its client advertises.
 
 The restore is what makes this safe to run — a session that ended without it would
 leave a user's speakers at zero with their factory or hand-set delays gone, which
@@ -178,9 +186,10 @@ Across sessions the delays MA can write come in at 0, because
 [the session zeroed them](#measuring-from-zero), so their correction falls out of
 the measurement alone. A delay the user had set by hand on such a speaker is
 therefore **replaced** rather than kept as part of the baseline: if it was
-compensating real latency the run re-derives the same value from the measurement,
-and if it was not, it is gone. What only a device's own firmware knows about is
-neither readable nor removable, and stays inside the arrival that was measured.
+compensating real latency the run re-derives the same alignment from the
+measurement, and if it was not, it is gone. What only a device's own firmware knows
+about is neither readable nor removable, and stays inside the arrival that was
+measured.
 
 Every member of the session must be measured. Correcting a subset would leave the
 rest normalised against a different baseline, which is worse than not correcting at
@@ -260,9 +269,8 @@ term. MA holds no static delay for it — there is no config entry to hold one �
 and whatever its firmware applies is already inside the arrival that was just
 measured, so 0 keeps the sum honest and stable across re-runs. Since the session
 [zeroed every delay it could write](#measuring-from-zero), the adjustable speakers
-genuinely come in at 0 as well: one assumption now covers the whole group, and a
-`manual` value stays the increment described above rather than quietly becoming
-something else.
+genuinely come in at 0 as well, so one assumption now covers the whole group
+instead of two.
 
 `adjustable` is on `eligible_players` rather than discovered at apply time on
 purpose: the user is told which speakers they will have to correct by hand while

@@ -416,14 +416,15 @@ class SendspinSyncProvider(PluginProvider):
         The offsets are *relative*: the probe measures every speaker against one
         arbitrary shared baseline, so only the differences between them mean anything.
         Each player's current static delay is folded in before normalising, which keeps
-        re-running a calibration convergent instead of drifting.
+        re-running a calibration convergent instead of drifting. Starting a session takes
+        off every static delay MA can write, so on a first apply those come in at 0 and
+        the correction falls out of the measurement alone - replacing whatever delay MA
+        held for that speaker, including one the user set by hand. What a speaker's own
+        firmware applies is neither readable nor removable and is already inside the
+        arrival that was measured.
 
-        Starting a session takes off every static delay MA can write, so a measured
-        speaker comes in at 0 and its correction falls out of the measurement alone.
-        That correction therefore replaces whatever delay MA held for that speaker,
-        including one the user set by hand - the session put it back only if the speaker
-        was left unmeasured. What a speaker's own firmware applies is neither readable
-        nor removable and is already inside the arrival that was measured.
+        A correction supersedes the session's restore for the speakers it was written to;
+        one left unmeasured, or whose write failed, still goes back to what it had.
 
         Every speaker in the session is normalised the same way, including one whose
         client does not accept a static delay - it belongs in the baseline the others
@@ -486,12 +487,8 @@ class SendspinSyncProvider(PluginProvider):
                     result.manual[player_id] = delay_ms
                     continue
                 await sendspin.set_player_static_delay(target, delay_ms)
-                # Immediately after the write, and not in a pass of its own: the
-                # correction supersedes the zero the session put in place, so the
-                # session must stop owing this member its pre-session delay or the
-                # teardown would put that back over the value just written. Only a
-                # member a write actually landed on gets here, so one that was left
-                # out or failed still goes back to what it had.
+                # after the write, never before: only a correction that landed may
+                # supersede the session's restore. See keep_applied_static_delay.
                 self._session.keep_applied_static_delay(player_id)
                 result.applied[player_id] = delay_ms
             self._arm_session_timeout()

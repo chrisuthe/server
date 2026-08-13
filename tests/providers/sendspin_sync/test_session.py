@@ -691,6 +691,28 @@ async def test_a_member_no_correction_landed_on_still_gets_its_delay_back() -> N
     assert _static_delays(mass) == {"a": 40, "b": 20}
 
 
+async def test_a_member_whose_delay_could_not_be_zeroed_is_owed_nothing_back() -> None:
+    """
+    A zero that never landed leaves the speaker on the delay it already had.
+
+    The takeover fails, so the members before it are restored; the one that raised is
+    only released, since putting a delay back over the one it still carries would be
+    writing a value the session never took off.
+    """
+    mass = _make_mass(
+        _make_player("a"),
+        _make_player("b"),
+        static_delays_ms={"a": 250, "b": 20},
+    )
+    _fail_for(_sendspin(mass).set_player_static_delay, "b", PlayerUnavailableError("gone"))
+
+    with pytest.raises(PlayerUnavailableError):
+        await _start(mass, ["a", "b"])
+
+    assert _static_delays(mass) == {"a": 250, "b": 20}
+    assert _delay_writes(mass) == [("a", 0), ("b", 0), ("a", 250)]
+
+
 async def test_a_failure_while_grouping_puts_back_what_it_had_already_zeroed() -> None:
     """A takeover that dies halfway leaves no speaker measuring from a delay of zero."""
     mass = _make_mass(

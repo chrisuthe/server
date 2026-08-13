@@ -144,8 +144,10 @@ class CalibrationSessionState(DataClassDictMixin):
 class StaticDelaySnapshot:
     """The static delay a session took off a member, and the player to write it back to."""
 
-    # the Sendspin player the delay belongs to, held rather than resolved again at
-    # teardown: a member whose visible player has gone by then can no longer be resolved
+    # the Sendspin player the delay came off, held rather than resolved again at
+    # teardown: a member whose Sendspin side has meanwhile gone resolves to nothing, and
+    # one that reconnected in between could resolve to a different client than the delay
+    # was taken from
     sendspin_player_id: str
     delay_ms: int
 
@@ -529,22 +531,23 @@ class CalibrationSession:
         """
         Give a member back the static delay this session took off it.
 
+        The value goes back as an explicit one, so a member that was still tracking the
+        default its client advertises is left carrying that default pinned.
+
         A no-op for a member that was never zeroed, or whose delay a correction has
         already superseded - see :meth:`keep_applied_static_delay`.
         """
-        zeroed = self._zeroed_delays.pop(player_id, None)
+        zeroed = self._zeroed_delays.get(player_id)
         if zeroed is None:
             return
-        try:
-            # resolved again rather than held from the start of the session: a session
-            # runs for as long as it takes to walk a house, and the Sendspin provider
-            # that carries the delay may have reloaded in the meantime
-            sendspin = _require_sendspin(self.mass, self.translation_owner)
-            await sendspin.set_player_static_delay(zeroed.sendspin_player_id, zeroed.delay_ms)
-        except Exception:
-            # keep the record so the sweep at the end of the restore can name the value
-            self._zeroed_delays[player_id] = zeroed
-            raise
+        # resolved again rather than held from the start of the session: a session runs
+        # for as long as it takes to walk a house, and the Sendspin provider that carries
+        # the delay may have reloaded in the meantime
+        sendspin = _require_sendspin(self.mass, self.translation_owner)
+        await sendspin.set_player_static_delay(zeroed.sendspin_player_id, zeroed.delay_ms)
+        # dropped only once the value is back, so anything that raised above is still
+        # owed and gets named by the sweep at the end of the restore
+        del self._zeroed_delays[player_id]
 
     def _report_stranded_static_delays(self) -> None:
         """
@@ -561,7 +564,6 @@ class CalibrationSession:
                 player_id,
                 zeroed.delay_ms,
             )
-        self._zeroed_delays.clear()
 
     async def _ungroup(self, player: Player) -> None:
         """Release a player from the calibration group."""

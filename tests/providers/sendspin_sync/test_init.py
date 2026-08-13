@@ -914,6 +914,27 @@ async def test_a_speaker_the_correction_could_not_reach_goes_back_to_what_it_had
     assert delays_ms == {"a": 0, "fixed": 0}
 
 
+async def test_a_speaker_that_stopped_accepting_a_delay_mid_session_gets_it_back() -> None:
+    """
+    A client whose support flapped across a reconnect is reported by hand and restored.
+
+    Its correction is an increment on whatever the device now applies rather than an
+    absolute MA wrote, so nothing superseded the delay the session took off it.
+    """
+    provider = await _setup_provider()
+    delays_ms = {"a": 0, "b": 250}
+    sendspin = _stub_sendspin(provider, delays_ms)
+    await _run_real_session(provider, ["a", "b"])
+    assert delays_ms == {"a": 0, "b": 0}
+    sendspin.supports_player_static_delay = MagicMock(side_effect=lambda p: p != "b")
+
+    result = await provider.apply_measurements({"a": 0.0, "b": 30.0})
+    await provider.stop_session()
+
+    assert result.manual == {"b": 30}
+    assert delays_ms == {"a": 0, "b": 250}
+
+
 async def test_a_timed_out_session_gives_the_delays_back() -> None:
     """A phone that walks away may not leave the speakers measuring from zero."""
     provider = await _setup_provider()
