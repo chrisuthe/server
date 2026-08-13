@@ -395,6 +395,239 @@ async def test_a_player_that_cannot_be_ungrouped_is_still_unmuted() -> None:
     assert not stuck.state.volume_muted
 
 
+async def test_start_measures_every_writable_speaker_from_zero() -> None:
+    """
+    A session takes MA's static delay off each member before anything is measured.
+
+    A delay advances a client, so one the size of a factory default moves the speaker's
+    arrival outside the window a chirp period can place it in and the reading folds to a
+    plausible wrong value. Folding the delay back in afterwards can not recover that.
+    """
+    mass = _make_mass(
+        _make_player("a"),
+        _make_player("b"),
+        static_delays_ms={"a": 250, "b": 20},
+    )
+
+    await _start(mass, ["a", "b"])
+
+    assert _static_delays(mass) == {"a": 0, "b": 0}
+
+
+async def test_start_zeroes_the_client_behind_a_physical_speaker() -> None:
+    """The delay belongs to the hidden Sendspin client, not the visible player."""
+    mass = _make_mass(_make_speaker("living_room"), static_delays_ms={"living_room_client": 120})
+
+    await _start(mass, ["living_room"])
+
+    assert _delay_writes(mass) == [("living_room_client", 0)]
+
+
+async def test_start_leaves_a_speaker_that_refuses_a_delay_alone() -> None:
+    """
+    A member MA can not write to has nothing to zero and is never written to.
+
+    Whatever its firmware applies is inside the arrival that gets measured, and MA can
+    neither read nor remove it.
+    """
+    mass = _make_mass(
+        _make_player("a"),
+        _make_player("fixed"),
+        static_delays_ms={"a": 250},
+        non_adjustable={"fixed"},
+    )
+
+    session = await _start(mass, ["a", "fixed"])
+    await session.stop()
+
+    assert _delay_writes(mass) == [("a", 0), ("a", 250)]
+
+
+async def test_start_writes_nothing_to_a_speaker_that_is_already_at_zero() -> None:
+    """
+    A speaker with no delay to take off is not written to at all.
+
+    Its reading can not fold, and writing a 0 it already has would pin that value into
+    the config of a speaker that was still tracking the default its client advertises.
+    """
+    mass = _make_mass(_make_player("a"), _make_player("b"), static_delays_ms={"a": 250})
+
+    session = await _start(mass, ["a", "b"])
+    await session.stop()
+
+    assert _delay_writes(mass) == [("a", 0), ("a", 250)]
+
+
+async def test_the_delays_are_zeroed_before_the_stream_starts() -> None:
+    """
+    Taking the delay off shifts the client's timing, so it happens outside the measurement.
+
+    A session that zeroed once its chirp train was already running would move the very
+    phase reference the first measurements are taken against.
+    """
+    mass = _make_mass(_make_player("a"), static_delays_ms={"a": 250})
+
+    with patch(
+        "music_assistant.providers.sendspin_sync.session.SharedPlaybackSession"
+    ) as shared_cls:
+        shared_cls.create_remote = AsyncMock(return_value=_make_shared_session())
+        await CalibrationSession.create(
+            mass, MagicMock(), "provider.sendspin_sync", "sendspin_sync--test", ["a"]
+        )
+
+    assert _static_delays(mass) == {"a": 0}
+    mass.player_queues.play_media.assert_not_awaited()
+
+
+async def test_stop_puts_every_zeroed_delay_back() -> None:
+    """
+    A session that ends leaves the speakers carrying what they carried before it.
+
+    Anything else is worse than the state the user started in, and one they may not
+    notice until the music sounds wrong.
+    """
+    mass = _make_mass(
+        _make_player("a"),
+        _make_player("b"),
+        static_delays_ms={"a": 250, "b": 20},
+    )
+    session = await _start(mass, ["a", "b"])
+    await session.solo("a")
+
+    await session.stop()
+
+    assert _static_delays(mass) == {"a": 250, "b": 20}
+
+
+async def test_stop_puts_the_delays_back_when_stopping_the_stream_fails() -> None:
+    """A stream that refuses to stop may not cost the user their static delays."""
+    mass = _make_mass(_make_player("a"), static_delays_ms={"a": 250})
+    session = await _start(mass, ["a"])
+    mass.player_queues.stop.side_effect = RuntimeError("queue is gone")
+
+    await session.stop()
+
+    assert _static_delays(mass) == {"a": 250}
+
+
+async def test_the_delay_goes_back_before_the_player_leaves_the_group() -> None:
+    """
+    The delay is written while the speaker is still certain to be reachable.
+
+    Releasing a player from the calibration group and putting its power back can take
+    its Sendspin client offline, and a write to a client that has gone raises.
+    """
+    mass = _make_mass(_make_player("a"), static_delays_ms={"a": 250})
+    session = await _start(mass, ["a"])
+    seen: list[int] = []
+    _shared_session(session).remove_guest_listener.side_effect = lambda _: seen.append(
+        _static_delays(mass)["a"]
+    )
+
+    await session.stop()
+
+    assert seen == [250]
+
+
+async def test_stop_restores_the_remaining_delays_when_one_write_fails() -> None:
+    """One speaker that will not take its delay back can not strand the rest at zero."""
+    mass = _make_mass(
+        _make_player("a"),
+        _make_player("b"),
+        static_delays_ms={"a": 250, "b": 20},
+    )
+    session = await _start(mass, ["a", "b"])
+    _fail_for(_sendspin(mass).set_player_static_delay, "a", PlayerUnavailableError("gone"))
+
+    await session.stop()
+
+    assert _static_delays(mass) == {"a": 0, "b": 20}
+
+
+async def test_a_member_that_vanished_is_named_rather_than_left_at_zero_in_silence() -> None:
+    """
+    A speaker that went away mid-session is reported with the delay it should get back.
+
+    The zero is persisted in its config, so it stays advanced by nothing until something
+    sets it again - and the user has no reason to suspect it.
+    """
+    logger = MagicMock()
+    mass = _make_mass(
+        _make_player("a"),
+        _make_player("b"),
+        static_delays_ms={"a": 250, "b": 20},
+    )
+    session = await _start(mass, ["a", "b"], logger=logger)
+    _vanish(mass, "a")
+
+    await session.stop()
+
+    assert _static_delays(mass) == {"a": 0, "b": 20}
+    assert any(call.args[1:] == ("a", 250) for call in logger.warning.call_args_list), (
+        logger.warning.call_args_list
+    )
+
+
+async def test_a_correction_that_was_applied_survives_the_restore() -> None:
+    """
+    A written correction replaces the zero, so the pre-session delay is not put over it.
+
+    The correction was computed to replace exactly that value; restoring it afterwards
+    would land the measurement on the wrong baseline.
+    """
+    mass = _make_mass(_make_player("a"), static_delays_ms={"a": 250})
+    session = await _start(mass, ["a"])
+    await _sendspin(mass).set_player_static_delay("a", 40)
+    session.keep_applied_static_delay("a")
+
+    await session.stop()
+
+    assert _static_delays(mass) == {"a": 40}
+
+
+async def test_a_member_no_correction_landed_on_still_gets_its_delay_back() -> None:
+    """Only the members a correction was actually written to are taken out of the restore."""
+    mass = _make_mass(
+        _make_player("a"),
+        _make_player("b"),
+        static_delays_ms={"a": 250, "b": 20},
+    )
+    session = await _start(mass, ["a", "b"])
+    await _sendspin(mass).set_player_static_delay("a", 40)
+    session.keep_applied_static_delay("a")
+
+    await session.stop()
+
+    assert _static_delays(mass) == {"a": 40, "b": 20}
+
+
+async def test_a_failure_while_grouping_puts_back_what_it_had_already_zeroed() -> None:
+    """A takeover that dies halfway leaves no speaker measuring from a delay of zero."""
+    mass = _make_mass(
+        _make_player("a"),
+        _make_player("b"),
+        static_delays_ms={"a": 250, "b": 20},
+    )
+    shared = _make_shared_session()
+    _fail_for(shared.add_guest_listener, "b", PlayerUnavailableError("gone"))
+
+    with pytest.raises(PlayerUnavailableError):
+        await _start(mass, ["a", "b"], shared=shared)
+
+    assert _static_delays(mass) == {"a": 250, "b": 20}
+
+
+async def test_a_session_refuses_to_start_without_the_sendspin_provider() -> None:
+    """Without Sendspin there is nothing to take a delay off, nor to give one back."""
+    mass = _make_mass(_make_player("a"))
+    mass.get_provider = MagicMock(return_value=None)
+
+    with pytest.raises(ActionUnavailable, match="Sendspin provider"):
+        await _start(mass, ["a"])
+
+    mass.player_queues.play_media.assert_not_awaited()
+
+
 async def test_a_solo_that_cannot_make_its_target_audible_fails() -> None:
     """
     A target that can not be unmuted is an error, not a session reporting it isolated.
@@ -645,6 +878,7 @@ async def _start(
     player_ids: list[str],
     force: bool = False,
     shared: MagicMock | None = None,
+    logger: MagicMock | None = None,
 ) -> CalibrationSession:
     """
     Return a started, streaming session anchored on a stubbed shared playback session.
@@ -653,6 +887,7 @@ async def _start(
     :param player_ids: The players to calibrate.
     :param force: Take over players that are busy playing.
     :param shared: Anchor stub to use, so a caller can inspect it after a failed start.
+    :param logger: Logger stub to use, so a caller can inspect what the session reported.
     """
     with patch(
         "music_assistant.providers.sendspin_sync.session.SharedPlaybackSession"
@@ -660,7 +895,7 @@ async def _start(
         shared_cls.create_remote = AsyncMock(return_value=shared or _make_shared_session())
         session = await CalibrationSession.create(
             mass,
-            MagicMock(),
+            logger or MagicMock(),
             "provider.sendspin_sync",
             "sendspin_sync--test",
             player_ids,
@@ -668,6 +903,21 @@ async def _start(
         )
     await session.begin(MagicMock())
     return session
+
+
+def _vanish(mass: MagicMock, player_id: str) -> None:
+    """
+    Make one player unknown to the given stub MusicAssistant, as a disconnect does.
+
+    :param mass: The stub MusicAssistant to take the player out of.
+    :param player_id: The player that has gone.
+    """
+    known = mass.players.get_player.side_effect
+
+    def _get_player(wanted_id: str, *args: object) -> MagicMock | None:
+        return None if wanted_id == player_id else cast("MagicMock | None", known(wanted_id, *args))
+
+    mass.players.get_player = MagicMock(side_effect=_get_player)
 
 
 def _fail_for(mock: AsyncMock, player_id: str, error: Exception) -> None:
@@ -778,13 +1028,23 @@ def _make_player(player_id: str, *, domain: str = "sendspin", **overrides: objec
     return player
 
 
-def _make_mass(*players: MagicMock, optimistic_volume: bool = True) -> MagicMock:
+def _make_mass(
+    *players: MagicMock,
+    optimistic_volume: bool = True,
+    static_delays_ms: dict[str, int] | None = None,
+    non_adjustable: set[str] | None = None,
+) -> MagicMock:
     """
     Return a stub MusicAssistant whose mute and volume commands move player state.
 
     :param players: The stub players to register.
     :param optimistic_volume: Whether a volume command lands in player state immediately.
         Sendspin's does not - it waits for the client to acknowledge it.
+    :param static_delays_ms: The static delay each *Sendspin* player starts out carrying,
+        keyed by that player's id and defaulting to 0. Reads and writes hit the same
+        mapping, so :func:`_static_delays` reports what a session left behind.
+    :param non_adjustable: Sendspin players whose client refuses a static delay. Reading
+        one raises, exactly as the real provider does.
     """
     registry = {player.player_id: player for player in players}
     mass = MagicMock()
@@ -809,9 +1069,25 @@ def _make_mass(*players: MagicMock, optimistic_volume: bool = True) -> MagicMock
     mass.player_queues.play_media = AsyncMock()
     mass.player_queues.stop = AsyncMock()
     mass.player_queues.get = MagicMock(return_value=_make_anchor_queue())
+    refused = non_adjustable or set()
+    delays_ms = dict(static_delays_ms or {})
+
+    def _get_delay(player_id: str) -> int:
+        if player_id in refused:
+            raise UnsupportedFeaturedException(player_id)
+        return delays_ms.get(player_id, 0)
+
+    async def _set_delay(player_id: str, delay_ms: int) -> None:
+        if player_id in refused:
+            raise UnsupportedFeaturedException(player_id)
+        delays_ms[player_id] = delay_ms
+
     sendspin = MagicMock()
     sendspin.is_virtual_player = MagicMock(return_value=False)
-    sendspin.supports_player_static_delay = MagicMock(return_value=True)
+    sendspin.supports_player_static_delay = MagicMock(side_effect=lambda p: p not in refused)
+    sendspin.get_player_static_delay = MagicMock(side_effect=_get_delay)
+    sendspin.set_player_static_delay = AsyncMock(side_effect=_set_delay)
+    sendspin.static_delays_ms = delays_ms
     mass.get_provider = MagicMock(return_value=sendspin)
     return mass
 
@@ -827,6 +1103,24 @@ def _make_anchor_queue() -> MagicMock:
 def _shared_session(session: CalibrationSession) -> MagicMock:
     """Return the stubbed shared playback session backing the given session."""
     return cast("MagicMock", session._shared_session)
+
+
+def _sendspin(mass: MagicMock) -> MagicMock:
+    """Return the stub Sendspin provider static delays are read and written through."""
+    return cast("MagicMock", mass.get_provider.return_value)
+
+
+def _static_delays(mass: MagicMock) -> dict[str, int]:
+    """Return the static delay every Sendspin player of the given stub now carries."""
+    return cast("dict[str, int]", _sendspin(mass).static_delays_ms)
+
+
+def _delay_writes(mass: MagicMock) -> list[tuple[str, int]]:
+    """Return every (sendspin_player_id, delay_ms) pair written, in order."""
+    return [
+        (call.args[0], call.args[1])
+        for call in _sendspin(mass).set_player_static_delay.await_args_list
+    ]
 
 
 def _mute_calls(mass: MagicMock) -> list[tuple[str, bool]]:
