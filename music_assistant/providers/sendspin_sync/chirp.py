@@ -25,9 +25,12 @@ SAMPLE_RATE = 48000
 BIT_DEPTH = 16
 CHANNELS = 2
 
-# one 60 ms chirp every 500 ms, both expressed in whole frames so the period
-# cannot drift
-PERIOD_FRAMES = SAMPLE_RATE // 2
+# one 60 ms chirp every second, both expressed in whole frames so the period
+# cannot drift. The period is also the measurement's unambiguous range: an arrival
+# more than half a period late is numbered onto the following chirp and comes back
+# folded, so one second resolves speakers spread across 500 ms - comfortably past
+# the ~200 ms real speakers have measured at.
+PERIOD_FRAMES = SAMPLE_RATE
 CHIRP_FRAMES = SAMPLE_RATE * 60 // 1000
 
 CHIRP_START_HZ = 500.0

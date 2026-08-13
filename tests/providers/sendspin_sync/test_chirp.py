@@ -29,11 +29,11 @@ ONSET_THRESHOLD = 1000
 
 
 def test_period_is_one_buffer_of_stereo_pcm() -> None:
-    """The generated period is exactly 500 ms of 48 kHz 16-bit stereo PCM_S16LE."""
+    """The generated period is exactly 1 second of 48 kHz 16-bit stereo PCM_S16LE."""
     assert (SAMPLE_RATE, BIT_DEPTH, CHANNELS) == (48000, 16, 2)
-    assert PERIOD_FRAMES == 24000
+    assert PERIOD_FRAMES == 48000
     assert CHIRP_FRAMES == 2880
-    assert len(build_chirp_period()) == 24000 * 2 * 2
+    assert len(build_chirp_period()) == 48000 * 2 * 2
 
 
 def test_period_is_reproducible() -> None:
@@ -47,11 +47,11 @@ def test_both_channels_carry_identical_content() -> None:
     assert samples[0::2] == samples[1::2]
 
 
-def test_chirp_onsets_are_exactly_24000_frames_apart() -> None:
-    """Repeating the period spaces consecutive chirp onsets exactly 500 ms apart."""
+def test_chirp_onsets_are_exactly_48000_frames_apart() -> None:
+    """Repeating the period spaces consecutive chirp onsets exactly 1 second apart."""
     onsets = _chirp_onsets(_left_channel(build_chirp_period() * 3))
     assert len(onsets) == 3
-    assert [later - earlier for earlier, later in pairwise(onsets)] == [24000, 24000]
+    assert [later - earlier for earlier, later in pairwise(onsets)] == [48000, 48000]
 
 
 def test_sweep_starts_and_ends_at_the_intended_frequencies() -> None:
