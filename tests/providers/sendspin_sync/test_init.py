@@ -198,28 +198,21 @@ async def test_api_commands_are_registered_and_released_on_unload() -> None:
         "sendspin_sync/apply_measurements",
         "sendspin_sync/stop_session",
     ]
-    scopes = [call.kwargs["required_scope"] for call in mass.register_api_command.call_args_list]
-    assert scopes == [
-        Scope.PLAYERS_READ,
-        Scope.PLAYERS_READ,
-        Scope.PLAYERS_CONTROL,
-        Scope.PLAYERS_CONTROL,
-        Scope.CONFIG_PLAYERS_WRITE,
-        Scope.PLAYERS_CONTROL,
-    ]
 
     await provider.unload()
     assert unregister_calls == registered
 
 
-async def test_applying_a_result_needs_more_than_a_guest_scope() -> None:
+async def test_session_commands_need_more_than_a_guest_scope() -> None:
     """
-    Persisting a static delay is guarded like any other player config write.
+    Driving a session is guarded like any other player config write.
 
-    Every other session command is transient and fully restored, so a guest may drive
-    one. This command writes player config - the mutation config/players/save gates on
+    Starting one zeroes the static delays, stopping one puts them back and applying a
+    result persists one - every mutation config/players/save gates on
     CONFIG_PLAYERS_WRITE - and an in-process call into the Sendspin provider is never
     re-checked against the caller's scopes, so the registration is the only guard.
+    Pinned per command: lowering one back to a guest scope is invisible in behaviour
+    and only shows up as a security problem.
     """
     provider = await _setup_provider()
     mass = _mock_mass(provider)
@@ -231,7 +224,14 @@ async def test_applying_a_result_needs_more_than_a_guest_scope() -> None:
         for call in mass.register_api_command.call_args_list
     }
 
-    assert scope_by_command["sendspin_sync/apply_measurements"] == Scope.CONFIG_PLAYERS_WRITE
+    assert scope_by_command == {
+        "sendspin_sync/eligible_players": Scope.PLAYERS_READ,
+        "sendspin_sync/session": Scope.PLAYERS_READ,
+        "sendspin_sync/start_session": Scope.CONFIG_PLAYERS_WRITE,
+        "sendspin_sync/solo_player": Scope.CONFIG_PLAYERS_WRITE,
+        "sendspin_sync/apply_measurements": Scope.CONFIG_PLAYERS_WRITE,
+        "sendspin_sync/stop_session": Scope.CONFIG_PLAYERS_WRITE,
+    }
     assert Scope.CONFIG_PLAYERS_WRITE not in ROLE_SCOPES[UserRole.GUEST]
 
 
