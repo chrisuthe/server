@@ -43,7 +43,7 @@ async def test_start_groups_every_target_and_starts_the_track_once() -> None:
     assert mass.player_queues.play_media.await_args.args[0] == ANCHOR_ID
 
 
-async def test_the_session_is_silent_until_its_stream_begins() -> None:
+async def test_the_track_does_not_start_until_begin_is_called() -> None:
     """Commandeering the speakers and starting the track are separate steps."""
     mass = _make_mass(_make_player("a"))
 
@@ -78,16 +78,85 @@ async def test_soloing_never_restarts_the_stream() -> None:
     mass.player_queues.stop.assert_not_awaited()
 
 
-async def test_solo_mutes_the_others_and_never_mutes_the_target() -> None:
-    """Isolating a speaker silences its peers and issues no mute command against it."""
+async def test_start_silences_every_member() -> None:
+    """
+    A started session is inaudible until a speaker is soloed.
+
+    Otherwise the whole group chirps at once from the moment the track starts, which
+    tells the user nothing and is merely startling.
+    """
+    mass = _make_mass(_make_player("a"), _make_player("b"), _make_player("c"))
+
+    session = await _start(mass, ["a", "b", "c"])
+
+    assert _silenced(mass) == {"a", "b", "c"}
+    assert session.soloed_player_id is None
+
+
+async def test_every_member_is_silenced_before_the_stream_starts() -> None:
+    """
+    The silencing lands while the track is not yet running, not after its first chirp.
+
+    A member silenced once the chirp train was already playing would be audible for as
+    long as the commands took to land.
+    """
+    mass = _make_mass(_make_player("a"), _make_player("b"))
+
+    with patch(
+        "music_assistant.providers.sendspin_sync.session.SharedPlaybackSession"
+    ) as shared_cls:
+        shared_cls.create_remote = AsyncMock(return_value=_make_shared_session())
+        await CalibrationSession.create(
+            mass, MagicMock(), "provider.sendspin_sync", "sendspin_sync--test", ["a", "b"]
+        )
+
+    assert _silenced(mass) == {"a", "b"}
+    mass.player_queues.play_media.assert_not_awaited()
+
+
+async def test_the_first_solo_makes_exactly_one_member_audible() -> None:
+    """From the all-silent start a solo only has to bring its own target back up."""
     mass = _make_mass(_make_player("a"), _make_player("b"), _make_player("c"))
     session = await _start(mass, ["a", "b", "c"])
+    # the start silenced every member, so what remains to assert is the solo's own doing
+    mass.players.cmd_volume_mute.reset_mock()
 
     await session.solo("b")
 
     assert _silenced(mass) == {"a", "c"}
-    assert "b" not in _mute_command_targets(mass)
+    assert _mute_calls(mass) == [("b", False)]
     assert session.soloed_player_id == "b"
+
+
+async def test_start_refuses_a_member_it_cannot_silence() -> None:
+    """
+    A speaker that stays in the mix is fatal to the start, not something to log and go on.
+
+    The probe attributes each arrival to the one speaker it believes is audible, so a
+    member left audible corrupts every other member's measurement rather than only its
+    own - unlike a solo, where silencing what is not being measured is best effort.
+    """
+    mass = _make_mass(_make_player("a"), _make_player("b"), _make_player("c"))
+    _fail_for(mass.players.cmd_volume_mute, "b", PlayerUnavailableError("gone"))
+    shared = _make_shared_session()
+
+    with pytest.raises(ActionUnavailable, match="silenced"):
+        await _start(mass, ["a", "b", "c"], shared=shared)
+
+    # 'a' and 'b' were grouped and are released again, both audible; 'c' was never reached
+    assert _silenced(mass) == set()
+    assert {call.args[0] for call in shared.remove_guest_listener.await_args_list} == {"a", "b"}
+    mass.player_queues.play_media.assert_not_awaited()
+
+
+async def test_silencing_at_start_never_touches_the_stream() -> None:
+    """Taking the members out of the mix is a per-player command, never a queue one."""
+    mass = _make_mass(_make_player("a"), _make_player("b"), _make_player("c"))
+
+    await _start(mass, ["a", "b", "c"])
+
+    mass.player_queues.play_media.assert_awaited_once()
+    mass.player_queues.stop.assert_not_awaited()
 
 
 async def test_solo_hands_the_next_target_over_unmuted() -> None:
@@ -124,7 +193,7 @@ async def test_start_rejects_a_player_turned_all_the_way_down() -> None:
         await _start(mass, ["a"], force=True)
 
 
-async def test_solo_silences_a_player_without_a_mute_control_by_volume() -> None:
+async def test_a_player_without_a_mute_control_is_silenced_by_volume() -> None:
     """A Sendspin client that does not implement mute is taken out of the mix by volume."""
     mass = _make_mass(
         _make_player("a"),
@@ -261,6 +330,27 @@ async def test_stop_restores_volume_mute_grouping_and_playback() -> None:
     assert mass.players.cmd_resume.await_args.args[0] == "c"
     assert mass.players.cmd_resume.await_args.args[1] == "c_queue"
     shared.close.assert_awaited_once()
+
+
+async def test_stop_restores_a_session_that_was_never_soloed() -> None:
+    """
+    A session that dies before the first measurement still hands the speakers back.
+
+    Starting one silences every member, so a phone that walks away between the start
+    and the first tap would otherwise leave the whole group inaudible.
+    """
+    mass = _make_mass(
+        _make_player("a", volume_level=30),
+        _make_player("b", mute_control=PLAYER_CONTROL_NONE, volume_level=70),
+    )
+    session = await _start(mass, ["a", "b"])
+    assert _silenced(mass) == {"a", "b"}
+
+    await session.stop()
+
+    assert _silenced(mass) == set()
+    assert ("a", False) in _mute_calls(mass)
+    assert ("b", 70) in _volume_calls(mass)
 
 
 async def test_stop_restarts_a_group_that_cannot_take_members_back() -> None:
@@ -821,11 +911,13 @@ async def test_soloing_a_physical_speaker_silences_only_the_others() -> None:
         "study",
     ]
     mass.player_queues.play_media.reset_mock()
+    # the start muted all three, so the solo's own commands are what this asserts on
+    mass.players.cmd_volume_mute.reset_mock()
 
     await session.solo("kitchen")
 
     assert _silenced(mass) == {"living_room", "study"}
-    assert "kitchen" not in _mute_command_targets(mass)
+    assert ("kitchen", True) not in _mute_calls(mass)
     mass.player_queues.play_media.assert_not_awaited()
     mass.player_queues.stop.assert_not_awaited()
 

@@ -328,9 +328,11 @@ class SendspinSyncProvider(PluginProvider):
         Start a calibration session over the given Sendspin players.
 
         The calibration track starts once and runs for the whole session; use
-        ``solo_player`` to walk the speakers without restarting it. The session is
-        torn down automatically after a period of inactivity, so a phone that goes
-        away can not leave the speakers muted or measuring from a delay of zero.
+        ``solo_player`` to walk the speakers without restarting it. Every speaker is
+        silenced before the track starts, so nothing is heard until ``solo_player``
+        opens one up. The session is torn down automatically after a period of
+        inactivity, so a phone that goes away can not leave the speakers muted or
+        measuring from a delay of zero.
 
         Every speaker MA can write a static delay to is measured from zero, so a delay
         already in place can not push its arrival outside the window the probe counts in.
@@ -344,10 +346,10 @@ class SendspinSyncProvider(PluginProvider):
         :raises InvalidDataError: If no players were given, or the same player twice.
         :raises PlayerUnavailableError: If a given player is unknown or unavailable.
         :raises UnsupportedFeaturedException: If a given player does not render over
-            Sendspin, or can not be silenced.
+            Sendspin, or has neither a mute nor a volume control.
         :raises ActionUnavailable: If a player is already muted or turned all the way
-            down, is playing and ``force`` was not set, or the Sendspin provider is
-            not loaded.
+            down, is playing and ``force`` was not set, could not be silenced, or the
+            Sendspin provider is not loaded.
         :return: The state of the started session.
         """
         async with self._session_lock:
@@ -383,8 +385,9 @@ class SendspinSyncProvider(PluginProvider):
         """
         Isolate one speaker in the running session so only it is audible.
 
-        Mutes every other member of the session and never mutes the target itself.
-        Leaves the calibration stream running.
+        Brings the target out of the silence the session started it in, leaves every
+        other member silent, and never mutes the target itself. Leaves the calibration
+        stream running.
 
         :param player_id: The session member to isolate.
         :raises ActionUnavailable: If no calibration session is running.

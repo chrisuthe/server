@@ -18,8 +18,9 @@ Two properties of the orchestration are load-bearing for the measurement:
   latency as a phase offset against it, so a restart resets the timeline and
   invalidates every measurement taken against the old one. Isolation therefore
   only ever touches per-player mute/volume, never the queue.
-- **Only one member is audible at a time**, so an arrival can be attributed to a
-  specific speaker.
+- **At most one member is audible at a time**, so an arrival can be attributed to a
+  specific speaker. Every member is silenced as it is commandeered, so the chirp
+  train starts out inaudible and a solo is what opens up a single speaker.
 
 The anchor is a virtual player rather than one of the targets on purpose. It
 owns its own queue, so no user queue is ever replaced, and it never renders
@@ -208,9 +209,10 @@ class CalibrationSession:
         """
         Commandeer the given players and group them onto a fresh calibration anchor.
 
-        The session is silent until :meth:`begin` starts its stream. Every member MA can
-        write a static delay to is measured from zero, so what it takes off is put back
-        by :meth:`stop`.
+        Every member is silenced on the way in, so the track :meth:`begin` starts can not
+        be heard until a :meth:`solo` opens up a speaker. Every member MA can write a
+        static delay to is measured from zero, so what it takes off is put back by
+        :meth:`stop`.
 
         :param mass: MusicAssistant instance.
         :param logger: Logger of the owning provider.
@@ -223,9 +225,9 @@ class CalibrationSession:
         :raises InvalidDataError: If no players were given, or the same player twice.
         :raises PlayerUnavailableError: If a given player is unknown or unavailable.
         :raises UnsupportedFeaturedException: If a given player does not render over
-            Sendspin, or can not be silenced.
+            Sendspin, or has neither a mute nor a volume control.
         :raises ActionUnavailable: If a player is busy playing and ``force`` was not set,
-            or the Sendspin provider is not loaded.
+            if one could not be silenced, or if the Sendspin provider is not loaded.
         :return: The commandeered, not yet streaming session.
         """
         if not player_ids:
@@ -258,6 +260,11 @@ class CalibrationSession:
             for player in players:
                 await shared_session.add_guest_listener(player.player_id)
                 session._snapshots[player.player_id] = snapshots[player.player_id]
+                # taken out of the mix as it joins, so the track begin() starts is
+                # inaudible from its first chirp rather than from the first solo. After
+                # the grouping, not before: a mute only takes the lock that survives a
+                # group volume change once the player is already in the group.
+                await session._silence_member(player)
                 await session._zero_static_delay(sendspin, player)
         except Exception:
             await session.stop()
@@ -333,9 +340,10 @@ class CalibrationSession:
         Mutes every other member and issues no mute command against the target, so
         the speaker being measured is never put into mute as part of isolating it:
         clients that stop feeding their DAC while muted shift their timing on
-        resume, which would corrupt the number being measured. A target an earlier
-        :meth:`solo` had silenced is brought back first, before the others go down,
-        so it has the longest settling window this call can give it.
+        resume, which would corrupt the number being measured. The target is brought
+        out of the silence it is in - every member starts silenced, and a later solo
+        puts the previous one back - before the others go down, so it has the longest
+        settling window this call can give it.
 
         That window is only as long as the mute commands that follow it, so the
         probe consuming this session is expected to discard the first chirp periods
@@ -640,6 +648,27 @@ class CalibrationSession:
         """
         if player is not None and self._silenced.pop(player.player_id, None) == SilenceMethod.MUTE:
             player.extra_data.pop(ATTR_MUTE_LOCK, None)
+
+    async def _silence_member(self, player: Player) -> None:
+        """
+        Take a member out of the mix as the session claims it, or refuse to start at all.
+
+        Unlike the silencing a :meth:`solo` does, a member that can not be silenced up
+        front is fatal rather than merely logged: the probe attributes each arrival to
+        the one speaker it believes is audible, so a member left in the mix corrupts the
+        measurement of every other one instead of only its own.
+
+        :param player: The member to silence.
+        :raises ActionUnavailable: If the member could not be made inaudible.
+        """
+        await self._silence(player.player_id)
+        if player.player_id not in self._silenced:
+            raise ActionUnavailable(
+                f"Player {player.state.name} could not be silenced for calibration",
+                translation_key="player_not_silenced",
+                translation_args=[player.state.name],
+                translation_owner=self.translation_owner,
+            )
 
     async def _silence(self, player_id: str) -> None:
         """
