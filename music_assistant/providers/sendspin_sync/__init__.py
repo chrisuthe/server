@@ -162,18 +162,22 @@ class SendspinSyncProvider(PluginProvider):
         api_handlers = (
             ("sendspin_sync/eligible_players", self.get_eligible_players, Scope.PLAYERS_READ),
             ("sendspin_sync/session", self.get_session, Scope.PLAYERS_READ),
-            ("sendspin_sync/start_session", self.start_session, Scope.PLAYERS_CONTROL),
-            ("sendspin_sync/solo_player", self.solo_player, Scope.PLAYERS_CONTROL),
-            # CONFIG_PLAYERS_WRITE, unlike the transient commands above: this one
-            # persists a player config value, which is exactly what config/players/save
-            # is gated on. PLAYERS_CONTROL is a guest scope, and an in-process call to
-            # the Sendspin provider is not re-checked against the caller's scopes.
+            # CONFIG_PLAYERS_WRITE, unlike the read-only commands above. Starting a
+            # session zeroes the static delays and stopping one puts them back, so both
+            # persist player config just as applying a result does - exactly what
+            # config/players/save is gated on. solo_player writes nothing itself, but is
+            # only reachable inside a session that has, so it is raised with them rather
+            # than left as a half-open door. PLAYERS_CONTROL is a guest scope, and an
+            # in-process call to the Sendspin provider is not re-checked against the
+            # caller's scopes.
+            ("sendspin_sync/start_session", self.start_session, Scope.CONFIG_PLAYERS_WRITE),
+            ("sendspin_sync/solo_player", self.solo_player, Scope.CONFIG_PLAYERS_WRITE),
             (
                 "sendspin_sync/apply_measurements",
                 self.apply_measurements,
                 Scope.CONFIG_PLAYERS_WRITE,
             ),
-            ("sendspin_sync/stop_session", self.stop_session, Scope.PLAYERS_CONTROL),
+            ("sendspin_sync/stop_session", self.stop_session, Scope.CONFIG_PLAYERS_WRITE),
         )
         for command, handler, required_scope in api_handlers:
             self._unregister_handles.append(

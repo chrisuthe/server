@@ -39,10 +39,10 @@ each of them in turn. It is driven through the API:
 | --- | --- | --- |
 | `sendspin_sync/eligible_players` | `players.read` | The speakers a session can run against, and whether MA can write each one's delay |
 | `sendspin_sync/session` | `players.read` | State of the running session, or `null` |
-| `sendspin_sync/start_session` | `players.control` | Take the given speakers over and start the track |
-| `sendspin_sync/solo_player` | `players.control` | Make one member of the session audible |
+| `sendspin_sync/start_session` | `config.players.write` | Take the given speakers over and start the track |
+| `sendspin_sync/solo_player` | `config.players.write` | Make one member of the session audible |
 | `sendspin_sync/apply_measurements` | `config.players.write` | Turn the measured offsets into static delays and apply the ones MA can write |
-| `sendspin_sync/stop_session` | `players.control` | End the session and restore every speaker |
+| `sendspin_sync/stop_session` | `config.players.write` | End the session and restore every speaker |
 
 The speakers are grouped onto a **hidden Sendspin virtual player** that owns the
 queue the track plays on. That anchor never renders audio itself, which buys two
@@ -201,19 +201,22 @@ again* possible inside one session, and verification has to happen there: ending
 the session ungroups every speaker, changing the sync path the numbers describe.
 The inactivity timeout still applies, so a client has to apply within it.
 
-Unlike the other five commands, `apply_measurements` requires
-`config.players.write` rather than `players.control`. The rest are transient and
-fully restored when the session ends, but this one persists a player config value —
-the same mutation `config/players/save` is gated on. `players.control` is held by
-guests, and `config.players.write` by admin and service accounts only, so a plain
-user can drive a session but not apply its result. An in-process call into the
-Sendspin provider is not re-checked against the caller's scopes, so the command
+Every command that drives a session requires `config.players.write`. Only
+`eligible_players` and `session`, which report state and mutate nothing, are
+`players.read`. [Starting a session zeroes each speaker's static
+delay](#measuring-from-zero) and stopping it puts the value back, so the brackets of
+a session persist player config in their own right, exactly as applying a result
+does — the same mutation `config/players/save` is gated on. `players.control`,
+which would otherwise fit commands that only group and mute, is held by guests, and
+`config.players.write` by admin and service accounts only. An in-process call into
+the Sendspin provider is not re-checked against the caller's scopes, so the command
 registration is the only place that guard exists.
 
-That holds even for a session over speakers MA cannot write to, which reaches the
-scope check and then writes nothing — so a guest can drive such a session but not
-read back its answer. The scope is on the command, not on what a particular run
-turns out to touch, which fails closed.
+`solo_player` persists nothing itself, but it is reachable only inside a session
+that does, so it carries the same scope rather than leaving a half-open door. The
+same reasoning covers a session over speakers MA cannot write to, which reaches the
+scope check and then writes nothing: the scope is on the command, not on what a
+particular run turns out to touch, which fails closed.
 
 ## Speakers that cannot accept a delay
 
