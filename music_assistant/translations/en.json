@@ -2117,6 +2117,7 @@
   "provider.sendspin_sync.errors.player_not_eligible": "{0} can not be calibrated: it is not a Sendspin speaker, or its volume can not be controlled.",
   "provider.sendspin_sync.errors.player_not_in_session": "{0} is not part of this calibration session.",
   "provider.sendspin_sync.errors.player_not_measured": "{0} was not measured. Measure every speaker in the session before applying the result.",
+  "provider.sendspin_sync.errors.player_not_silenced": "{0} could not be silenced, so the other speakers can not be measured. Check that it is still reachable and try again.",
   "provider.sendspin_sync.errors.player_silent": "{0} is muted or turned all the way down. Turn it up before calibrating.",
   "provider.sendspin_sync.errors.player_unavailable": "{0} is not available.",
   "provider.sendspin_sync.errors.sendspin_unavailable": "The Sendspin provider is not available.",
