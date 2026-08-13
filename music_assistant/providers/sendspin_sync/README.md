@@ -17,8 +17,11 @@ that train is a metronome running on the server clock, which lets a listener
 recover a speaker's latency as a phase offset against it without knowing the
 server's absolute time. Two properties therefore matter:
 
-- **The period is exact.** One 500 ms period is generated once at load and then
+- **The period is exact.** One 1 s period is generated once at load and then
   replayed verbatim; jitter in the chirp spacing would corrupt the measurement.
+- **The period is long enough.** Its length is the measurement's unambiguous
+  range: an arrival more than half a period late is numbered onto the following
+  chirp and comes back folded, so 1 s resolves speakers spread across 500 ms.
 - **The pulse is a swept sine, not a noise burst.** Matched-filter correlation
   against a sweep compresses room reverberation into a sharp peak, where onset
   detection on noise degrades badly in a reverberant room.

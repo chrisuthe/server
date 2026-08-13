@@ -27,6 +27,7 @@ from music_assistant_models.errors import (
 from music_assistant_models.player import OutputProtocol
 from music_assistant_models.provider import ProviderManifest
 
+from music_assistant.controllers.streams.audio import AUDIO_SOURCE_CHUNK_SECONDS
 from music_assistant.controllers.webserver.helpers.auth_middleware import ROLE_SCOPES
 from music_assistant.helpers.shared_playback import SENDSPIN_DOMAIN
 from music_assistant.providers import sendspin_sync
@@ -118,6 +119,19 @@ async def test_audio_stream_repeats_the_period_seamlessly() -> None:
     period = build_chirp_period()
     streamed = await _take_bytes(provider, len(period) * 2)
     assert streamed == period * 2
+
+
+async def test_the_period_slices_into_whole_chunks() -> None:
+    """
+    The period divides evenly by the chunk size the streams controller paces at.
+
+    An indivisible period would leave a short chunk at every loop boundary, so the
+    stream would stop handing out the uniform, ready-made chunks the up-front
+    slicing exists to provide.
+    """
+    provider = await _setup_provider()
+    chunk_size = int(SAMPLE_RATE * AUDIO_SOURCE_CHUNK_SECONDS) * CHANNELS * (BIT_DEPTH // 8)
+    assert {len(chunk) for chunk in provider._period_chunks} == {chunk_size}
 
 
 async def test_audio_stream_stops_when_another_session_supersedes_it() -> None:
