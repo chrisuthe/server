@@ -10,10 +10,13 @@ from music_assistant_models.enums import ImageType, MediaType
 from music_assistant_models.media_items import (
     Album,
     Artist,
+    Audiobook,
     ItemMapping,
     MediaItemImage,
     MediaItemMetadata,
     Playlist,
+    Podcast,
+    PodcastEpisode,
     Radio,
     Track,
 )
@@ -23,6 +26,10 @@ from music_assistant_models.queue_item import QueueItem
 from music_assistant_models.unique_list import UniqueList
 
 from music_assistant.constants import ATTR_PLAY_ACTION_IN_PROGRESS
+from music_assistant.controllers.player_queues.constants import (
+    PAUSE_AUTO_STOP_TIMEOUT,
+    PAUSE_AUTO_STOP_TIMEOUT_LONG_FORM,
+)
 from music_assistant.controllers.player_queues.helpers import (
     build_queue_item,
     find_dynamic_source,
@@ -30,6 +37,7 @@ from music_assistant.controllers.player_queues.helpers import (
     handle_play_action,
     has_dynamic_source,
     is_dynamic_source,
+    pause_auto_stop_timeout,
     space_by_artist,
 )
 from music_assistant.controllers.player_queues.state import PlayerQueueData
@@ -488,3 +496,58 @@ class TestBuildQueueItem:
         assert restored.media_item.item_id == "t1"
         assert restored.image is not None
         assert restored.image.type is ImageType.THUMB
+
+
+def _long_form_item(media_item: Audiobook | PodcastEpisode) -> QueueItem:
+    return QueueItem(
+        queue_id="q1",
+        queue_item_id=media_item.item_id,
+        name=media_item.name,
+        duration=9028,
+        media_item=media_item,
+    )
+
+
+class TestPauseAutoStopTimeout:
+    """How long a paused queue may sit before the watchdog stops it."""
+
+    def test_track_uses_the_default_timeout(self) -> None:
+        """Re-opening a paused track costs little, so the short window stands."""
+        queue = _queue()
+        queue.current_item = _queue_item("Song")
+        assert pause_auto_stop_timeout(queue) == PAUSE_AUTO_STOP_TIMEOUT
+
+    def test_podcast_episode_gets_the_extended_timeout(self) -> None:
+        """Stopping a paused episode forces a re-open and a seek back to the pause point."""
+        queue = _queue()
+        podcast = Podcast(
+            item_id="pod1", provider="test", name="Pod", provider_mappings=_PROVIDER_MAPPINGS
+        )
+        queue.current_item = _long_form_item(
+            PodcastEpisode(
+                item_id="ep1",
+                provider="test",
+                name="Ep",
+                provider_mappings=_PROVIDER_MAPPINGS,
+                position=1,
+                podcast=podcast,
+            )
+        )
+        assert pause_auto_stop_timeout(queue) == PAUSE_AUTO_STOP_TIMEOUT_LONG_FORM
+
+    def test_audiobook_gets_the_extended_timeout(self) -> None:
+        """Audiobooks are paused for long stretches for the same reasons podcasts are."""
+        queue = _queue()
+        queue.current_item = _long_form_item(
+            Audiobook(
+                item_id="ab1",
+                provider="test",
+                name="Book",
+                provider_mappings=_PROVIDER_MAPPINGS,
+            )
+        )
+        assert pause_auto_stop_timeout(queue) == PAUSE_AUTO_STOP_TIMEOUT_LONG_FORM
+
+    def test_queue_without_current_item_uses_the_default(self) -> None:
+        """Nothing loaded means there is no resume point to protect."""
+        assert pause_auto_stop_timeout(_queue()) == PAUSE_AUTO_STOP_TIMEOUT

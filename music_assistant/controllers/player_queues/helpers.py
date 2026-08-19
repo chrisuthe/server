@@ -11,6 +11,11 @@ from music_assistant_models.media_items import MediaItemMetadata, Playlist, Radi
 from music_assistant_models.queue_item import QueueItem
 
 from music_assistant.constants import ATTR_PLAY_ACTION_IN_PROGRESS, PlaylistPlayableItem
+from music_assistant.controllers.player_queues.constants import (
+    LONG_FORM_MEDIA_TYPES,
+    PAUSE_AUTO_STOP_TIMEOUT,
+    PAUSE_AUTO_STOP_TIMEOUT_LONG_FORM,
+)
 from music_assistant.controllers.players.constants import PlayerLockPurpose
 
 if TYPE_CHECKING:
@@ -200,6 +205,13 @@ def get_current_playback_speed(queue: PlayerQueue) -> float:
     if queue.current_item is None:
         return 1.0
     return float(queue.current_item.extra_attributes.get("playback_speed") or 1.0)
+
+
+def pause_auto_stop_timeout(queue: PlayerQueue) -> int:
+    """Return how many seconds the queue may sit paused before it is stopped."""
+    if queue.current_item is not None and queue.current_item.media_type in LONG_FORM_MEDIA_TYPES:
+        return PAUSE_AUTO_STOP_TIMEOUT_LONG_FORM
+    return PAUSE_AUTO_STOP_TIMEOUT
 
 
 def interleave_groups[ItemT](groups: list[list[ItemT]]) -> list[ItemT]:

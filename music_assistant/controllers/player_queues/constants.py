@@ -114,3 +114,18 @@ PROBED_DURATION_MEDIA_TYPES = (
     MediaType.PODCAST_EPISODE,
     MediaType.AUDIOBOOK,
 )
+
+# Hour-long media that a listener routinely parks mid-item rather than plays end to end.
+LONG_FORM_MEDIA_TYPES = (
+    MediaType.PODCAST_EPISODE,
+    MediaType.AUDIOBOOK,
+)
+
+# A paused player is stopped after sitting idle this long, so it does not hold its stream and
+# device session open indefinitely.
+PAUSE_AUTO_STOP_TIMEOUT = 30
+# Stopping discards the item's audio buffer, so resuming has to re-open the source and seek back
+# to the pause position - for a multi-hour episode that is a slow round trip the listener pays for
+# every pause, and one that fails leaves them back at the start. Pausing long-form media for
+# minutes at a time is normal use, so give it a much longer grace period before stopping.
+PAUSE_AUTO_STOP_TIMEOUT_LONG_FORM = 600

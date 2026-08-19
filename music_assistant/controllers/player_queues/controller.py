@@ -70,6 +70,7 @@ from music_assistant.controllers.player_queues.helpers import (
     get_current_playback_speed,
     handle_play_action,
     is_dynamic_source,
+    pause_auto_stop_timeout,
 )
 from music_assistant.controllers.player_queues.managed_pool import ManagedPool
 from music_assistant.controllers.player_queues.media_resolver import MediaResolver
@@ -725,14 +726,15 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             if player.state.playback_state != PlaybackState.PAUSED:
                 return
             count = 0
-            while count < 30 and player.state.playback_state == PlaybackState.PAUSED:
+            auto_stop_timeout = pause_auto_stop_timeout(queue)
+            while count < auto_stop_timeout and player.state.playback_state == PlaybackState.PAUSED:
                 count += 1
                 await asyncio.sleep(1)
             # if player is still paused when the limit is reached, send stop
             if player.state.playback_state == PlaybackState.PAUSED:
                 await self.stop(queue_id)
 
-        # we auto stop a player from paused when its paused for 30 seconds
+        # we auto stop a player that is left paused, giving long-form media a longer grace period
         if (
             queue_active
             and (queue_player := self.mass.players.get_player(queue_id))
