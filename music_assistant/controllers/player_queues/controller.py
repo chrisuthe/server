@@ -779,6 +779,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         queue.current_item = self.get_item(queue_id, next_index)
         queue.elapsed_time = 0
         queue.elapsed_time_last_updated = time.time()
+        # the anchor belongs to the item being left behind, so it must not seek the new one
+        queue.resume_pos = 0
         self.signal_update(queue_id)
         if queue_player := self.mass.players.get_player(queue_id, True):
             queue_player.update_state()
@@ -818,6 +820,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         queue.current_item = self.get_item(queue_id, prev_index)
         queue.elapsed_time = 0
         queue.elapsed_time_last_updated = time.time()
+        # the anchor belongs to the item being left behind, so it must not seek the new one
+        queue.resume_pos = 0
         self.signal_update(queue_id)
         if queue_player := self.mass.players.get_player(queue_id, True):
             queue_player.update_state()
@@ -943,7 +947,6 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         try:
             queue_data = self._queue_data[queue_id]
             queue = queue_data.queue
-            queue.resume_pos = 0
             # A queue picked up from its end plays its items over from the start, so a resume point
             # left on an audiobook/episode must not pull it back to where it was left off. The flag
             # itself is only cleared once an item actually loaded below, so a start that never got
@@ -1021,6 +1024,11 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
                     queue.current_item = queue_item
                     # playback is under way, so the queue is no longer sitting at its end
                     queue.ended = False
+                    # the pause position has been handed to the stream, so it is spent. Clearing it
+                    # only now keeps it available to retry with: a start that never got off the
+                    # ground would otherwise leave the next play to begin from zero, and a few
+                    # seconds of that overwrites the stored progress for good.
+                    queue.resume_pos = 0
                     # reset the elapsed clock together with the item switch (like
                     # next/previous do), so queue updates signaled before the player
                     # reports position don't carry the previous item's elapsed_time
