@@ -223,7 +223,7 @@ class Audiobookshelf(RecommendationPayloadMixin, MusicProvider):
         password = str(self.get_setup_value(CONF_PASSWORD))
         token_old = self.get_setup_value(CONF_OLD_TOKEN)
         token_api = self.get_setup_value(CONF_API_TOKEN)
-        verify_ssl = bool(self.get_setup_value(CONF_VERIFY_SSL))
+        verify_ssl = bool(self.get_setup_value(CONF_VERIFY_SSL, True))
         session_config = AbsSessionConfiguration(
             session=self.mass.http_session,
             url=base_url,

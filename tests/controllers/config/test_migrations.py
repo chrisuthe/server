@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+from music_assistant_models.config_entries import ProviderConfig
+from music_assistant_models.enums import ProviderType
 from music_assistant_models.errors import InvalidDataError
 
 from music_assistant.constants import (
@@ -16,6 +18,7 @@ from music_assistant.constants import (
 )
 from music_assistant.controllers.config.controller import ConfigController
 from music_assistant.controllers.config.migrations import (
+    PROVIDER_SETUP_FLOW_KEY_DEFAULTS,
     PROVIDER_SETUP_FLOW_KEYS,
     _migrate_airplay_apple_power_control,
     _migrate_airplay_receiver_ghost_players,
@@ -29,6 +32,7 @@ from music_assistant.controllers.config.migrations import (
     migrate_nfs_subfolder_into_export_path,
     migrate_provider_setup_data,
 )
+from music_assistant.models.music_provider import MusicProvider
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -44,6 +48,18 @@ def _fake_encrypt(value: str) -> str:
 def _fake_decrypt(value: str) -> str:
     """Mirror ConfigController.decrypt_string: strip the prefix, pass plain values through."""
     return value.removeprefix(ENCRYPT_SUFFIX)
+
+
+def _setup_value_reader(
+    controller: ConfigController, domain: str, instance_id: str
+) -> MusicProvider:
+    """Return a provider bound to the given config store, for reading setup values back."""
+    manifest = SimpleNamespace(domain=domain, name=domain)
+    config = ProviderConfig(
+        values={}, type=ProviderType.MUSIC, domain=domain, instance_id=instance_id
+    )
+    mass = SimpleNamespace(config=controller, cache=None)
+    return MusicProvider(mass, manifest, config)  # type: ignore[arg-type]
 
 
 def test_migrate_output_limiter_drops_stored_values() -> None:
@@ -555,6 +571,227 @@ def test_migrate_provider_setup_data_real_domain_opensubsonic() -> None:
     assert cfg["setup_data"]["port"] == 4533
     # a genuine provider option is not part of the setup-flow key set and stays put
     assert cfg["values"] == {"enable_podcasts": True}
+
+
+def test_preflow_default_keys_are_all_setup_flow_owned() -> None:
+    """A recorded default must belong to a key the migration also moves."""
+    for domain, defaults in PROVIDER_SETUP_FLOW_KEY_DEFAULTS.items():
+        owned = PROVIDER_SETUP_FLOW_KEYS.get(domain)
+        assert owned is not None, domain
+        assert set(defaults) <= set(owned), domain
+
+
+def test_migrate_provider_setup_data_seeds_preflow_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An owned key left at its pre-flow default is seeded, since it was never persisted."""
+    monkeypatch.setitem(PROVIDER_SETUP_FLOW_KEYS, "demo", ("host", "port", "verify", "token"))
+    monkeypatch.setitem(
+        PROVIDER_SETUP_FLOW_KEY_DEFAULTS,
+        "demo",
+        {"host": "localhost", "port": 8096, "verify": True},
+    )
+    data: dict[str, Any] = {
+        "providers": {
+            # only the key that differed from its default was ever written to settings.json
+            "demo": {"domain": "demo", "values": {"host": "nas.local", "quality": "high"}}
+        }
+    }
+    assert migrate_provider_setup_data(data, _fake_encrypt) is True
+    cfg = data["providers"]["demo"]
+    assert cfg["setup_data"] == {
+        "host": ENCRYPT_SUFFIX + "nas.local",  # moved, so not overwritten by the default
+        "port": 8096,  # seeded raw, like any non-string value
+        "verify": True,
+    }
+    # a key with no recorded default is not invented, and options are left alone
+    assert "token" not in cfg["setup_data"]
+    assert cfg["values"] == {"quality": "high"}
+
+
+def test_migrate_provider_setup_data_seeds_plex_connection_defaults() -> None:
+    """A Plex config on the standard TLS port keeps its port and certificate verification."""
+    data: dict[str, Any] = {
+        "providers": {
+            "plex--1": {
+                "domain": "plex",
+                "values": {
+                    "token": "tok",
+                    "local_server_ip": "local.abc.plex.direct",
+                    "local_server_ssl": True,
+                    "library_id": "lib1",
+                },
+            }
+        }
+    }
+    assert migrate_provider_setup_data(data, _fake_encrypt) is True
+    setup_data = data["providers"]["plex--1"]["setup_data"]
+    # left at their pre-flow defaults, so absent from values and only recoverable by seeding
+    assert setup_data["local_server_port"] == 32400
+    assert setup_data["local_server_verify_cert"] is True
+    assert setup_data["library_type"] == ENCRYPT_SUFFIX + "music"
+    # the values that did differ from their defaults still move rather than being overwritten
+    assert setup_data["local_server_ssl"] is True
+    assert setup_data["local_server_ip"] == ENCRYPT_SUFFIX + "local.abc.plex.direct"
+
+
+def test_migrate_provider_setup_data_keeps_a_cleared_value_cleared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A value the user explicitly cleared stays cleared; the default must not come back."""
+    monkeypatch.setitem(PROVIDER_SETUP_FLOW_KEYS, "demo", ("host",))
+    monkeypatch.setitem(PROVIDER_SETUP_FLOW_KEY_DEFAULTS, "demo", {"host": "localhost"})
+    # clearing a value whose entry default is non-None does get persisted, as None
+    data: dict[str, Any] = {"providers": {"demo": {"domain": "demo", "values": {"host": None}}}}
+    assert migrate_provider_setup_data(data, _fake_encrypt) is True
+    assert data["providers"]["demo"]["setup_data"] == {"host": None}
+
+
+def test_migrate_provider_setup_data_repairs_an_already_migrated_config() -> None:
+    """A config an earlier 2.10 pre-release stripped is repaired, not skipped."""
+    data: dict[str, Any] = {
+        "providers": {
+            "plex--1": {
+                "domain": "plex",
+                # the pre-release moved what it could and emptied values; the keys that were
+                # left at their defaults never made it across and are gone from both dicts
+                "values": {},
+                "setup_data": {
+                    "token": ENCRYPT_SUFFIX + "tok",
+                    "local_server_ip": ENCRYPT_SUFFIX + "local.abc.plex.direct",
+                    "local_server_ssl": True,
+                },
+            }
+        }
+    }
+    assert migrate_provider_setup_data(data, _fake_encrypt) is True
+    setup_data = data["providers"]["plex--1"]["setup_data"]
+    assert setup_data["local_server_port"] == 32400
+    assert setup_data["local_server_verify_cert"] is True
+    # what the pre-release did move is preserved untouched
+    assert setup_data["local_server_ip"] == ENCRYPT_SUFFIX + "local.abc.plex.direct"
+    assert setup_data["local_server_ssl"] is True
+
+
+def test_migrate_provider_setup_data_seeds_without_a_values_dict() -> None:
+    """Seeding does not need a `values` dict, which a pre-release may have dropped entirely."""
+    data: dict[str, Any] = {"providers": {"jellyfin--1": {"domain": "jellyfin"}}}
+    assert migrate_provider_setup_data(data, _fake_encrypt) is True
+    assert data["providers"]["jellyfin--1"]["setup_data"] == {"verify_ssl": True}
+
+
+def test_migrate_provider_setup_data_seeding_is_idempotent() -> None:
+    """The seeding pass reports one change, so settings.json is not rewritten every startup."""
+    data: dict[str, Any] = {
+        "providers": {"jellyfin--1": {"domain": "jellyfin", "values": {"url": "https://jf"}}}
+    }
+    assert migrate_provider_setup_data(data, _fake_encrypt) is True
+    assert migrate_provider_setup_data(data, _fake_encrypt) is False
+
+
+def test_migrate_provider_setup_data_never_overwrites_a_collected_value() -> None:
+    """A value the setup flow collected is left as it is, even when a default is recorded."""
+    setup_data = {
+        "verify_ssl": False,  # deliberately turned off in the setup flow
+        "url": ENCRYPT_SUFFIX + "https://jf.example",
+        "username": ENCRYPT_SUFFIX + "alice",
+        "password": ENCRYPT_SUFFIX + "pw",
+    }
+    data: dict[str, Any] = {
+        "providers": {"jellyfin--1": {"domain": "jellyfin", "setup_data": dict(setup_data)}}
+    }
+    assert migrate_provider_setup_data(data, _fake_encrypt) is False
+    assert data["providers"]["jellyfin--1"]["setup_data"] == setup_data
+
+
+def test_migrate_provider_setup_data_keeps_tls_verification_on() -> None:
+    """A config with no stored verify_ssl must not silently drop to unverified TLS."""
+    data: dict[str, Any] = {
+        "providers": {
+            "jellyfin--1": {"domain": "jellyfin", "values": {"url": "https://jf.example"}},
+            "audiobookshelf--1": {"domain": "audiobookshelf", "values": {"url": "https://abs"}},
+        }
+    }
+    assert migrate_provider_setup_data(data, _fake_encrypt) is True
+    assert data["providers"]["jellyfin--1"]["setup_data"]["verify_ssl"] is True
+    assert data["providers"]["audiobookshelf--1"]["setup_data"]["verify_ssl"] is True
+
+
+def test_migrated_plex_config_builds_a_usable_server_url(tmp_path: Path) -> None:
+    """The reported crash: a migrated Plex config must build `https://<host>:32400`, not `:None`."""
+    mass = SimpleNamespace(storage_path=str(tmp_path))
+    controller = ConfigController(mass)  # type: ignore[arg-type]
+    controller.initialized = True
+    controller.save = lambda **_kwargs: None  # type: ignore[method-assign]
+    controller.set(CONF_SERVER_ID, uuid4().hex)
+    controller._init_encryption()
+
+    # the reporter's install: TLS on the standard port, so only the two keys that differed
+    # from their pre-flow defaults were ever written to settings.json
+    controller._data["providers"] = {
+        "plex--1": {
+            "domain": "plex",
+            "values": {
+                "local_server_ip": "local.abc.plex.direct",
+                "local_server_ssl": True,
+            },
+        }
+    }
+    assert migrate_provider_setup_data(controller._data, controller.encrypt_string) is True
+
+    provider = _setup_value_reader(controller, "plex", "plex--1")
+    # mirrors how plex.handle_async_init builds its base url
+    protocol = "https" if provider.get_setup_value("local_server_ssl") else "http"
+    host = provider.get_setup_value("local_server_ip")
+    port = provider.get_setup_value("local_server_port")
+    assert f"{protocol}://{host}:{port}" == "https://local.abc.plex.direct:32400"
+    # and the certificate verification the reporter had configured is still on
+    assert provider.get_setup_value("local_server_verify_cert") is True
+
+
+def test_nfs_subfolder_is_never_resurrected_by_seeding() -> None:
+    """The NFS fold deletes `subfolder` for good; seeding must not put an empty one back."""
+    data: dict[str, Any] = {
+        "providers": {
+            "filesystem_nfs--1": {
+                "domain": "filesystem_nfs",
+                "values": {
+                    "host": "nas.local",
+                    "export_path": "/volume1",
+                    "subfolder": "Music",
+                },
+            }
+        }
+    }
+    assert migrate_provider_setup_data(data, _fake_encrypt) is True
+    assert migrate_nfs_subfolder_into_export_path(data, _fake_encrypt, _fake_decrypt) is True
+    setup_data = data["providers"]["filesystem_nfs--1"]["setup_data"]
+    assert setup_data["export_path"] == ENCRYPT_SUFFIX + "/volume1/Music"
+    assert "subfolder" not in setup_data
+    # the next startup runs the same pass again and must leave the folded config alone
+    assert migrate_provider_setup_data(data, _fake_encrypt) is False
+    assert "subfolder" not in setup_data
+
+
+def test_preflow_defaults_resolve_through_get_setup_value(tmp_path: Path) -> None:
+    """Every recorded default is readable again through the real setup-value read path."""
+    mass = SimpleNamespace(storage_path=str(tmp_path))
+    controller = ConfigController(mass)  # type: ignore[arg-type]
+    controller.initialized = True
+    controller.save = lambda **_kwargs: None  # type: ignore[method-assign]
+    controller.set(CONF_SERVER_ID, uuid4().hex)
+    controller._init_encryption()
+
+    controller._data["providers"] = {
+        f"{domain}--1": {"domain": domain} for domain in PROVIDER_SETUP_FLOW_KEY_DEFAULTS
+    }
+    assert migrate_provider_setup_data(controller._data, controller.encrypt_string) is True
+
+    for domain, defaults in PROVIDER_SETUP_FLOW_KEY_DEFAULTS.items():
+        instance_id = f"{domain}--1"
+        provider = _setup_value_reader(controller, domain, instance_id)
+        for key, default in defaults.items():
+            assert provider.get_setup_value(key) == default, f"{domain}.{key}"
 
 
 def test_migrate_player_setup_data_moves_credentials() -> None:

@@ -39,6 +39,8 @@ from music_assistant.controllers.player_queues.constants import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from music_assistant_models.config_entries import ConfigValueType
+
 LOGGER = logging.getLogger(__name__)
 
 # removed player config key, only referenced by its migration
@@ -451,6 +453,91 @@ PROVIDER_SETUP_FLOW_KEYS: dict[str, tuple[str, ...]] = {
     "zvuk_music": ("token",),
 }
 
+# Pre-setup-flow `default_value` of the keys above, for the same one-off migration, transcribed
+# from the provider tree at 17e4e60ff^ (the commit before "Guided setup flows for providers and
+# players" #5010). A legacy config only ever persisted a value that *differed* from its entry's
+# default_value (see Config.to_raw), so a setting the user left at its default was never written
+# to settings.json at all: there is nothing for the migration to move, and the key is no longer a
+# declared config entry to fall back on, so get_setup_value would resolve it to None.
+# As above, the literal strings are the persisted config keys, not the CONF_* symbol names.
+#
+# The migration seeds these for every owned key still absent from `setup_data`, without checking
+# whether the config predates the flows - a config an earlier 2.10 pre-release already migrated
+# has the same shape as a flow-created one, so any such check would leave those installs broken
+# for good. A flow-created instance can therefore be seeded too, for a key its flow never
+# collects because the provider only writes it at runtime (ard_audiothek's "token_expiry"). That
+# is safe because such a key's default is what its read site already falls back to when the key
+# is absent, so seeding changes what is stored and not what the provider does. Every key where
+# absence *does* change behaviour - plex's connection details, the verify_ssl entries - is one
+# its flow always collects, and collects with this same default, so those can only ever be
+# seeded into a config that predates the flows.
+#
+# Recorded is every key whose pre-flow default was a static, install-independent value, whether
+# or not its read site defends itself today: that rule is verifiable against the tree above,
+# where "only the undefended ones" would be a per-key judgement that rots as read sites change.
+# A key that had no default is absent rather than mapped to None, so "not recorded" stays
+# distinguishable from "recorded as None". Deliberately not recorded:
+# - hass "url"/"verify_ssl": the pre-flow defaults differed per install (add-on: the fixed
+#   internal url and verify_ssl False; manual: no url default and verify_ssl True), so no
+#   single value is correct. On the add-on both still come from fixed (hidden) config entries
+#   carrying their value, and the manual read sites already pass True themselves.
+# - yandex_ynison "ym_instance": its pre-flow default was derived from live state (it
+#   auto-selected the only yandex_music instance when there was no manual token), which a
+#   migration cannot reproduce. Both its read sites treat the key as absent the same way they
+#   treat the "use own credentials" sentinel, so nothing regresses by leaving it unset.
+# - filesystem_nfs "subfolder": migrate_nfs_subfolder_into_export_path below folds and then
+#   deletes this key, so seeding its empty default would resurrect it on the next startup.
+# TODO: remove after 2.13 release
+PROVIDER_SETUP_FLOW_KEY_DEFAULTS: dict[str, dict[str, ConfigValueType]] = {
+    "airplay_receiver": {"mass_player_id": "__auto__", "airplay_name": "Music Assistant"},
+    "alexa": {"url": "amazon.com", "api_url": "http://localhost:5000"},
+    "ard_audiothek": {"token_expiry": 0},
+    "ariacast_receiver": {"mass_player_id": "__auto__"},
+    "audible": {"locale": "us"},
+    "audiobookshelf": {"verify_ssl": True},
+    "filesystem_google_drive": {"content_type": "music", "folder_id": "root"},
+    "filesystem_local": {"content_type": "music", "path": "/media"},
+    "filesystem_nfs": {"content_type": "music", "nfs_version": ""},
+    "filesystem_onedrive": {"content_type": "music", "folder_id": "root"},
+    "filesystem_smb": {
+        "content_type": "music",
+        "username": "guest",
+        "subfolder": "",
+        "smb_version": "3.0",
+    },
+    "gpodder": {"verify_ssl": True},
+    "hue_entertainment": {"hue_username": "", "hue_clientkey": ""},
+    "jellyfin": {"verify_ssl": True},
+    # the pre-flow entry defaulted to the stored network, falling back to Last.fm when absent
+    "lastfm_scrobble": {"_provider": "lastfm"},
+    "neteasecloudmusic": {"api_base_url": "http://127.0.0.1:3000"},
+    # nicovideo builds its entries through a factory: both secure strings defaulted to ""
+    "nicovideo": {"password": "", "user_session": ""},
+    "plex": {
+        "local_server_port": 32400,
+        "local_server_ssl": False,
+        "local_server_verify_cert": True,
+        "library_type": "music",
+    },
+    "siriusxm": {"sxm_region": "US"},
+    "spotify_connect": {"mass_player_id": "__auto__", "publish_name": "Music Assistant"},
+    "vban_receiver": {
+        "bind_ip": "0.0.0.0",
+        "bind_port": 6980,
+        "sender_host": "127.0.0.1",
+        "vban_stream_name": "Network AUX",
+        "audio_format": "S16LE",
+        "sample_rate": 44100,
+        "audio_channels": 2,
+    },
+    "webdav": {"content_type": "music", "verify_ssl": False},
+    "yandex_smarthome": {"connection_type": "cloud"},
+    # the "use own credentials" sentinel of the shared Yandex auth layer
+    "yandex_station": {"ym_instance": "__own__"},
+    "yandex_ynison": {"mass_player_id": "__auto__", "publish_name": "Music Assistant"},
+    "ytmusic": {"po_token_server_url": "http://127.0.0.1:4416"},
+}
+
 
 async def migrate(data: dict[str, Any]) -> bool:  # noqa: PLR0915
     """Migrate the persistent settings data in-place; return True if anything changed."""
@@ -630,6 +717,10 @@ def migrate_provider_setup_data(data: dict[str, Any], encrypt: Callable[[str], s
     """
     Move each provider's setup-flow-owned keys from `values` to `setup_data` in-place.
 
+    Keys that a legacy config left at their pre-flow default were never persisted, so they
+    cannot be moved; those are seeded from PROVIDER_SETUP_FLOW_KEY_DEFAULTS instead, which
+    also repairs a config an earlier 2.10 pre-release already stripped.
+
     Runs after encryption is initialized (unlike migrate()), so string values are
     encrypted at rest with the given callback - matching how the setup flows persist
     collected values. Returns True if anything changed.
@@ -645,30 +736,33 @@ def migrate_provider_setup_data(data: dict[str, Any], encrypt: Callable[[str], s
     for provider_cfg in all_provider_configs.values():
         if not isinstance(provider_cfg, dict):
             continue
-        owned_keys = PROVIDER_SETUP_FLOW_KEYS.get(provider_cfg.get("domain", ""))
+        domain = provider_cfg.get("domain", "")
+        owned_keys = PROVIDER_SETUP_FLOW_KEYS.get(domain)
         if not owned_keys:
             continue
-        values = provider_cfg.get("values")
-        if not isinstance(values, dict):
-            continue
-        movable_keys = [key for key in owned_keys if key in values]
         setup_data = provider_cfg.get("setup_data")
-        needs_airplay_default = provider_cfg.get("domain") == "airplay_receiver" and (
-            not isinstance(setup_data, dict) or "airplay_name" not in setup_data
-        )
-        if not movable_keys and not needs_airplay_default:
-            continue
         if not isinstance(setup_data, dict):
             setup_data = {}
-            provider_cfg["setup_data"] = setup_data
+        values = provider_cfg.get("values")
+        if not isinstance(values, dict):
+            values = {}
+        movable_keys = [key for key in owned_keys if key in values]
+        seedable = {
+            key: default
+            for key, default in PROVIDER_SETUP_FLOW_KEY_DEFAULTS.get(domain, {}).items()
+            if key not in setup_data and key not in movable_keys
+        }
+        if not movable_keys and not seedable:
+            continue
+        provider_cfg["setup_data"] = setup_data
         for key in movable_keys:
             # a value already collected into setup_data wins; only drop the stale copy
             if key not in setup_data:
                 value = values[key]
                 setup_data[key] = encrypt(value) if isinstance(value, str) else value
             del values[key]
-        if needs_airplay_default and "airplay_name" not in setup_data:
-            setup_data["airplay_name"] = encrypt("Music Assistant")
+        for key, default in seedable.items():
+            setup_data[key] = encrypt(default) if isinstance(default, str) else default
         changed = True
     if changed:
         LOGGER.info("Migrated provider setup values into setup_data")

@@ -1,18 +1,57 @@
 """Tests for Audiobookshelf provider initialization."""
 
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-from music_assistant_models.enums import MediaType, ProviderFeature
+from aioaudiobookshelf.exceptions import LoginError as AbsLoginError
+from music_assistant_models.config_entries import ProviderConfig
+from music_assistant_models.enums import MediaType, ProviderFeature, ProviderType
+from music_assistant_models.errors import LoginFailed
 
 from music_assistant.models.music_provider import MusicProvider
 from music_assistant.providers.audiobookshelf import Audiobookshelf
 from music_assistant.providers.audiobookshelf.helpers import LibraryHelper
 
+if TYPE_CHECKING:
+    from aioaudiobookshelf.client.session_configuration import (
+        SessionConfiguration as AbsSessionConfiguration,
+    )
+
 
 def test_supported_features_before_async_init(provider: Audiobookshelf) -> None:
     """Provider features are available before asynchronous initialization."""
     assert ProviderFeature.PLAYLIST_CREATE_AUDIOBOOKS in provider.supported_features
+
+
+@pytest.mark.asyncio
+async def test_verify_ssl_defaults_to_on(provider: Audiobookshelf) -> None:
+    """A config with no stored verify_ssl must still verify certificates."""
+    # nothing collected by a setup flow and no declared config entry to fall back on, as for
+    # a config migrated from before setup flows existed
+    provider.mass.config.get = Mock(return_value={})  # type: ignore[method-assign]
+    provider.config = ProviderConfig(
+        values={},
+        type=ProviderType.MUSIC,
+        domain="audiobookshelf",
+        instance_id="audiobookshelf--test123",
+    )
+    session_configs: list[AbsSessionConfiguration] = []
+
+    async def _capture(session_config: AbsSessionConfiguration, **_kwargs: object) -> object:
+        session_configs.append(session_config)
+        raise AbsLoginError("stop here")
+
+    with (
+        patch(
+            "music_assistant.providers.audiobookshelf.aioabs.get_user_and_socket_client", _capture
+        ),
+        pytest.raises(LoginFailed),
+    ):
+        await provider.handle_async_init()
+
+    assert session_configs
+    assert session_configs[0].verify_ssl is True
 
 
 @pytest.mark.asyncio

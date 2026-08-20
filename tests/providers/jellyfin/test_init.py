@@ -11,6 +11,8 @@ from music_assistant.mass import MusicAssistant
 from tests.common import get_fixtures_dir, wait_for_sync_completion
 
 if TYPE_CHECKING:
+    from aiojellyfin import Connection
+    from aiojellyfin.session import SessionConfiguration
     from music_assistant_models.config_entries import ProviderConfig
 
 
@@ -48,6 +50,33 @@ async def jellyfin_provider(mass: MusicAssistant) -> AsyncGenerator[ProviderConf
             await mass.music.start_sync()
 
         yield config
+
+
+async def test_verify_ssl_defaults_to_on(mass: MusicAssistant) -> None:
+    """A config with no stored verify_ssl must still verify certificates."""
+    f = FixtureBuilder()
+    authenticate_by_name = f.to_authenticate_by_name()
+    session_configs: list[SessionConfiguration] = []
+
+    async def _capture(
+        session_config: SessionConfiguration, username: str, password: str = ""
+    ) -> Connection:
+        session_configs.append(session_config)
+        return await authenticate_by_name(session_config, username, password)
+
+    with mock.patch("music_assistant.providers.jellyfin.authenticate_by_name", _capture):
+        async with wait_for_sync_completion(mass):
+            await mass.config._create_provider_instance(
+                "jellyfin",
+                {},
+                # no verify_ssl collected, as for a config migrated from before setup flows
+                setup_data=mass.config._encrypt_values(
+                    {"url": "http://localhost", "username": "username", "password": "password"}
+                ),
+            )
+
+    assert session_configs
+    assert session_configs[0].verify_ssl is True
 
 
 @pytest.mark.usefixtures("jellyfin_provider")

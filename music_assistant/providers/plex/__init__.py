@@ -279,7 +279,7 @@ class PlexProvider(RecommendationPayloadMixin, MusicProvider):
             try:
                 session = requests.Session()
                 session.verify = (
-                    bool(self.get_setup_value(CONF_LOCAL_SERVER_VERIFY_CERT))
+                    bool(self.get_setup_value(CONF_LOCAL_SERVER_VERIFY_CERT, True))
                     if self.get_setup_value(CONF_LOCAL_SERVER_SSL)
                     else False
                 )
