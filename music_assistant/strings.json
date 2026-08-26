@@ -225,14 +225,18 @@
         "flac": "FLAC (lossless, compressed)",
         "mp3": "MP3 (lossy)",
         "aac": "AAC (lossy)",
-        "wav": "WAV (lossless, uncompressed)"
+        "wav": "WAV (uncompressed PCM)"
       },
       "option_descriptions": {
         "flac": "Lossless and compressed — full quality at a moderate bitrate. The default and best choice for most players.",
         "mp3": "Lossy — smaller bitrate at some quality cost. Use for players that can't play FLAC, or to save bandwidth.",
         "aac": "Lossy — comparable to MP3; pick it for players that prefer AAC.",
-        "wav": "Lossless but uncompressed — highest bandwidth. Only needed for players that can't handle FLAC."
+        "wav": "Uncompressed PCM audio in a WAV container — highest bandwidth. Only needed for players that can't handle FLAC."
       }
+    },
+    "prefer_wav_for_live_sources": {
+      "label": "Prefer low-latency WAV for live sources",
+      "description": "Send live sources such as Spotify Connect and AirPlay Receiver as uncompressed PCM audio in a WAV container to reduce playback delay. Disable this if the player cannot play continuous WAV streams; Music Assistant will use the configured output codec instead."
     },
     "play_media_overrides_group": {
       "label": "Play Media overrides active group",
@@ -371,10 +375,20 @@
       }
     },
     "mass_player_id": {
-      "options": {
-        "__auto__": "Auto (prefer playing player)"
-      },
       "label": "Connected Music Assistant Player"
+    },
+    "connected_players": {
+      "label": "Connected players",
+      "description": "The Music Assistant players this plugin exposes. Every selected player is advertised as its own device on the network and audio streamed to it plays on that player. Leave empty to keep the plugin idle."
+    },
+    "publish_name_template": {
+      "label": "Advertised device name",
+      "description": "How each advertised device is named, based on the connected player's name.",
+      "options": {
+        "player_mass": "Player name | Music Assistant",
+        "player": "Player name only",
+        "mass_player": "Music Assistant | Player name"
+      }
     },
     "auth_device": {
       "label": "Login with device code",
@@ -434,6 +448,7 @@
     "playback": "Queue Playback",
     "items_to_select": "Items to select",
     "default_enqueue_option": "Default enqueue option",
+    "click_actions": "Click actions",
     "autoplay": "Autoplay",
     "crossfade": "Crossfade",
     "smart_shuffle": "Smart shuffle",
@@ -1134,6 +1149,9 @@
     "link_control": {
       "name": "Link control"
     },
+    "network_name": {
+      "name": "Network name"
+    },
     "party_mode": {
       "name": "Party mode"
     },
@@ -1175,6 +1193,7 @@
     "setup_failed": "Setup failed. Please check the configuration and try again.",
     "login_failed": "Login failed. Please check your credentials and try again.",
     "audio_error": "An error occurred while processing audio.",
+    "provider_stream_limit": "{0} has reached its limit of {1} simultaneous streams. Stop playback on another player and try again.",
     "queue_empty": "The queue is empty.",
     "unsupported_feature": "This feature is not supported.",
     "unsupported_system": "This is not supported on this system.",
@@ -1213,6 +1232,9 @@
     },
     "finish_library_sync": {
       "description": "Your library is imported in the background and can take a while the first time. It keeps filling up as the import progresses, so it is normal for things to look empty or incomplete at first."
+    },
+    "finish_silent": {
+      "title": "Done"
     }
   },
   "page": {
