@@ -1,0 +1,146 @@
+name: Track upstream dev + aiosendspin HEAD
+
+# Regenerates the `sendspin-head-track` branch: upstream music-assistant/server@dev
+# with exactly one change layered on top - the sendspin provider installs aiosendspin
+# from its git HEAD instead of the pinned PyPI release.
+#
+# This workflow lives on the fork's default branch (`dev`) for two reasons:
+#   1. GitHub only fires `schedule` triggers from the default branch.
+#   2. The track branch is rebuilt from upstream on every run, so a workflow stored
+#      there would delete itself on the first run.
+#
+# The track branch is REBUILT, not merged. That keeps it a clean "upstream + one
+# patch" with no accumulating merge commits and no drift, so it always tests
+# current upstream against current aiosendspin.
+
+on:
+  schedule:
+    # Hourly. Upstream pushes far more often than the MA dev add-on is rebuilt,
+    # so the branch only needs to be reasonably fresh, not instantaneous.
+    - cron: "0 * * * *"
+  workflow_dispatch:
+    inputs:
+      aiosendspin_ref:
+        description: "aiosendspin git ref to track (branch, tag or SHA)"
+        required: false
+        default: "main"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sendspin-head-track
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/music-assistant/server.git
+  UPSTREAM_BRANCH: dev
+  TRACK_BRANCH: sendspin-head-track
+  AIOSENDSPIN_REPO: https://github.com/Sendspin/aiosendspin
+  AIOSENDSPIN_REF: ${{ github.event.inputs.aiosendspin_ref || 'main' }}
+
+jobs:
+  retrack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM_REPO" 2>/dev/null \
+            || git remote set-url upstream "$UPSTREAM_REPO"
+          git fetch upstream "$UPSTREAM_BRANCH"
+
+      - name: Resolve refs
+        id: refs
+        run: |
+          upstream_sha="$(git rev-parse "upstream/$UPSTREAM_BRANCH")"
+
+          # Resolved only for logging and the commit message. The manifest keeps
+          # pointing at the moving ref, so the add-on picks up newer aiosendspin
+          # commits even between runs of this workflow.
+          aiosendspin_sha="$(git ls-remote "$AIOSENDSPIN_REPO" "$AIOSENDSPIN_REF" | awk '{print $1}' | head -n1)"
+          if [ -z "$aiosendspin_sha" ]; then
+            echo "ERROR: could not resolve '$AIOSENDSPIN_REF' in $AIOSENDSPIN_REPO" >&2
+            exit 1
+          fi
+
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "aiosendspin_sha=$aiosendspin_sha" >> "$GITHUB_OUTPUT"
+          echo "upstream dev:    $upstream_sha"
+          echo "aiosendspin ref: $AIOSENDSPIN_REF ($aiosendspin_sha)"
+
+      - name: Rebuild track branch from upstream
+        run: git checkout -B "$TRACK_BRANCH" "upstream/$UPSTREAM_BRANCH"
+
+      - name: Re-apply the aiosendspin HEAD pin
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+
+          repo = os.environ["AIOSENDSPIN_REPO"]
+          ref = os.environ["AIOSENDSPIN_REF"]
+          pin = f"aiosendspin[server] @ git+{repo}@{ref}"
+
+          path = pathlib.Path("music_assistant/providers/sendspin/manifest.json")
+          manifest = json.loads(path.read_text())
+          reqs = manifest["requirements"]
+
+          for i, req in enumerate(reqs):
+              # Matches the upstream PyPI pin and any previously applied git pin.
+              if re.match(r"^aiosendspin(\[|\s|@|=)", req):
+                  reqs[i] = pin
+                  break
+          else:
+              # Failing loudly matters: a silent miss would publish a branch that
+              # tests the released aiosendspin while claiming to track HEAD.
+              raise SystemExit(
+                  "aiosendspin requirement not found in the sendspin manifest. "
+                  "Upstream likely moved or renamed it; update this workflow."
+              )
+
+          path.write_text(json.dumps(manifest, indent=2) + "\n")
+          print(f"pinned: {pin}")
+          PY
+
+      - name: Regenerate requirements_all.txt
+        run: python scripts/gen_requirements_all.py
+
+      - name: Validate manifests
+        run: |
+          python scripts/check_manifests.py
+          python scripts/sync_manifest_from_requirements.py
+
+      - name: Verify the pin landed
+        run: |
+          grep -q 'aiosendspin\[server\] @ git+' requirements_all.txt
+          echo "requirements_all.txt carries the git pin"
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet; then
+            echo "Pin produced no diff against upstream; nothing to commit."
+          else
+            git add music_assistant/providers/sendspin/manifest.json requirements_all.txt
+            git commit \
+              -m "test: track aiosendspin ${AIOSENDSPIN_REF} (${{ steps.refs.outputs.aiosendspin_sha }})" \
+              -m "Rebuilt on music-assistant/server@dev ${{ steps.refs.outputs.upstream_sha }}." \
+              -m "Automated by .github/workflows/sendspin-head-track.yml. Test branch - do not merge upstream."
+          fi
+
+          # The branch is deliberately rebuilt each run, so the push rewrites it.
+          git push --force origin "$TRACK_BRANCH"
