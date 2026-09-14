@@ -707,6 +707,7 @@ class PandoraProvider(MusicProvider):
             "POST",
             SOD_SEARCH_ENDPOINT,
             data={"query": search_query, "types": types, "count": limit, "annotate": True},
+            exhausted_retry_reasons=frozenset({RETRY_REASON_STREAM_VIOLATION}),
         )
         annotations = response.get("annotations") or {}
         tracks: list[Track] = []

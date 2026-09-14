@@ -907,6 +907,25 @@ async def test_catalogue_search_asks_only_for_the_requested_types() -> None:
     assert calls[0]["types"] == ["TR"]
 
 
+async def test_catalogue_search_never_takes_the_stream_over() -> None:
+    """Searching the catalogue is metadata: taking the stream over would stop another device."""
+    reasons: list[frozenset[str]] = []
+
+    async def _recording_request(
+        method: str,  # noqa: ARG001
+        url: str,  # noqa: ARG001
+        data: dict[str, Any] | None = None,  # noqa: ARG001
+        exhausted_retry_reasons: frozenset[str] = frozenset(),
+    ) -> dict[str, Any]:
+        reasons.append(exhausted_retry_reasons)
+        return {"results": [], "annotations": {}}
+
+    provider, _ = _searching_provider()
+    provider._api_request = _recording_request  # type: ignore[method-assign]
+    await provider.search("coldplay", [MediaType.TRACK])
+    assert reasons == [frozenset({RETRY_REASON_STREAM_VIOLATION})]
+
+
 _ALBUM_ID = "AL:1728"
 # Pandora lists an album's tracks newest-id-first, which is also playing order: the ids
 # descend while the track numbers ascend. Anything that sorts this listing shows it wrong.
