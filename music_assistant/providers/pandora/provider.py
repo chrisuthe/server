@@ -64,6 +64,7 @@ from .constants import (
     QUALITY_STANDARD,
     RETRY_REASON_AUTH,
     RETRY_REASON_STREAM_VIOLATION,
+    SOD_SEARCH_ENDPOINT,
     STATIONS_ENDPOINT,
 )
 from .fragments import (
@@ -200,26 +201,22 @@ class PandoraProvider(MusicProvider):
         media_types: list[MediaType],
         limit: int = 25,
     ) -> SearchResults:
-        """Search the user's stations by name."""
-        # search is limited to the user's own stations: the API's catalogue search
-        # requires the legacy endpoints this provider does not speak
-        if MediaType.RADIO not in media_types:
-            return SearchResults()
-        # substring rather than compare_strings: that helper answers "are these the same
-        # entity", and its fuzzy mode rejects a length difference over four characters, so a
-        # short query like "rock" could never reach a station called "Classic Rock Radio"
-        query = search_query.lower().strip()
+        """Search the user's stations and, for an on-demand account, Pandora's catalogue."""
+        query = search_query.strip()
         if not query:
-            # every name contains the empty string, so an empty query would match the whole
-            # library rather than nothing
             return SearchResults()
-        results: list[Radio] = []
-        async for station in self._get_stations():
-            if query in station.name.lower():
-                results.append(station)
-                if len(results) >= limit:
-                    break
-        return SearchResults(radio=results)
+        stations = (
+            await self._search_stations(query, limit) if MediaType.RADIO in media_types else []
+        )
+        types = [
+            prefix
+            for media_type, prefix in ((MediaType.TRACK, "TR"), (MediaType.ALBUM, "AL"))
+            if media_type in media_types
+        ]
+        if not types or not self._on_demand_available:
+            return SearchResults(radio=stations)
+        tracks, albums = await self._search_catalogue(query, types, limit)
+        return SearchResults(radio=stations, tracks=tracks, albums=albums)
 
     async def get_library_radios(self) -> AsyncGenerator[Radio]:
         """Retrieve the user's stations as dynamic radio stations."""
@@ -655,6 +652,46 @@ class PandoraProvider(MusicProvider):
         response = await self._api_request("POST", STATIONS_ENDPOINT, data={"pageSize": 250})
         for station in response.get("stations", []):
             yield parse_station(self, station)
+
+    async def _search_stations(self, query: str, limit: int) -> list[Radio]:
+        """Return the user's stations whose name contains the query."""
+        # substring rather than compare_strings: that helper answers "are these the same
+        # entity", and its fuzzy mode rejects a length difference over four characters, so a
+        # short query like "rock" could never reach a station called "Classic Rock Radio"
+        query = query.lower()
+        results: list[Radio] = []
+        async for station in self._get_stations():
+            if query in station.name.lower():
+                results.append(station)
+                if len(results) >= limit:
+                    break
+        return results
+
+    async def _search_catalogue(
+        self, search_query: str, types: list[str], limit: int
+    ) -> tuple[list[Track], list[Album]]:
+        """
+        Search Pandora's catalogue for the given type prefixes.
+
+        :param types: Type prefixes to search for, as Pandora spells them - `["TR", "AL"]`.
+        """
+        response = await self._api_request(
+            "POST",
+            SOD_SEARCH_ENDPOINT,
+            data={"query": search_query, "types": types, "count": limit, "annotate": True},
+        )
+        annotations = response.get("annotations") or {}
+        tracks: list[Track] = []
+        albums: list[Album] = []
+        for result_id in response.get("results") or []:
+            if not isinstance(record := annotations.get(result_id), dict):
+                continue
+            rights = record.get("rightsInfo") or {}
+            if "TR" in types and result_id.startswith("TR:") and rights.get("hasInteractive"):
+                tracks.append(parse_track_record(self, record, result_id, annotations))
+            elif "AL" in types and result_id.startswith("AL:"):
+                albums.append(parse_album_record(self, record, result_id, annotations))
+        return tracks, albums
 
     def _get_or_create_session(self, station_id: str) -> PandoraStationSession:
         """Get or create a station session, with LRU eviction if needed."""

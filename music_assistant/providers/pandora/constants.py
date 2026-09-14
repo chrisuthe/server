@@ -10,6 +10,7 @@ STATIONS_ENDPOINT = f"{API_BASE}/station/getStations"
 PLAYLIST_FRAGMENT_ENDPOINT = f"{API_BASE}/playlist/getFragment"
 PLAYBACK_RESUMED_ENDPOINT = f"{API_BASE}/station/playbackResumed"
 PLAYBACK_SOURCE_ENDPOINT = f"{API_BASE}/playback/source"
+SOD_SEARCH_ENDPOINT = f"{API_HOST}/v3/sod/search"
 
 # Pandora Error Code Categories
 # Authentication and authorization failures

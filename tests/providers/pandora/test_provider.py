@@ -16,7 +16,7 @@ from music_assistant_models.errors import (
     ProviderUnavailableError,
     ResourceTemporarilyUnavailable,
 )
-from music_assistant_models.media_items import Radio, SearchResults
+from music_assistant_models.media_items import Album, Radio, SearchResults, Track
 
 from music_assistant.constants import CONF_PASSWORD, CONF_USERNAME
 from music_assistant.providers.pandora import provider as provider_module
@@ -26,6 +26,7 @@ from music_assistant.providers.pandora.constants import (
     PLAYBACK_SOURCE_ENDPOINT,
     QUALITY_HIGH,
     RETRY_REASON_STREAM_VIOLATION,
+    SOD_SEARCH_ENDPOINT,
     STATIONS_ENDPOINT,
 )
 from music_assistant.providers.pandora.fragments import (
@@ -721,6 +722,186 @@ async def test_search_for_an_empty_query_returns_nothing(search_query: str) -> N
     results = await provider.search(search_query, [MediaType.RADIO])
     assert results.radio == []
     assert calls == []
+
+
+async def test_an_empty_query_reaches_neither_lookup() -> None:
+    """An empty query returns nothing, even for an on-demand account asking for tracks."""
+    provider = _provider(stations=_stations(["Coldplay Radio"]))
+    provider._on_demand_available = True
+    calls: list[str] = []
+    inner = provider._api_request
+
+    async def _recording_api_request(method: str, url: str, **kwargs: Any) -> dict[str, Any]:
+        """Record the endpoint before delegating."""
+        calls.append(url)
+        return await inner(method, url, **kwargs)
+
+    provider._api_request = _recording_api_request  # type: ignore[method-assign, assignment]
+    results = await provider.search("  ", [MediaType.RADIO, MediaType.TRACK, MediaType.ALBUM])
+    assert results == SearchResults()
+    assert calls == []
+
+
+_CATALOGUE_RESULTS = ["TR:100", "AL:157378", "AR:346031", "TR:101"]
+
+_CATALOGUE_ANNOTATIONS: dict[str, Any] = {
+    "TR:100": {
+        "pandoraId": "TR:100",
+        "name": "Playable Song",
+        "albumId": "AL:157378",
+        "artistId": "AR:346031",
+        "duration": 232,
+        "isrc": "GBAYE0601498",
+        "rightsInfo": {"hasInteractive": True},
+    },
+    "TR:101": {
+        "pandoraId": "TR:101",
+        "name": "Station Only Song",
+        "albumId": "AL:157378",
+        "artistId": "AR:346031",
+        "duration": 199,
+        "rightsInfo": {"hasInteractive": False},
+    },
+    "AL:157378": {"pandoraId": "AL:157378", "name": "Some Album", "artistId": "AR:346031"},
+    "AR:346031": {"pandoraId": "AR:346031", "name": "Some Artist"},
+}
+
+
+def _searching_provider(
+    on_demand: bool = True,
+    stations: list[dict[str, Any]] | None = None,
+) -> tuple[PandoraProvider, list[dict[str, Any]]]:
+    """
+    Build a provider whose getStations and sod/search calls return canned payloads.
+
+    Returns the provider and a list recording each catalogue request body, so a test can
+    assert the call was never made at all rather than only that nothing came back.
+    """
+    provider = PandoraProvider.__new__(PandoraProvider)
+    provider.manifest = Mock(domain="pandora")
+    provider.config = Mock(instance_id="pandora--test")
+    provider.logger = Mock()
+    provider._sessions = {}
+    provider._high_quality_available = False
+    provider._on_demand_available = on_demand
+    catalogue_calls: list[dict[str, Any]] = []
+    station_list = _stations(["Coldplay Radio"]) if stations is None else stations
+
+    async def _fake_api_request(
+        method: str,  # noqa: ARG001
+        url: str,
+        data: dict[str, Any] | None = None,
+        **kwargs: Any,  # noqa: ARG001
+    ) -> dict[str, Any]:
+        """Return canned station/catalogue payloads instead of calling Pandora."""
+        if url == STATIONS_ENDPOINT:
+            return {"stations": station_list}
+        if url == SOD_SEARCH_ENDPOINT:
+            catalogue_calls.append(data or {})
+            return {
+                "results": list(_CATALOGUE_RESULTS),
+                "annotations": dict(_CATALOGUE_ANNOTATIONS),
+                "searchToken": "search-token",
+            }
+        raise AssertionError(f"unexpected endpoint {url}")
+
+    provider._api_request = _fake_api_request  # type: ignore[method-assign, assignment]
+    return provider, catalogue_calls
+
+
+async def test_entitled_search_returns_catalogue_tracks_and_albums() -> None:
+    """An account that can play on demand searches Pandora's catalogue, not just its own."""
+    provider, calls = _searching_provider()
+    results = await provider.search("coldplay", [MediaType.TRACK, MediaType.ALBUM])
+    assert len(calls) == 1
+    assert [track.item_id for track in results.tracks] == ["TR:100"]
+    assert [album.item_id for album in results.albums] == ["AL:157378"]
+    track = cast("Track", results.tracks[0])
+    assert track.name == "Playable Song"
+    assert track.duration == 232
+    assert track.album is not None
+    assert track.album.name == "Some Album"
+    assert track.artists[0].item_id == "AR:346031"
+
+
+async def test_a_searched_album_carries_its_artist() -> None:
+    """The AR: record is already in the search response, and an artist-less album never matches."""
+    provider, _ = _searching_provider()
+    results = await provider.search("coldplay", [MediaType.ALBUM])
+    album = cast("Album", results.albums[0])
+    assert [artist.item_id for artist in album.artists] == ["AR:346031"]
+    assert album.artists[0].name == "Some Artist"
+
+
+async def test_search_drops_a_track_the_account_cannot_play() -> None:
+    """A result without hasInteractive would fail on click, so it never becomes a result."""
+    provider, _ = _searching_provider()
+    results = await provider.search("coldplay", [MediaType.TRACK])
+    assert [track.item_id for track in results.tracks] == ["TR:100"]
+
+
+async def test_search_returns_only_the_types_that_were_asked_for() -> None:
+    """
+    Pandora answers a track search with albums and artists too, and core does not filter them.
+
+    Returning an album to a track-only search puts a result in front of the user that the
+    caller never asked for, from a search whose count was spent on tracks.
+    """
+    provider, _ = _searching_provider()
+    tracks_only = await provider.search("coldplay", [MediaType.TRACK])
+    assert tracks_only.albums == []
+    albums_only = await provider.search("coldplay", [MediaType.ALBUM])
+    assert albums_only.tracks == []
+    assert [album.item_id for album in albums_only.albums] == ["AL:157378"]
+
+
+async def test_search_does_not_return_artists() -> None:
+    """The response carries AR: records, but this provider has no artist page to open."""
+    provider, _ = _searching_provider()
+    results = await provider.search(
+        "coldplay", [MediaType.TRACK, MediaType.ALBUM, MediaType.ARTIST]
+    )
+    assert results.artists == []
+
+
+async def test_unentitled_search_returns_stations_and_makes_no_catalogue_call() -> None:
+    """A listener who cannot play a catalogue track must not be offered one."""
+    provider, calls = _searching_provider(on_demand=False)
+    results = await provider.search("coldplay", [MediaType.RADIO, MediaType.TRACK])
+    assert [radio.name for radio in results.radio] == ["Coldplay Radio"]
+    assert results.tracks == []
+    assert results.albums == []
+    assert calls == []
+
+
+async def test_entitled_search_still_returns_stations() -> None:
+    """Catalogue results sit alongside the account's own stations, not instead of them."""
+    provider, _ = _searching_provider()
+    results = await provider.search("coldplay", [MediaType.RADIO, MediaType.TRACK])
+    assert [radio.name for radio in results.radio] == ["Coldplay Radio"]
+    assert [track.item_id for track in results.tracks] == ["TR:100"]
+
+
+async def test_radio_only_search_makes_no_catalogue_call() -> None:
+    """Nothing in a radio-only search needs the catalogue, entitled or not."""
+    provider, calls = _searching_provider()
+    results = await provider.search("coldplay", [MediaType.RADIO])
+    assert [radio.name for radio in results.radio] == ["Coldplay Radio"]
+    assert calls == []
+
+
+async def test_catalogue_search_sends_the_measured_body() -> None:
+    """The body was measured against the live API; extra keys are guesses, not evidence."""
+    provider, calls = _searching_provider()
+    await provider.search("coldplay", [MediaType.TRACK, MediaType.ALBUM], limit=10)
+    assert calls == [{"query": "coldplay", "types": ["TR", "AL"], "count": 10, "annotate": True}]
+
+
+async def test_catalogue_search_asks_only_for_the_requested_types() -> None:
+    """A track-only search must not spend the result count on albums."""
+    provider, calls = _searching_provider()
+    await provider.search("coldplay", [MediaType.TRACK])
+    assert calls[0]["types"] == ["TR"]
 
 
 async def test_first_request_returns_a_fragment() -> None:
