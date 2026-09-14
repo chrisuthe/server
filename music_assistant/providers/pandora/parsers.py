@@ -17,6 +17,8 @@ from music_assistant_models.unique_list import UniqueList
 
 from music_assistant.helpers.util import parse_title_and_version
 
+from .constants import CATALOG_ART_BASE_URL
+
 if TYPE_CHECKING:
     from .provider import PandoraProvider
 
@@ -31,6 +33,18 @@ def _parse_art(provider: PandoraProvider, art: list[dict[str, Any]]) -> MediaIte
     return MediaItemImage(
         type=ImageType.THUMB,
         path=str(art_url),
+        provider=provider.instance_id,
+        remotely_accessible=True,
+    )
+
+
+def _parse_icon(provider: PandoraProvider, record: dict[str, Any]) -> MediaItemImage | None:
+    """Parse the image for a Pandora catalogue record, if it names one."""
+    if not (art_url := (record.get("icon") or {}).get("artUrl")):
+        return None
+    return MediaItemImage(
+        type=ImageType.THUMB,
+        path=f"{CATALOG_ART_BASE_URL}{art_url}",
         provider=provider.instance_id,
         remotely_accessible=True,
     )
@@ -184,6 +198,8 @@ def parse_track_record(
     )
     if isrc := record.get("isrc"):
         track.external_ids.add((ExternalID.ISRC, str(isrc)))
+    if image := _parse_icon(provider, record):
+        track.metadata.add_image(image)
     siblings = annotations or {}
     album_id = record.get("albumId")
     if album_id and isinstance(album_record := siblings.get(album_id), dict):
@@ -222,6 +238,8 @@ def parse_album_record(
             )
         },
     )
+    if image := _parse_icon(provider, record):
+        album.metadata.add_image(image)
     siblings = annotations or {}
     artist_id = record.get("artistId")
     if artist_id and isinstance(artist_record := siblings.get(artist_id), dict):

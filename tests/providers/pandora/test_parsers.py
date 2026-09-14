@@ -264,9 +264,28 @@ def test_album_record_without_siblings_is_still_usable() -> None:
         assert list(album.artists) == []
 
 
-def test_album_record_carries_no_image() -> None:
-    """A record's icon.artUrl is a relative path whose CDN base is unmeasured."""
-    record = {"name": "Some Album", "icon": {"artUrl": "images/abc/500W_500H.jpg"}}
+def test_album_record_carries_its_catalogue_art() -> None:
+    """A record's icon.artUrl is relative to Pandora's image host."""
+    record = {"name": "Some Album", "icon": {"artUrl": "images/abc/_500W_500H.jpg"}}
+    images = parse_album_record(_provider(), record, "AL:900").metadata.images
+    assert [image.path for image in images or []] == [
+        "https://content-images.p-cdn.com/images/abc/_500W_500H.jpg"
+    ]
+
+
+def test_track_record_carries_its_catalogue_art() -> None:
+    """A searched track shows its cover like a station track does."""
+    record = {"name": "Some Song", "icon": {"artUrl": "images/abc/_500W_500H.jpg"}}
+    images = parse_track_record(_provider(), record, "TR:900").metadata.images
+    assert [image.path for image in images or []] == [
+        "https://content-images.p-cdn.com/images/abc/_500W_500H.jpg"
+    ]
+
+
+@pytest.mark.parametrize("icon", [None, {}, {"artUrl": None}, {"artUrl": ""}])
+def test_record_without_art_carries_no_image(icon: dict[str, Any] | None) -> None:
+    """Records without usable art must parse cleanly with no image."""
+    record = {"name": "Some Album", "icon": icon}
     assert not parse_album_record(_provider(), record, "AL:900").metadata.images
 
 

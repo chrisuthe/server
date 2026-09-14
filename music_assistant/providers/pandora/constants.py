@@ -11,6 +11,7 @@ PLAYLIST_FRAGMENT_ENDPOINT = f"{API_BASE}/playlist/getFragment"
 PLAYBACK_RESUMED_ENDPOINT = f"{API_BASE}/station/playbackResumed"
 PLAYBACK_SOURCE_ENDPOINT = f"{API_BASE}/playback/source"
 SOD_SEARCH_ENDPOINT = f"{API_HOST}/v3/sod/search"
+CATALOG_ART_BASE_URL = "https://content-images.p-cdn.com/"
 
 # Pandora Error Code Categories
 # Authentication and authorization failures
