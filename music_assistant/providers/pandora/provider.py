@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import aiohttp
 from music_assistant_models.config_entries import (
@@ -53,6 +54,8 @@ from music_assistant.models.music_provider import MusicProvider
 
 from .constants import (
     ACCOUNT_FLAG_HIGH_QUALITY,
+    ACCOUNT_FLAG_ON_DEMAND,
+    CONF_DEVICE_UUID,
     CONF_QUALITY,
     CONF_TAKEOVER_ACTION,
     LOGIN_ENDPOINT,
@@ -74,6 +77,7 @@ from .helpers import (
     create_auth_headers,
     get_csrf_token,
     handle_pandora_error,
+    raise_if_playback_refused,
     read_account_flags,
 )
 
@@ -93,6 +97,8 @@ class PandoraProvider(MusicProvider):
     _sessions: dict[str, PandoraStationSession]
     _socks_proxy: bool = False
     _high_quality_available: bool = False
+    _on_demand_available: bool = False
+    _device_uuid: str = ""
 
     @property
     def max_concurrent_streams(self) -> int:
@@ -156,6 +162,11 @@ class PandoraProvider(MusicProvider):
         else:
             self.http_session = self.mass.http_session
         await self._authenticate(username, password)
+
+        if not (device_uuid := self.get_setup_value(CONF_DEVICE_UUID)):
+            device_uuid = str(uuid4())
+            self._update_setup_data(CONF_DEVICE_UUID, device_uuid)
+        self._device_uuid = str(device_uuid)
 
     async def unload(self, is_removed: bool = False) -> None:
         """Handle unload/close of the provider."""
@@ -363,11 +374,14 @@ class PandoraProvider(MusicProvider):
                 # on some accounts, so read through them rather than guarding after the fact.
                 flags = read_account_flags(response_data)
                 self._high_quality_available = ACCOUNT_FLAG_HIGH_QUALITY in flags
+                self._on_demand_available = ACCOUNT_FLAG_ON_DEMAND in flags
 
                 self.logger.info(
                     "Successfully authenticated with Pandora "
-                    "(high-quality streaming available: %s)",
+                    "(high-quality streaming available: %s, "
+                    "on-demand playback available: %s)",
                     self._high_quality_available,
+                    self._on_demand_available,
                 )
 
         except aiohttp.ClientError as err:
@@ -450,6 +464,8 @@ class PandoraProvider(MusicProvider):
                 if response.status >= 500:
                     await self.close()
                     raise ProviderUnavailableError("Pandora server error")
+                if response.status == 400:
+                    await raise_if_playback_refused(response)
                 if response.status >= 400:
                     await self.close()
                     raise InvalidDataError(f"Pandora API error: HTTP {response.status}")

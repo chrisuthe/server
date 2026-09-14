@@ -1,7 +1,8 @@
 """Constants for the Pandora music provider."""
 
 # API Endpoints
-API_BASE = "https://www.pandora.com/api/v1"
+API_HOST = "https://www.pandora.com/api"
+API_BASE = f"{API_HOST}/v1"
 LOGIN_ENDPOINT = f"{API_BASE}/auth/login"
 STATIONS_ENDPOINT = f"{API_BASE}/station/getStations"
 PLAYLIST_FRAGMENT_ENDPOINT = f"{API_BASE}/playlist/getFragment"
@@ -60,3 +61,8 @@ QUALITY_HIGH = "high"
 QUALITY_STANDARD = "standard"
 
 ACCOUNT_FLAG_HIGH_QUALITY = "highQualityStreamingAvailable"
+ACCOUNT_FLAG_ON_DEMAND = "onDemand"
+
+NO_ON_DEMAND_MESSAGE = "On-demand playback is not available on this Pandora account"
+
+CONF_DEVICE_UUID = "device_uuid"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import secrets
 from typing import Any
 
@@ -14,7 +15,7 @@ from music_assistant_models.errors import (
     ResourceTemporarilyUnavailable,
 )
 
-from .constants import AUTH_ERRORS, NOT_FOUND_ERRORS, UNAVAILABLE_ERRORS
+from .constants import AUTH_ERRORS, NO_ON_DEMAND_MESSAGE, NOT_FOUND_ERRORS, UNAVAILABLE_ERRORS
 
 
 def generate_csrf_token() -> str:
@@ -110,6 +111,25 @@ def create_auth_headers(csrf_token: str, auth_token: str | None = None) -> dict[
         headers["X-AuthToken"] = auth_token
 
     return headers
+
+
+async def raise_if_playback_refused(response: aiohttp.ClientResponse) -> None:
+    """
+    Raise MediaNotFoundError if a 400 response names a known playback refusal.
+
+    :param response: The still-open aiohttp response for a Pandora 400 status.
+    """
+    try:
+        error_body = await response.json()
+    except aiohttp.ContentTypeError, json.JSONDecodeError:
+        return
+    if not isinstance(error_body, dict):
+        return
+    error_string = error_body.get("errorString")
+    if error_string == "NO_ENTITLEMENTS":
+        raise MediaNotFoundError(NO_ON_DEMAND_MESSAGE)
+    if error_string == "NO_PLAYABLE_CONTENT":
+        raise MediaNotFoundError("This Pandora source has nothing playable")
 
 
 def read_account_flags(response_data: dict[str, Any]) -> set[str]:
