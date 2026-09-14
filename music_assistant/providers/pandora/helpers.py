@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import secrets
+from math import isfinite
 from typing import Any
 
 import aiohttp
@@ -15,7 +16,13 @@ from music_assistant_models.errors import (
     ResourceTemporarilyUnavailable,
 )
 
-from .constants import AUTH_ERRORS, NO_ON_DEMAND_MESSAGE, NOT_FOUND_ERRORS, UNAVAILABLE_ERRORS
+from .constants import (
+    AUTH_ERRORS,
+    NO_ON_DEMAND_MESSAGE,
+    NOT_FOUND_ERRORS,
+    REPLAY_GAIN_REFERENCE_LUFS,
+    UNAVAILABLE_ERRORS,
+)
 
 
 def generate_csrf_token() -> str:
@@ -130,6 +137,21 @@ async def raise_if_playback_refused(response: aiohttp.ClientResponse) -> None:
         raise MediaNotFoundError(NO_ON_DEMAND_MESSAGE)
     if error_string == "NO_PLAYABLE_CONTENT":
         raise MediaNotFoundError("This Pandora source has nothing playable")
+
+
+def loudness_from_file_gain(file_gain: Any) -> float | None:
+    """
+    Convert a Pandora `fileGain` figure to integrated loudness in LUFS, or None if unusable.
+
+    :param file_gain: A `fileGain` from a playback/source item; measured as a string.
+    """
+    try:
+        gain = float(file_gain)
+    except TypeError, ValueError:
+        return None
+    if not isfinite(gain):
+        return None
+    return REPLAY_GAIN_REFERENCE_LUFS - gain
 
 
 def read_account_flags(response_data: dict[str, Any]) -> set[str]:

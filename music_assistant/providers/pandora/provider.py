@@ -58,6 +58,7 @@ from .constants import (
     LOGIN_ENDPOINT,
     NO_ON_DEMAND_MESSAGE,
     PLAYBACK_RESUMED_ENDPOINT,
+    PLAYBACK_SOURCE_ENDPOINT,
     PLAYLIST_FRAGMENT_ENDPOINT,
     QUALITY_HIGH,
     QUALITY_STANDARD,
@@ -75,6 +76,7 @@ from .helpers import (
     create_auth_headers,
     get_csrf_token,
     handle_pandora_error,
+    loudness_from_file_gain,
     raise_if_playback_refused,
     read_account_flags,
 )
@@ -292,7 +294,7 @@ class PandoraProvider(MusicProvider):
         return parse_artist(self, prov_artist_id)
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
-        """Get streamdetails for a station track."""
+        """Get streamdetails for a track, minting on demand when no live fragment holds it."""
         if media_type != MediaType.TRACK:
             raise MediaNotFoundError(f"Unsupported media type: {media_type}")
         now = time.time()
@@ -305,8 +307,27 @@ class PandoraProvider(MusicProvider):
             if (fragment := session.current) is not None
             and (track := fragment.find(item_id)) is not None
         ]
-        playable = [holder for holder in holders if not holder[0].urls_expired(now)]
-        if not playable:
+        if playable := [holder for holder in holders if not holder[0].urls_expired(now)]:
+            # stations overlap, so the same song can sit in several sessions at once. Serve the
+            # freshest copy, not the one from whichever session happens to be oldest: an older
+            # station's expired fragment must not fail a playable track, and the fragment that is
+            # marked as having served the track has to be the one the audio URL came from.
+            fragment, track = max(playable, key=lambda holder: holder[0].fetched_at)
+            fragment.mark_resolved(item_id, now)
+            duration = int(track.get("trackLength") or 0)
+            can_seek = duration > 0
+            return StreamDetails(
+                provider=self.instance_id,
+                item_id=item_id,
+                audio_format=self._audio_format(),
+                media_type=MediaType.TRACK,
+                stream_type=StreamType.HTTP,
+                path=track["audioURL"],
+                duration=duration,
+                can_seek=can_seek,
+                allow_seek=can_seek,
+            )
+        if not self._on_demand_available:
             if holders:
                 # the signed URLs have outlived their TTL, which is what a long pause looks
                 # like from here. Refusing keeps the failure named rather than an opaque
@@ -314,25 +335,47 @@ class PandoraProvider(MusicProvider):
                 # can be idle long enough to be worth replacing while its URLs are still
                 # perfectly playable, and refusing those would break resuming after a pause.
                 raise MediaNotFoundError(f"Track {item_id} expired while playback was stopped")
-            raise MediaNotFoundError(f"Track {item_id} is no longer available from Pandora")
-        # stations overlap, so the same song can sit in several sessions at once. Serve the
-        # freshest copy, not the one from whichever session happens to be oldest: an older
-        # station's expired fragment must not fail a playable track, and the fragment that is
-        # marked as having served the track has to be the one the audio URL came from.
-        fragment, track = max(playable, key=lambda holder: holder[0].fetched_at)
-        fragment.mark_resolved(item_id, now)
-        duration = int(track.get("trackLength") or 0)
-        can_seek = duration > 0
+            raise MediaNotFoundError(NO_ON_DEMAND_MESSAGE)
+        return await self._mint_stream_details(item_id)
+
+    async def _mint_stream_details(self, source_id: str) -> StreamDetails:
+        """
+        Mint a signed URL for one playable source and describe the stream it names.
+
+        :param source_id: The Pandora id to play. This provider only ever passes a `TR:` track
+            id, but the endpoint plays other kinds of source too.
+        :raises MediaNotFoundError: If Pandora will not play the source for this account.
+        """
+        response = await self._api_request(
+            "POST",
+            PLAYBACK_SOURCE_ENDPOINT,
+            data={
+                "sourceId": source_id,
+                "includeItem": True,
+                "includeSource": True,
+                "deviceUuid": self._device_uuid,
+            },
+        )
+        item = response.get("item") or {}
+        if not (audio_url := item.get("audioUrl")):
+            raise MediaNotFoundError(f"Pandora minted no audio URL for {source_id}")
+        # Pandora's own answer for seekability, not a duration guess
+        can_seek = "SEEK" in (item.get("interactions") or [])
+        # names the encoding Pandora minted, not the account's quality preference
+        encoding = str(item.get("encoding") or "")
         return StreamDetails(
             provider=self.instance_id,
-            item_id=item_id,
-            audio_format=self._audio_format(),
+            item_id=source_id,
+            audio_format=AudioFormat(
+                content_type=ContentType.MP3 if encoding.startswith("mp3") else ContentType.AAC
+            ),
             media_type=MediaType.TRACK,
             stream_type=StreamType.HTTP,
-            path=track["audioURL"],
-            duration=duration,
+            path=str(audio_url),
+            duration=int(item.get("duration") or 0),
             can_seek=can_seek,
             allow_seek=can_seek,
+            loudness=loudness_from_file_gain(item.get("fileGain")),
         )
 
     async def takeover_stream(self) -> None:

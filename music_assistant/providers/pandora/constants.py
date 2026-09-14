@@ -9,6 +9,7 @@ LOGIN_ENDPOINT = f"{API_BASE}/auth/login"
 STATIONS_ENDPOINT = f"{API_BASE}/station/getStations"
 PLAYLIST_FRAGMENT_ENDPOINT = f"{API_BASE}/playlist/getFragment"
 PLAYBACK_RESUMED_ENDPOINT = f"{API_BASE}/station/playbackResumed"
+PLAYBACK_SOURCE_ENDPOINT = f"{API_BASE}/playback/source"
 
 # Pandora Error Code Categories
 # Authentication and authorization failures
@@ -68,3 +69,6 @@ ACCOUNT_FLAG_ON_DEMAND = "onDemand"
 NO_ON_DEMAND_MESSAGE = "On-demand playback is not available on this Pandora account"
 
 CONF_DEVICE_UUID = "device_uuid"
+
+# Reference level core uses for a REPLAYGAIN_TRACK_GAIN tag; see helpers/tags.py.
+REPLAY_GAIN_REFERENCE_LUFS = -18.0
