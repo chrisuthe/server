@@ -318,7 +318,7 @@ def test_station_is_a_dynamic_radio() -> None:
 
 def test_station_prefers_the_size_500_art() -> None:
     """A station's thumbnail follows the same size preference as a track's."""
-    playlist = parse_station(
+    radio = parse_station(
         _provider(),
         {
             "stationId": "station-1",
@@ -329,5 +329,5 @@ def test_station_prefers_the_size_500_art() -> None:
             ],
         },
     )
-    assert playlist.metadata.images is not None
-    assert [image.path for image in playlist.metadata.images] == ["https://art/500.jpg"]
+    assert radio.metadata.images is not None
+    assert [image.path for image in radio.metadata.images] == ["https://art/500.jpg"]

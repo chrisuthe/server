@@ -324,8 +324,8 @@ class PandoraProvider(MusicProvider):
             raise MediaNotFoundError(f"Unsupported media type: {media_type}")
         now = time.time()
         # only each session's live fragment: an older one's signed URL may already be expired
-        # and there is no way to tell from here, so refuse rather than hand ffmpeg a link
-        # that 403s mid-track
+        # and there is no way to tell from here, so an older one is never handed to ffmpeg to
+        # 403 mid-track
         holders = [
             (fragment, track)
             for session in self._sessions.values()
@@ -367,8 +367,7 @@ class PandoraProvider(MusicProvider):
         """
         Mint a signed URL for one playable source and describe the stream it names.
 
-        :param source_id: The Pandora id to play. This provider only ever passes a `TR:` track
-            id, but the endpoint plays other kinds of source too.
+        :param source_id: The Pandora source id to play.
         :raises MediaNotFoundError: If Pandora will not play the source for this account.
         """
         response = await self._api_request(
@@ -384,9 +383,7 @@ class PandoraProvider(MusicProvider):
         item = response.get("item") or {}
         if not (audio_url := item.get("audioUrl")):
             raise MediaNotFoundError(f"Pandora minted no audio URL for {source_id}")
-        # Pandora's own answer for seekability, not a duration guess
         can_seek = "SEEK" in (item.get("interactions") or [])
-        # names the encoding Pandora minted, not the account's quality preference
         encoding = str(item.get("encoding") or "")
         return StreamDetails(
             provider=self.instance_id,

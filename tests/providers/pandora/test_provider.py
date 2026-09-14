@@ -1017,7 +1017,7 @@ async def test_album_tracks_come_from_the_details_response_alone_when_it_hydrate
 
 
 async def test_album_tracks_pandora_did_not_hydrate_are_fetched_in_one_batch() -> None:
-    """Whether getDetails hydrates an album's tracks is unmeasured, so the listing must work either way - and the way that is not one call must still not be one call per track."""
+    """Tracks getDetails did not hydrate are fetched in one batched call."""
     provider, details_calls, annotate_calls = _detailing_provider(_ALBUM_SIBLINGS, _ALBUM_TRACKS)
     tracks = await provider.get_album_tracks(_ALBUM_ID)
     assert [track.item_id for track in tracks] == list(_ALBUM_TRACK_IDS)
@@ -1584,7 +1584,7 @@ async def test_the_mint_names_its_own_encoding_not_the_account_preference() -> N
 
 
 async def test_an_mp3_mint_is_described_as_mp3() -> None:
-    """Pandora mints MP3 too, and a standard-quality account must not force AAC onto it."""
+    """A mint naming an MP3 encoding is described as MP3."""
     provider, _ = _minting_provider({**_MINTED_ITEM, "encoding": "mp3-hifi"})
     assert provider._audio_format().content_type is ContentType.AAC
     details = await provider.get_stream_details("TR:1809020", MediaType.TRACK)
