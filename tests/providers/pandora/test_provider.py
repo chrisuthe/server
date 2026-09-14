@@ -22,6 +22,7 @@ from music_assistant.constants import CONF_PASSWORD, CONF_USERNAME
 from music_assistant.providers.pandora import provider as provider_module
 from music_assistant.providers.pandora.constants import (
     CATALOG_ANNOTATE_ENDPOINT,
+    CATALOG_DETAILS_ENDPOINT,
     CONF_DEVICE_UUID,
     PLAYBACK_SOURCE_ENDPOINT,
     QUALITY_HIGH,
@@ -156,12 +157,14 @@ async def test_unentitled_album_is_addressed_by_its_tracks_id() -> None:
     assert album.name == "Some Album"
 
 
-async def test_album_tracks_hold_the_track_it_was_minted_from() -> None:
-    """An album page lists the one station track Pandora knows for it."""
+@pytest.mark.parametrize("on_demand", [False, True])
+async def test_station_album_lists_the_track_it_is_keyed_by(on_demand: bool) -> None:
+    """A station album lists its one fragment track, playable only with on-demand playback."""
     provider = _provider()
+    provider._on_demand_available = on_demand
     await provider.get_dynamic_radio_tracks(STATION_ID)
     tracks = await provider.get_album_tracks("TR:S0")
-    assert [(track.item_id, track.available) for track in tracks] == [("TR:S0", False)]
+    assert [(track.item_id, track.available) for track in tracks] == [("TR:S0", on_demand)]
     with pytest.raises(MediaNotFoundError):
         await provider.get_album_tracks("TR:unknown")
 
@@ -902,6 +905,231 @@ async def test_catalogue_search_asks_only_for_the_requested_types() -> None:
     provider, calls = _searching_provider()
     await provider.search("coldplay", [MediaType.TRACK])
     assert calls[0]["types"] == ["TR"]
+
+
+_ALBUM_ID = "AL:1728"
+# Pandora lists an album's tracks newest-id-first, which is also playing order: the ids
+# descend while the track numbers ascend. Anything that sorts this listing shows it wrong.
+_ALBUM_TRACK_IDS = ("TR:21356", "TR:21355", "TR:21354")
+
+_ALBUM_TRACKS: dict[str, Any] = {
+    track_id: {
+        "pandoraId": track_id,
+        "name": f"Album Song {number}",
+        "trackNumber": number,
+        "duration": 160 + number,
+        "albumId": _ALBUM_ID,
+        "artistId": "AR:6089",
+        "rightsInfo": {"hasInteractive": True},
+    }
+    for number, track_id in enumerate(_ALBUM_TRACK_IDS, start=1)
+}
+
+_ALBUM_SIBLINGS: dict[str, Any] = {
+    _ALBUM_ID: {
+        "pandoraId": _ALBUM_ID,
+        "name": "Double Live",
+        "artistId": "AR:6089",
+        "tracks": list(_ALBUM_TRACK_IDS),
+    },
+    "AR:6089": {"pandoraId": "AR:6089", "name": "Garth Brooks"},
+}
+
+
+def _detailing_provider(
+    details: dict[str, Any],
+    annotated: dict[str, Any] | None = None,
+    on_demand: bool = True,
+) -> tuple[PandoraProvider, list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    Build a provider whose getDetails and annotateObjects answers are canned separately.
+
+    Returns the provider and one recording list per endpoint, so a test can assert how many
+    calls an album listing cost as well as what it produced.
+
+    :param details: The annotations map getDetails answers with.
+    :param annotated: The records annotateObjects holds; it answers only for ids it is asked
+        for, so a test can leave a track unhydrated by both endpoints.
+    """
+    provider = PandoraProvider.__new__(PandoraProvider)
+    provider.manifest = Mock(domain="pandora")
+    provider.config = Mock(instance_id="pandora--test")
+    provider.logger = Mock()
+    provider.http_session = Mock(closed=False)
+    provider._sessions = {}
+    provider._high_quality_available = False
+    provider._on_demand_available = on_demand
+    details_calls: list[dict[str, Any]] = []
+    annotate_calls: list[dict[str, Any]] = []
+
+    async def _fake_api_request(
+        method: str,  # noqa: ARG001
+        url: str,
+        data: dict[str, Any] | None = None,
+        **kwargs: Any,  # noqa: ARG001
+    ) -> dict[str, Any]:
+        """Return canned catalogue payloads instead of calling Pandora."""
+        if url == CATALOG_DETAILS_ENDPOINT:
+            details_calls.append(data or {})
+            return {"annotations": dict(details)}
+        if url == CATALOG_ANNOTATE_ENDPOINT:
+            annotate_calls.append(data or {})
+            held = annotated or {}
+            return {
+                item_id: held[item_id]
+                for item_id in (data or {}).get("pandoraIds") or []
+                if item_id in held
+            }
+        raise AssertionError(f"unexpected endpoint {url}")
+
+    provider._api_request = _fake_api_request  # type: ignore[method-assign, assignment]
+    return provider, details_calls, annotate_calls
+
+
+async def test_album_tracks_come_from_the_details_response_alone_when_it_hydrates_them() -> None:
+    """If getDetails already carries every record, listing the album costs exactly one call."""
+    provider, details_calls, annotate_calls = _detailing_provider(
+        {**_ALBUM_SIBLINGS, **_ALBUM_TRACKS}
+    )
+    tracks = await provider.get_album_tracks(_ALBUM_ID)
+    assert [track.item_id for track in tracks] == list(_ALBUM_TRACK_IDS)
+    assert len(details_calls) == 1
+    assert annotate_calls == []
+
+
+async def test_album_tracks_pandora_did_not_hydrate_are_fetched_in_one_batch() -> None:
+    """Whether getDetails hydrates an album's tracks is unmeasured, so the listing must work either way - and the way that is not one call must still not be one call per track."""
+    provider, details_calls, annotate_calls = _detailing_provider(_ALBUM_SIBLINGS, _ALBUM_TRACKS)
+    tracks = await provider.get_album_tracks(_ALBUM_ID)
+    assert [track.item_id for track in tracks] == list(_ALBUM_TRACK_IDS)
+    assert len(details_calls) == 1
+    assert annotate_calls == [{"pandoraIds": list(_ALBUM_TRACK_IDS), "annotateAlbumTracks": False}]
+
+
+async def test_album_tracks_batch_only_the_records_the_details_response_lacks() -> None:
+    """A partly hydrated response must widen the one follow-up call, not repeat the whole album."""
+    provider, _, annotate_calls = _detailing_provider(
+        {**_ALBUM_SIBLINGS, "TR:21355": _ALBUM_TRACKS["TR:21355"]}, _ALBUM_TRACKS
+    )
+    tracks = await provider.get_album_tracks(_ALBUM_ID)
+    assert [track.item_id for track in tracks] == list(_ALBUM_TRACK_IDS)
+    assert len(annotate_calls) == 1
+    assert annotate_calls[0]["pandoraIds"] == ["TR:21356", "TR:21354"]
+
+
+async def test_album_tracks_keep_pandoras_order() -> None:
+    """Pandora's order is the album's order; sorting by id would reverse this one."""
+    provider, _, _ = _detailing_provider({**_ALBUM_SIBLINGS, **_ALBUM_TRACKS})
+    tracks = await provider.get_album_tracks(_ALBUM_ID)
+    assert [track.name for track in tracks] == ["Album Song 1", "Album Song 2", "Album Song 3"]
+    assert [track.track_number for track in tracks] == [1, 2, 3]
+
+
+async def test_album_tracks_carry_their_catalogue_identities() -> None:
+    """An album track has to resolve and play by id, and to lead back to its album and artist."""
+    provider, _, _ = _detailing_provider({**_ALBUM_SIBLINGS, **_ALBUM_TRACKS})
+    track = (await provider.get_album_tracks(_ALBUM_ID))[0]
+    assert track.item_id == "TR:21356"
+    assert track.duration == 161
+    assert track.album is not None
+    assert track.album.item_id == _ALBUM_ID
+    assert track.album.name == "Double Live"
+    assert track.artists[0].item_id == "AR:6089"
+
+
+async def test_album_tracks_drop_a_track_the_account_cannot_play() -> None:
+    """The same rights check search applies: a listing entry that fails on click is not an entry."""
+    unplayable = {**_ALBUM_TRACKS["TR:21355"], "rightsInfo": {"hasInteractive": False}}
+    provider, _, _ = _detailing_provider(
+        {**_ALBUM_SIBLINGS, **_ALBUM_TRACKS, "TR:21355": unplayable}
+    )
+    tracks = await provider.get_album_tracks(_ALBUM_ID)
+    assert [track.item_id for track in tracks] == ["TR:21356", "TR:21354"]
+
+
+async def test_album_tracks_drop_a_track_whose_rights_are_null() -> None:
+    """Pandora really does send `rightsInfo: null`; reading through it must not crash."""
+    nulled = {**_ALBUM_TRACKS["TR:21355"], "rightsInfo": None}
+    provider, _, _ = _detailing_provider({**_ALBUM_SIBLINGS, **_ALBUM_TRACKS, "TR:21355": nulled})
+    tracks = await provider.get_album_tracks(_ALBUM_ID)
+    assert [track.item_id for track in tracks] == ["TR:21356", "TR:21354"]
+
+
+_TRACKLESS_ALBUMS: dict[str, dict[str, Any]] = {
+    "null": {**_ALBUM_SIBLINGS[_ALBUM_ID], "tracks": None},
+    "absent": {key: value for key, value in _ALBUM_SIBLINGS[_ALBUM_ID].items() if key != "tracks"},
+}
+
+
+@pytest.mark.parametrize("album", list(_TRACKLESS_ALBUMS.values()), ids=list(_TRACKLESS_ALBUMS))
+async def test_an_album_with_no_tracks_is_empty_rather_than_an_error(
+    album: dict[str, Any],
+) -> None:
+    """
+    An album record naming no tracks lists nothing, and asks Pandora nothing further.
+
+    Pandora sends the key as null as readily as it omits it, and neither is a missing album.
+    """
+    provider, details_calls, annotate_calls = _detailing_provider({_ALBUM_ID: album})
+    assert await provider.get_album_tracks(_ALBUM_ID) == []
+    assert len(details_calls) == 1
+    assert annotate_calls == []
+
+
+async def test_album_tracks_drop_a_track_no_record_ever_arrived_for() -> None:
+    """Neither endpoint answered for this id, so it cannot be described - or played."""
+    listed = [*_ALBUM_TRACK_IDS, "TR:00000"]
+    album = {**_ALBUM_SIBLINGS[_ALBUM_ID], "tracks": listed}
+    provider, _, annotate_calls = _detailing_provider(
+        {**_ALBUM_SIBLINGS, _ALBUM_ID: album, **_ALBUM_TRACKS}
+    )
+    tracks = await provider.get_album_tracks(_ALBUM_ID)
+    assert [track.item_id for track in tracks] == list(_ALBUM_TRACK_IDS)
+    assert annotate_calls[0]["pandoraIds"] == ["TR:00000"]
+
+
+async def test_album_tracks_send_the_measured_body() -> None:
+    """This endpoint takes a single `pandoraId`; the batched annotator is the one taking a list."""
+    provider, details_calls, _ = _detailing_provider({**_ALBUM_SIBLINGS, **_ALBUM_TRACKS})
+    await provider.get_album_tracks(_ALBUM_ID)
+    assert details_calls == [{"pandoraId": _ALBUM_ID}]
+
+
+async def test_album_tracks_never_take_the_stream_over() -> None:
+    """Listing an album is metadata: taking the stream over would stop another device."""
+    reasons: list[frozenset[str]] = []
+
+    async def _recording_request(
+        method: str,  # noqa: ARG001
+        url: str,  # noqa: ARG001
+        data: dict[str, Any] | None = None,  # noqa: ARG001
+        exhausted_retry_reasons: frozenset[str] = frozenset(),
+    ) -> dict[str, Any]:
+        reasons.append(exhausted_retry_reasons)
+        return {"annotations": {**_ALBUM_SIBLINGS, **_ALBUM_TRACKS}}
+
+    provider, _, _ = _detailing_provider({})
+    provider._api_request = _recording_request  # type: ignore[method-assign]
+    await provider.get_album_tracks(_ALBUM_ID)
+    assert reasons == [frozenset({RETRY_REASON_STREAM_VIOLATION})]
+
+
+async def test_unknown_album_id_is_refused() -> None:
+    """Pandora holding no record for the id is a missing album, not an empty one."""
+    provider, _, _ = _detailing_provider({})
+    with pytest.raises(MediaNotFoundError):
+        await provider.get_album_tracks("AL:does-not-exist")
+
+
+async def test_unentitled_account_is_refused_an_album_tracklist() -> None:
+    """A library row outlives the entitlement that made it; its tracks still cannot play."""
+    provider, details_calls, annotate_calls = _detailing_provider(
+        {**_ALBUM_SIBLINGS, **_ALBUM_TRACKS}, on_demand=False
+    )
+    with pytest.raises(MediaNotFoundError, match="not available on this Pandora account"):
+        await provider.get_album_tracks(_ALBUM_ID)
+    assert details_calls == []
+    assert annotate_calls == []
 
 
 async def test_first_request_returns_a_fragment() -> None:

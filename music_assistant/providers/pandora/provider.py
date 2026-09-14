@@ -52,6 +52,7 @@ from .constants import (
     ACCOUNT_FLAG_HIGH_QUALITY,
     ACCOUNT_FLAG_ON_DEMAND,
     CATALOG_ANNOTATE_ENDPOINT,
+    CATALOG_DETAILS_ENDPOINT,
     CONF_DEVICE_UUID,
     CONF_QUALITY,
     CONF_TAKEOVER_ACTION,
@@ -270,16 +271,43 @@ class PandoraProvider(MusicProvider):
 
     async def get_album_tracks(self, prov_album_id: str) -> list[Track]:
         """
-        Get the tracks of an album, listed but not playable.
+        Get an album's tracks, in the order Pandora lists them.
 
-        :param prov_album_id: The Pandora album id.
+        :param prov_album_id: A catalogue album id, or the track id a station album is keyed by.
+        :raises MediaNotFoundError: If the album is unknown, or the account may not play a
+            catalogue album on demand.
         """
-        if (found := self._find_track_with_fragment(prov_album_id)) is None:
-            raise MediaNotFoundError(f"Album {prov_album_id} not found")
-        track, fragment = found
-        # Pandora has no album catalogue, so the album only holds the station track it was
-        # created from. Playing a chosen station track on demand is a paid Pandora feature.
-        return [parse_track(self, track, fragment.annotations, available=False)]
+        if not prov_album_id.startswith("AL:"):
+            if (found := self._find_track_with_fragment(prov_album_id)) is None:
+                raise MediaNotFoundError(f"Album {prov_album_id} not found")
+            track, fragment = found
+            # a station album holds only the track it is keyed by
+            return [
+                parse_track(self, track, fragment.annotations, available=self._on_demand_available)
+            ]
+        if not self._on_demand_available:
+            raise MediaNotFoundError(NO_ON_DEMAND_MESSAGE)
+        response = await self._api_request(
+            "POST",
+            CATALOG_DETAILS_ENDPOINT,
+            data={"pandoraId": prov_album_id},
+            exhausted_retry_reasons=frozenset({RETRY_REASON_STREAM_VIOLATION}),
+        )
+        annotations: dict[str, Any] = response.get("annotations") or {}
+        if not isinstance(album := annotations.get(prov_album_id), dict):
+            raise MediaNotFoundError(f"Pandora has no record for {prov_album_id}")
+        track_ids = [str(track_id) for track_id in album.get("tracks") or []]
+        missing = [
+            track_id for track_id in track_ids if not isinstance(annotations.get(track_id), dict)
+        ]
+        if missing:
+            annotations = {**annotations, **await self._annotate_ids(missing)}
+        tracks: list[Track] = []
+        for track_id in track_ids:
+            record = annotations.get(track_id)
+            if isinstance(record, dict) and (record.get("rightsInfo") or {}).get("hasInteractive"):
+                tracks.append(parse_track_record(self, record, track_id, annotations))
+        return tracks
 
     async def get_artist(self, prov_artist_id: str) -> Artist:
         """Get an artist by its catalogue id, or by name for a station artist."""
