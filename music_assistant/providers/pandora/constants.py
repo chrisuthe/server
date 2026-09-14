@@ -3,6 +3,8 @@
 # API Endpoints
 API_HOST = "https://www.pandora.com/api"
 API_BASE = f"{API_HOST}/v1"
+# the music catalogue annotator; v1/aesop/annotateObjects only answers for podcasts
+CATALOG_ANNOTATE_ENDPOINT = f"{API_HOST}/v4/catalog/annotateObjects"
 LOGIN_ENDPOINT = f"{API_BASE}/auth/login"
 STATIONS_ENDPOINT = f"{API_BASE}/station/getStations"
 PLAYLIST_FRAGMENT_ENDPOINT = f"{API_BASE}/playlist/getFragment"

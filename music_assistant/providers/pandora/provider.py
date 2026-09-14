@@ -16,7 +16,6 @@ from music_assistant_models.config_entries import (
 from music_assistant_models.enums import (
     ConfigEntryType,
     ContentType,
-    ImageType,
     MediaType,
     StreamType,
 )
@@ -25,6 +24,7 @@ from music_assistant_models.errors import (
     LoginFailed,
     MediaNotFoundError,
     ProviderUnavailableError,
+    ResourceTemporarilyUnavailable,
 )
 from music_assistant_models.media_items import (
     Album,
@@ -32,15 +32,12 @@ from music_assistant_models.media_items import (
     AudioFormat,
     BrowseFolder,
     ItemMapping,
-    MediaItemImage,
     MediaItemType,
-    ProviderMapping,
     Radio,
     SearchResults,
     Track,
 )
 from music_assistant_models.streamdetails import StreamDetails
-from music_assistant_models.unique_list import UniqueList
 
 from music_assistant.constants import (
     CONF_ENTRY_UNOFFICIAL_PROVIDER,
@@ -49,16 +46,17 @@ from music_assistant.constants import (
     CONF_USERNAME,
 )
 from music_assistant.helpers.aiohttp_client import create_clientsession, get_socks5_url
-from music_assistant.helpers.util import parse_title_and_version
 from music_assistant.models.music_provider import MusicProvider
 
 from .constants import (
     ACCOUNT_FLAG_HIGH_QUALITY,
     ACCOUNT_FLAG_ON_DEMAND,
+    CATALOG_ANNOTATE_ENDPOINT,
     CONF_DEVICE_UUID,
     CONF_QUALITY,
     CONF_TAKEOVER_ACTION,
     LOGIN_ENDPOINT,
+    NO_ON_DEMAND_MESSAGE,
     PLAYBACK_RESUMED_ENDPOINT,
     PLAYLIST_FRAGMENT_ENDPOINT,
     QUALITY_HIGH,
@@ -79,6 +77,15 @@ from .helpers import (
     handle_pandora_error,
     raise_if_playback_refused,
     read_account_flags,
+)
+from .parsers import (
+    parse_album,
+    parse_album_record,
+    parse_artist,
+    parse_artist_record,
+    parse_station,
+    parse_track,
+    parse_track_record,
 )
 
 if TYPE_CHECKING:
@@ -239,23 +246,25 @@ class PandoraProvider(MusicProvider):
         # Already-served tracks are withheld: the queue controller only de-duplicates refill
         # candidates against its unplayed tail, so a served track that scrolls out of that
         # tail would otherwise be re-added here and then fail once the fragment has moved on.
-        return [self._parse_track(track) for track in fragment.pending]
+        return [parse_track(self, track, fragment.annotations) for track in fragment.pending]
 
     async def get_track(self, prov_track_id: str) -> Track:
         """Get full track details by id."""
-        if (track := self._find_track(prov_track_id)) is None:
-            raise MediaNotFoundError(f"Track {prov_track_id} not found")
-        return self._parse_track(track)
+        if (found := self._find_track_with_fragment(prov_track_id)) is not None:
+            track, fragment = found
+            return parse_track(self, track, fragment.annotations)
+        records = self._find_annotations(prov_track_id) or await self._annotate_one(prov_track_id)
+        return parse_track_record(self, records[prov_track_id], prov_track_id, records)
 
     async def get_album(self, prov_album_id: str) -> Album:
-        """
-        Get the album a station track belongs to.
-
-        Fragments carry no album identifier of their own, so an album is addressed by the id of
-        one of its tracks - see `_parse_album`, which mints the album that way.
-        """
-        if (track := self._find_track(prov_album_id)) and (
-            album := self._parse_album(track, prov_album_id)
+        """Get an album by its catalogue id, or by the id of a station track it holds."""
+        if prov_album_id.startswith("AL:"):
+            records = self._find_annotations(prov_album_id) or await self._annotate_one(
+                prov_album_id
+            )
+            return parse_album_record(self, records[prov_album_id], prov_album_id, records)
+        if (found := self._find_track_with_fragment(prov_album_id)) and (
+            album := parse_album(self, found[0], prov_album_id)
         ):
             return album
         raise MediaNotFoundError(f"Album {prov_album_id} not found")
@@ -266,15 +275,21 @@ class PandoraProvider(MusicProvider):
 
         :param prov_album_id: The Pandora album id.
         """
-        if (track := self._find_track(prov_album_id)) is None:
+        if (found := self._find_track_with_fragment(prov_album_id)) is None:
             raise MediaNotFoundError(f"Album {prov_album_id} not found")
+        track, fragment = found
         # Pandora has no album catalogue, so the album only holds the station track it was
         # created from. Playing a chosen station track on demand is a paid Pandora feature.
-        return [self._parse_track(track, available=False)]
+        return [parse_track(self, track, fragment.annotations, available=False)]
 
     async def get_artist(self, prov_artist_id: str) -> Artist:
-        """Get artist details; Pandora identifies station artists by name only."""
-        return self._parse_artist(prov_artist_id)
+        """Get an artist by its catalogue id, or by name for a station artist."""
+        if prov_artist_id.startswith("AR:"):
+            records = self._find_annotations(prov_artist_id) or await self._annotate_one(
+                prov_artist_id
+            )
+            return parse_artist_record(self, records[prov_artist_id], prov_artist_id)
+        return parse_artist(self, prov_artist_id)
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Get streamdetails for a station track."""
@@ -531,13 +546,72 @@ class PandoraProvider(MusicProvider):
             raise MediaNotFoundError(
                 f"Pandora returned no playable tracks for {session.station_id}"
             )
-        return session.add_fragment(tracks, time.time())
+        return session.add_fragment(tracks, time.time(), await self._hydrate(tracks))
+
+    async def _hydrate(self, tracks: list[dict[str, Any]]) -> dict[str, Any]:
+        """
+        Return catalogue records for the given fragment tracks, keyed by pandoraId.
+
+        Empty when the account is not entitled to on-demand playback or the lookup fails.
+        """
+        if not self._on_demand_available:
+            return {}
+        try:
+            return await self._annotate_objects([track["pandoraId"] for track in tracks])
+        except (
+            InvalidDataError,
+            MediaNotFoundError,
+            ProviderUnavailableError,
+            ResourceTemporarilyUnavailable,
+        ) as err:
+            # only degrade while the connection is still usable
+            if self.http_session.closed:
+                raise
+            self.logger.warning("Could not annotate Pandora fragment tracks: %s", err)
+            return {}
+
+    async def _annotate_objects(self, pandora_ids: list[str]) -> dict[str, Any]:
+        """
+        Return catalogue records for the given ids in one request, keyed by pandoraId.
+
+        Not gated on entitlement; `_annotate_ids` is.
+        """
+        response = await self._api_request(
+            "POST",
+            CATALOG_ANNOTATE_ENDPOINT,
+            data={"pandoraIds": pandora_ids, "annotateAlbumTracks": False},
+            # a metadata lookup never takes the stream over from another device
+            exhausted_retry_reasons=frozenset({RETRY_REASON_STREAM_VIOLATION}),
+        )
+        return {key: value for key, value in response.items() if isinstance(value, dict)}
+
+    async def _annotate_ids(self, pandora_ids: list[str]) -> dict[str, Any]:
+        """
+        Return catalogue records for the given ids in one request, keyed by pandoraId.
+
+        :raises MediaNotFoundError: If the account is not entitled to on-demand playback.
+        """
+        if not self._on_demand_available:
+            raise MediaNotFoundError(NO_ON_DEMAND_MESSAGE)
+        return await self._annotate_objects(pandora_ids)
+
+    async def _annotate_one(self, pandora_id: str) -> dict[str, Any]:
+        """
+        Return the records Pandora answers one id with, siblings included, keyed by pandoraId.
+
+        :raises MediaNotFoundError: If the account is not entitled to on-demand playback, or
+            Pandora holds no record for the id.
+        """
+        records = await self._annotate_ids([pandora_id])
+        if not isinstance(records.get(pandora_id), dict):
+            raise MediaNotFoundError(f"Pandora has no record for {pandora_id}")
+        return records
 
     async def _get_stations(self) -> AsyncGenerator[Radio]:
         """Retrieve the user's stations from the provider."""
         response = await self._api_request("POST", STATIONS_ENDPOINT, data={"pageSize": 250})
         for station in response.get("stations", []):
-            yield self._parse_station(station)
+            yield parse_station(self, station)
 
     def _get_or_create_session(self, station_id: str) -> PandoraStationSession:
         """Get or create a station session, with LRU eviction if needed."""
@@ -551,9 +625,11 @@ class PandoraProvider(MusicProvider):
         session.last_accessed = time.time()
         return session
 
-    def _find_track(self, prov_track_id: str) -> dict[str, Any] | None:
+    def _find_track_with_fragment(
+        self, prov_track_id: str
+    ) -> tuple[dict[str, Any], PandoraFragment] | None:
         """
-        Return raw track data from the freshest retained fragment holding it, or None.
+        Return raw track data and the freshest retained fragment holding it, or None.
 
         The id no longer names a station, so every retained session is searched. At most
         `MAX_ACTIVE_SESSIONS` sessions hold at most `MAX_RETAINED_FRAGMENTS` fragments of about
@@ -563,123 +639,23 @@ class PandoraProvider(MusicProvider):
         song resolve differently from one lookup to the next.
         """
         holders = [
-            (fragment, track)
+            (track, fragment)
             for session in self._sessions.values()
             for fragment in session.fragments
             if (track := fragment.find(prov_track_id)) is not None
         ]
-        freshest = max(holders, key=lambda holder: holder[0].fetched_at, default=None)
-        return freshest[1] if freshest is not None else None
+        return max(holders, key=lambda holder: holder[1].fetched_at, default=None)
 
-    def _parse_station(self, station: dict[str, Any]) -> Radio:
-        """Parse a station object into a dynamic radio station."""
-        radio = Radio(
-            item_id=station["stationId"],
-            provider=self.instance_id,
-            name=station["name"],
-            is_dynamic=True,
-            provider_mappings={
-                ProviderMapping(
-                    item_id=station["stationId"],
-                    provider_domain=self.domain,
-                    provider_instance=self.instance_id,
-                )
-            },
-        )
-        if art := station.get("art"):
-            art_url = next(
-                (item.get("url") for item in art if item.get("size") == 500), art[-1].get("url")
-            )
-            if art_url:
-                radio.metadata.add_image(
-                    MediaItemImage(
-                        type=ImageType.THUMB,
-                        path=art_url,
-                        provider=self.instance_id,
-                        remotely_accessible=True,
-                    )
-                )
-        return radio
-
-    def _parse_track(self, obj: dict[str, Any], available: bool = True) -> Track:
-        """
-        Parse a raw fragment track into a Track.
-
-        :param obj: The raw fragment track.
-        :param available: Whether the track can be played from this listing.
-        """
-        name, version = parse_title_and_version(obj.get("songTitle") or "Unknown Song")
-        track_id = obj["pandoraId"]
-        track = Track(
-            item_id=track_id,
-            provider=self.instance_id,
-            name=name,
-            version=version,
-            duration=int(obj.get("trackLength") or 0),
-            provider_mappings={
-                ProviderMapping(
-                    item_id=track_id,
-                    provider_domain=self.domain,
-                    provider_instance=self.instance_id,
-                    audio_format=self._audio_format(),
-                    url=obj.get("songDetailURL"),
-                    available=available,
-                )
-            },
-        )
-        if album_art := obj.get("albumArt"):
-            art_url = next(
-                (art.get("url") for art in album_art if art.get("size") == 500),
-                album_art[-1].get("url"),
-            )
-            if art_url:
-                track.metadata.add_image(
-                    MediaItemImage(
-                        provider=self.instance_id,
-                        type=ImageType.THUMB,
-                        path=art_url,
-                        remotely_accessible=True,
-                    )
-                )
-        if artist_name := obj.get("artistName"):
-            track.artists = UniqueList([self._parse_artist(artist_name)])
-        track.album = self._parse_album(obj, track_id)
-        return track
-
-    def _parse_album(self, obj: dict[str, Any], track_id: str) -> Album | None:
-        """Parse the album a fragment track belongs to, if the API named one."""
-        if not (url := obj.get("albumDetailURL")):
-            return None
-        name, version = parse_title_and_version(obj.get("albumTitle") or "Unknown Album")
-        return Album(
-            item_id=track_id,
-            provider=self.instance_id,
-            name=name,
-            version=version,
-            provider_mappings={
-                ProviderMapping(
-                    item_id=track_id,
-                    provider_domain=self.domain,
-                    provider_instance=self.instance_id,
-                    url=url,
-                )
-            },
-        )
-
-    def _parse_artist(self, artist_name: str) -> Artist:
-        """Parse an artist; Pandora fragments identify artists by name only."""
-        return Artist(
-            item_id=artist_name,
-            name=artist_name,
-            provider=self.instance_id,
-            provider_mappings={
-                ProviderMapping(
-                    item_id=artist_name,
-                    provider_domain=self.domain,
-                    provider_instance=self.instance_id,
-                )
-            },
-        )
+    def _find_annotations(self, pandora_id: str) -> dict[str, Any] | None:
+        """Return the annotations of the freshest retained fragment holding the id, or None."""
+        holders = [
+            fragment
+            for session in self._sessions.values()
+            for fragment in session.fragments
+            if pandora_id in fragment.annotations
+        ]
+        freshest = max(holders, key=lambda fragment: fragment.fetched_at, default=None)
+        return freshest.annotations if freshest is not None else None
 
     def _audio_format(self) -> AudioFormat:
         """Return the audio format the fragments are requested in."""

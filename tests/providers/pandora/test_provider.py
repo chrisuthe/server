@@ -9,12 +9,23 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from music_assistant_models.enums import MediaType, StreamType
-from music_assistant_models.errors import InvalidDataError, MediaNotFoundError
+from music_assistant_models.errors import (
+    InvalidDataError,
+    LoginFailed,
+    MediaNotFoundError,
+    ProviderUnavailableError,
+    ResourceTemporarilyUnavailable,
+)
 from music_assistant_models.media_items import Radio, SearchResults
 
 from music_assistant.constants import CONF_PASSWORD, CONF_USERNAME
 from music_assistant.providers.pandora import provider as provider_module
-from music_assistant.providers.pandora.constants import CONF_DEVICE_UUID, STATIONS_ENDPOINT
+from music_assistant.providers.pandora.constants import (
+    CATALOG_ANNOTATE_ENDPOINT,
+    CONF_DEVICE_UUID,
+    RETRY_REASON_STREAM_VIOLATION,
+    STATIONS_ENDPOINT,
+)
 from music_assistant.providers.pandora.fragments import (
     FRAGMENT_STALE_SECONDS,
     FRAGMENT_URL_TTL_SECONDS,
@@ -133,8 +144,8 @@ async def test_search_ignores_a_playlist_only_request() -> None:
     assert results.playlists == []
 
 
-async def test_album_is_addressed_by_its_tracks_id() -> None:
-    """A fragment names no album, so the track's id stands in - and it must round-trip."""
+async def test_unentitled_album_is_addressed_by_its_tracks_id() -> None:
+    """Without entitlement this is the only album route there is, and the id must round-trip."""
     provider = _provider()
     await provider.get_dynamic_radio_tracks(STATION_ID)
     album = await provider.get_album("TR:S0")
@@ -152,7 +163,7 @@ async def test_album_tracks_hold_the_track_it_was_minted_from() -> None:
         await provider.get_album_tracks("TR:unknown")
 
 
-async def test_album_is_gone_once_its_track_ages_out() -> None:
+async def test_unentitled_album_is_gone_once_its_track_ages_out() -> None:
     """A track-keyed album only exists while the fragment naming it is still retained."""
     prefixes = [chr(ord("A") + index) for index in range(MAX_RETAINED_FRAGMENTS + 1)]
     provider = _provider([_tracks(prefix=prefix) for prefix in prefixes])
@@ -163,7 +174,7 @@ async def test_album_is_gone_once_its_track_ages_out() -> None:
         await provider.get_album("TR:A0")
 
 
-async def test_artist_is_identified_by_name() -> None:
+async def test_unentitled_artist_is_identified_by_name() -> None:
     """Pandora names a fragment's artist but never identifies it, so the name is the id."""
     provider = _provider()
     artist = await provider.get_artist("Some Artist")
@@ -180,6 +191,474 @@ async def test_get_track_matches_radio_tracks_identity() -> None:
     assert listed.album is not None
     assert looked_up.album.item_id == listed.album.item_id
     assert looked_up.artists[0].item_id == listed.artists[0].item_id
+
+
+_HYDRATED = {
+    "TR:S0": {"pandoraId": "TR:S0", "albumId": "AL:900", "artistId": "AR:800"},
+    "AL:900": {"pandoraId": "AL:900", "name": "Some Album"},
+    "AR:800": {"pandoraId": "AR:800", "name": "Some Artist"},
+}
+
+
+def _annotating_provider(
+    annotations: dict[str, Any] | None = None,
+    on_demand: bool = True,
+) -> tuple[PandoraProvider, list[dict[str, Any]]]:
+    """
+    Build a provider whose annotateObjects calls return a canned map.
+
+    Returns the provider and a list recording each annotate request body, so a test can
+    assert whether the call was made at all rather than only what came back.
+    """
+    provider = PandoraProvider.__new__(PandoraProvider)
+    provider.manifest = Mock(domain="pandora")
+    provider.config = Mock(instance_id="pandora--test")
+    provider.logger = Mock()
+    provider.http_session = Mock(closed=False)
+    provider._sessions = {}
+    provider._high_quality_available = False
+    provider._on_demand_available = on_demand
+    annotate_calls: list[dict[str, Any]] = []
+
+    async def _fake_api_request(
+        method: str,  # noqa: ARG001
+        url: str,
+        data: dict[str, Any] | None = None,
+        **kwargs: Any,  # noqa: ARG001
+    ) -> dict[str, Any]:
+        """Return canned fragment/annotate payloads instead of calling Pandora."""
+        if url == CATALOG_ANNOTATE_ENDPOINT:
+            annotate_calls.append(data or {})
+            return dict(annotations or {})
+        return {"tracks": _tracks()}
+
+    provider._api_request = _fake_api_request  # type: ignore[method-assign, assignment]
+    return provider, annotate_calls
+
+
+def _breaking_provider(error: Exception) -> PandoraProvider:
+    """Build an entitled provider whose annotate call raises the given error."""
+    provider, _ = _annotating_provider(_HYDRATED)
+
+    async def _failing_request(
+        method: str,  # noqa: ARG001
+        url: str,
+        data: dict[str, Any] | None = None,  # noqa: ARG001
+        **kwargs: Any,  # noqa: ARG001
+    ) -> dict[str, Any]:
+        if url == CATALOG_ANNOTATE_ENDPOINT:
+            raise error
+        return {"tracks": _tracks()}
+
+    provider._api_request = _failing_request  # type: ignore[method-assign, assignment]
+    return provider
+
+
+async def test_entitled_account_hydrates_a_fragment() -> None:
+    """One batched annotate call per fragment carries the catalogue ids the payload lacks."""
+    provider, calls = _annotating_provider(_HYDRATED)
+    await provider.get_dynamic_radio_tracks(STATION_ID)
+    assert len(calls) == 1
+    assert calls[0] == {
+        "pandoraIds": [f"TR:S{index}" for index in range(4)],
+        "annotateAlbumTracks": False,
+    }
+    fragment = provider._sessions[STATION_ID].current
+    assert fragment is not None
+    assert fragment.annotations == _HYDRATED
+
+
+async def test_unentitled_account_does_not_hydrate() -> None:
+    """Without on-demand, catalogue ids would only offer albums whose tracks cannot play."""
+    provider, calls = _annotating_provider(_HYDRATED, on_demand=False)
+    await provider.get_dynamic_radio_tracks(STATION_ID)
+    assert calls == []
+    fragment = provider._sessions[STATION_ID].current
+    assert fragment is not None
+    assert fragment.annotations == {}
+
+
+async def test_unentitled_hydration_raises_and_logs_nothing() -> None:
+    """
+    Hydration answers for an unentitled account itself, rather than through the gated path.
+
+    Routing it through the entitlement check would raise once per fragment fetch, and the
+    degradation clause would then swallow that raise and log a warning for every station
+    an unentitled listener plays.
+    """
+    provider, calls = _annotating_provider(_HYDRATED, on_demand=False)
+    tracks = await provider.get_dynamic_radio_tracks(STATION_ID)
+    assert [track.item_id for track in tracks] == [f"TR:S{index}" for index in range(4)]
+    assert calls == []
+    assert cast("Mock", provider.logger).warning.mock_calls == []
+
+
+async def test_hydration_drops_a_non_record_value() -> None:
+    """The map is keyed by id, but its values are not guaranteed to be records."""
+    provider, _ = _annotating_provider({"TR:S0": None, "TR:S1": {"albumId": "AL:900"}})
+    await provider.get_dynamic_radio_tracks(STATION_ID)
+    fragment = provider._sessions[STATION_ID].current
+    assert fragment is not None
+    assert fragment.annotations == {"TR:S1": {"albumId": "AL:900"}}
+
+
+async def test_failed_hydration_still_serves_the_station() -> None:
+    """Hydration is metadata enrichment; losing it must not stop playback."""
+    provider = _breaking_provider(InvalidDataError("annotate exploded"))
+    tracks = await provider.get_dynamic_radio_tracks(STATION_ID)
+    assert len(tracks) == 4
+    fragment = provider._sessions[STATION_ID].current
+    assert fragment is not None
+    assert fragment.annotations == {}
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        InvalidDataError("annotate exploded"),
+        MediaNotFoundError("Pandora has no record for the id"),
+        ProviderUnavailableError("Pandora server error"),
+        ResourceTemporarilyUnavailable("Pandora service issue"),
+    ],
+    ids=lambda error: type(error).__name__,
+)
+async def test_hydration_degrades_for_each_caught_annotate_error(error: Exception) -> None:
+    """
+    Every type in _hydrate's except clause must degrade the station, not fail it.
+
+    Only InvalidDataError was ever exercised on this path before, so narrowing the clause
+    to drop any of the other three would break no existing test while letting a 500 or a
+    rate limit during hydration propagate and stop the station instead of degrading past it.
+    """
+    provider = _breaking_provider(error)
+    tracks = await provider.get_dynamic_radio_tracks(STATION_ID)
+    assert len(tracks) == 4
+    fragment = provider._sessions[STATION_ID].current
+    assert fragment is not None
+    assert fragment.annotations == {}
+
+
+async def test_hydration_failure_over_a_closed_session_is_not_masked() -> None:
+    """
+    Degrading past a closed transport would report success over a connection that is gone.
+
+    Several _api_request paths close the session before raising; the next call would then
+    fail with a bare RuntimeError somewhere unrelated instead of here.
+    """
+    provider = _breaking_provider(InvalidDataError("annotate exploded after closing"))
+    provider.http_session = Mock(closed=True)
+    with pytest.raises(InvalidDataError):
+        await provider.get_dynamic_radio_tracks(STATION_ID)
+
+
+async def test_hydration_does_not_swallow_an_auth_failure() -> None:
+    """A login failure must surface, not degrade into a silently unhydrated station."""
+    provider = _breaking_provider(LoginFailed("Pandora authentication failed after retry"))
+    with pytest.raises(LoginFailed):
+        await provider.get_dynamic_radio_tracks(STATION_ID)
+
+
+async def test_hydration_never_takes_the_stream_over() -> None:
+    """Enrichment must not fight the concurrent-stream limit: that stops another device."""
+    provider, _ = _annotating_provider(_HYDRATED)
+    reasons: list[frozenset[str]] = []
+
+    async def _recording_request(
+        method: str,  # noqa: ARG001
+        url: str,
+        data: dict[str, Any] | None = None,
+        exhausted_retry_reasons: frozenset[str] = frozenset(),
+    ) -> dict[str, Any]:
+        if url == CATALOG_ANNOTATE_ENDPOINT:
+            reasons.append(exhausted_retry_reasons)
+            requested = (data or {}).get("pandoraIds") or []
+            return {item_id: {"name": "Some Artist"} for item_id in requested}
+        return {"tracks": _tracks()}
+
+    provider._api_request = _recording_request  # type: ignore[method-assign]
+    await provider.get_dynamic_radio_tracks(STATION_ID)
+    # an id no fragment annotated is the only route left that still calls out
+    await provider.get_artist("AR:not-in-any-fragment")
+    assert reasons == [frozenset({RETRY_REASON_STREAM_VIOLATION})] * 2
+
+
+async def test_hydrated_track_uses_catalogue_album_and_artist_ids() -> None:
+    """An entitled account's album and artist are the ids the catalogue uses everywhere."""
+    provider, _ = _annotating_provider(_HYDRATED)
+    tracks = await provider.get_dynamic_radio_tracks(STATION_ID)
+    assert tracks[0].album is not None
+    assert tracks[0].album.item_id == "AL:900"
+    assert tracks[0].artists[0].item_id == "AR:800"
+    # only TR:S0 was annotated: the rest keep the unhydrated fallbacks, track by track
+    fallbacks = [track.album.item_id for track in tracks[1:] if track.album]
+    assert fallbacks == ["TR:S1", "TR:S2", "TR:S3"]
+    assert {track.artists[0].item_id for track in tracks[1:]} == {"Some Artist"}
+
+
+async def test_unhydrated_track_keeps_todays_album_and_artist() -> None:
+    """Without entitlement the album stays track-scoped and the artist name-keyed."""
+    provider, _ = _annotating_provider(_HYDRATED, on_demand=False)
+    tracks = await provider.get_dynamic_radio_tracks(STATION_ID)
+    assert tracks[0].album is not None
+    assert tracks[0].album.item_id == "TR:S0"
+    assert tracks[0].artists[0].item_id == "Some Artist"
+
+
+async def test_catalogue_album_is_resolvable_by_id() -> None:
+    """An AL: id offered on a track must resolve, or the track offers a dead link."""
+    provider, _ = _annotating_provider(_HYDRATED)
+    album = await provider.get_album("AL:900")
+    assert album.item_id == "AL:900"
+    assert album.name == "Some Album"
+
+
+async def test_catalogue_artist_is_resolvable_by_id() -> None:
+    """An AR: id must resolve to the artist's name, not to the id as a name."""
+    provider, _ = _annotating_provider(_HYDRATED)
+    artist = await provider.get_artist("AR:800")
+    assert artist.item_id == "AR:800"
+    assert artist.name == "Some Artist"
+
+
+async def test_unknown_catalogue_id_is_refused() -> None:
+    """Pandora returning no record is a missing item, not an empty one."""
+    provider, _ = _annotating_provider({})
+    with pytest.raises(MediaNotFoundError):
+        await provider.get_artist("AR:does-not-exist")
+
+
+async def test_unentitled_account_is_refused_a_persisted_catalogue_album() -> None:
+    """
+    A library row can outlive the entitlement that created it.
+
+    Music Assistant persists library rows, so an `AL:` id minted while an account was
+    entitled can still be requested after the subscription lapses. No fragment holds it in
+    this fresh provider, so the lookup would otherwise fall through to a live annotate call.
+    """
+    provider, calls = _annotating_provider(_HYDRATED, on_demand=False)
+    with pytest.raises(MediaNotFoundError):
+        await provider.get_album("AL:900")
+    assert calls == []
+
+
+async def test_unentitled_account_is_refused_a_persisted_catalogue_artist() -> None:
+    """Same as the album case above, but for a persisted `AR:` id."""
+    provider, calls = _annotating_provider(_HYDRATED, on_demand=False)
+    with pytest.raises(MediaNotFoundError):
+        await provider.get_artist("AR:800")
+    assert calls == []
+
+
+async def test_catalogue_album_reuses_a_hydrated_fragments_record() -> None:
+    """Hydration already fetched this record; MA resolves albums per item, so do not refetch."""
+    provider, calls = _annotating_provider(_HYDRATED)
+    await provider.get_dynamic_radio_tracks(STATION_ID)
+    calls.clear()
+    album = await provider.get_album("AL:900")
+    assert album.item_id == "AL:900"
+    assert album.name == "Some Album"
+    assert calls == []
+
+
+async def test_catalogue_artist_reuses_a_hydrated_fragments_record() -> None:
+    """Same for artists: one batched call per fragment must not become one call per item."""
+    provider, calls = _annotating_provider(_HYDRATED)
+    await provider.get_dynamic_radio_tracks(STATION_ID)
+    calls.clear()
+    artist = await provider.get_artist("AR:800")
+    assert artist.item_id == "AR:800"
+    assert artist.name == "Some Artist"
+    assert calls == []
+
+
+async def test_hydrated_track_matches_radio_tracks_identity() -> None:
+    """A hydrated track resolves to the same album and artist by either entry point."""
+    provider, _ = _annotating_provider(_HYDRATED)
+    listed = (await provider.get_dynamic_radio_tracks(STATION_ID))[0]
+    looked_up = await provider.get_track("TR:S0")
+    assert looked_up.album is not None
+    assert listed.album is not None
+    assert looked_up.album.item_id == listed.album.item_id == "AL:900"
+    assert looked_up.artists[0].item_id == listed.artists[0].item_id == "AR:800"
+
+
+async def test_get_track_from_a_fragment_makes_no_catalogue_call() -> None:
+    """The fragment already describes the track, and Music Assistant resolves items one by one."""
+    provider, calls = _annotating_provider(_HYDRATED)
+    await provider.get_dynamic_radio_tracks(STATION_ID)
+    calls.clear()
+    track = await provider.get_track("TR:S0")
+    assert track.name == "Song 0"
+    assert calls == []
+
+
+# A catalogue track and the siblings annotateObjects returns alongside it, unasked: the
+# measured response carried 18 records for 6 requested track ids.
+_CATALOGUE_TRACK: dict[str, Any] = {
+    "TR:1809020": {
+        "pandoraId": "TR:1809020",
+        "name": "Catalogue Song",
+        "duration": 214,
+        "albumId": "AL:157378",
+        "artistId": "AR:346031",
+    },
+    "AL:157378": {
+        "pandoraId": "AL:157378",
+        "name": "Catalogue Album",
+        "artistId": "AR:346031",
+    },
+    "AR:346031": {"pandoraId": "AR:346031", "name": "Catalogue Artist"},
+}
+
+
+async def test_get_track_resolves_a_catalogue_id_no_fragment_holds() -> None:
+    """A track found by search is addressed by id alone, so this is its only route to resolve."""
+    provider, _ = _annotating_provider(_CATALOGUE_TRACK)
+    track = await provider.get_track("TR:1809020")
+    assert track.item_id == "TR:1809020"
+    assert track.name == "Catalogue Song"
+    assert track.duration == 214
+
+
+async def test_a_looked_up_catalogue_track_carries_its_album_and_artist() -> None:
+    """
+    A looked-up catalogue track carries its album and artist from the same response.
+
+    Music Assistant refuses to add an artist-less track to the library, so this decides
+    whether a Pandora search result can be favourited at all.
+    """
+    provider, calls = _annotating_provider(_CATALOGUE_TRACK)
+    track = await provider.get_track("TR:1809020")
+    assert track.album is not None
+    assert track.album.item_id == "AL:157378"
+    assert track.album.name == "Catalogue Album"
+    assert [artist.item_id for artist in track.artists] == ["AR:346031"]
+    assert track.artists[0].name == "Catalogue Artist"
+    assert len(calls) == 1
+
+
+async def test_a_cached_catalogue_track_carries_its_album_and_artist() -> None:
+    """The record already in hand came with its siblings, and must resolve to the same track."""
+    provider, calls = _annotating_provider({**_HYDRATED, **_CATALOGUE_TRACK})
+    await provider.get_dynamic_radio_tracks(STATION_ID)
+    calls.clear()
+    track = await provider.get_track("TR:1809020")
+    assert track.album is not None
+    assert track.album.item_id == "AL:157378"
+    assert track.album.name == "Catalogue Album"
+    assert [artist.item_id for artist in track.artists] == ["AR:346031"]
+    assert calls == []
+
+
+async def test_a_looked_up_catalogue_album_carries_its_artist() -> None:
+    """An album with no artists can never match the same album from another provider."""
+    provider, _ = _annotating_provider(_CATALOGUE_TRACK)
+    album = await provider.get_album("AL:157378")
+    assert album.item_id == "AL:157378"
+    assert [artist.item_id for artist in album.artists] == ["AR:346031"]
+    assert album.artists[0].name == "Catalogue Artist"
+
+
+async def test_get_track_reuses_an_already_fetched_record() -> None:
+    """A record already in hand is not fetched again, as for albums and artists above."""
+    record = {"pandoraId": "TR:X9", "name": "Catalogue Song"}
+    provider, calls = _annotating_provider({**_HYDRATED, "TR:X9": record})
+    await provider.get_dynamic_radio_tracks(STATION_ID)
+    calls.clear()
+    track = await provider.get_track("TR:X9")
+    assert track.name == "Catalogue Song"
+    assert calls == []
+
+
+async def test_unentitled_account_is_refused_a_catalogue_track() -> None:
+    """A track this account cannot play must be refused by name, not looked up first."""
+    provider, calls = _annotating_provider(_HYDRATED, on_demand=False)
+    with pytest.raises(MediaNotFoundError, match="not available on this Pandora account"):
+        await provider.get_track("TR:1809020")
+    assert calls == []
+
+
+def _two_station_provider() -> tuple[PandoraProvider, dict[str, Any]]:
+    """
+    Build a provider whose annotate answer can be switched between two station fetches.
+
+    Returns the provider and the mutable map its annotate call reads, so a test can leave
+    one station unhydrated and hydrate the next.
+    """
+    provider, _ = _annotating_provider(_HYDRATED)
+    records: dict[str, Any] = {}
+
+    async def _switchable_request(
+        method: str,  # noqa: ARG001
+        url: str,
+        data: dict[str, Any] | None = None,  # noqa: ARG001
+        **kwargs: Any,  # noqa: ARG001
+    ) -> dict[str, Any]:
+        if url == CATALOG_ANNOTATE_ENDPOINT:
+            return dict(records)
+        return {"tracks": _tracks()}
+
+    provider._api_request = _switchable_request  # type: ignore[method-assign, assignment]
+    return provider, records
+
+
+_SUPERSEDED = {
+    "TR:S0": {"pandoraId": "TR:S0", "albumId": "AL:700", "artistId": "AR:600"},
+    "AL:900": {"pandoraId": "AL:900", "name": "Superseded Album"},
+}
+
+
+async def _hydrate_two_stations(
+    provider: PandoraProvider,
+    records: dict[str, Any],
+    first: dict[str, Any],
+    second: dict[str, Any],
+    older: str,
+) -> None:
+    """Fetch station-a then station-b with the given records, then age one of them."""
+    records.clear()
+    records.update(first)
+    await provider.get_dynamic_radio_tracks("station-a")
+    records.clear()
+    records.update(second)
+    await provider.get_dynamic_radio_tracks("station-b")
+    fragment = provider._sessions[older].current
+    assert fragment is not None
+    fragment.fetched_at -= 60
+
+
+async def test_freshest_annotations_decide_the_album_and_artist() -> None:
+    """
+    A song must not resolve to two different albums depending on session insertion order.
+
+    Two stations annotating the same song used to be decided by dict order; the freshest
+    fetch is Pandora's latest answer for it and decides both the track's identity and the
+    record an album lookup reuses.
+    """
+    provider, records = _two_station_provider()
+    await _hydrate_two_stations(provider, records, _SUPERSEDED, _HYDRATED, older="station-a")
+    track = await provider.get_track("TR:S0")
+    assert track.album is not None
+    assert track.album.item_id == "AL:900"
+    assert track.artists[0].item_id == "AR:800"
+    assert (await provider.get_album("AL:900")).name == "Some Album"
+
+
+async def test_freshest_annotations_win_regardless_of_session_order() -> None:
+    """
+    The freshest-annotations rule must not coincide only with insertion order.
+
+    The test above degrades the first-inserted session, so a regression to any
+    insertion-order rule would still pass it. Here station-a is inserted first and holds
+    the freshest annotations, while station-b, inserted second, is the superseded one.
+    """
+    provider, records = _two_station_provider()
+    await _hydrate_two_stations(provider, records, _HYDRATED, _SUPERSEDED, older="station-b")
+    track = await provider.get_track("TR:S0")
+    assert track.album is not None
+    assert track.album.item_id == "AL:900"
+    assert track.artists[0].item_id == "AR:800"
+    assert (await provider.get_album("AL:900")).name == "Some Album"
 
 
 async def test_search_returns_a_matching_station_as_a_radio() -> None:
